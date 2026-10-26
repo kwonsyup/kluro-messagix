@@ -1,0 +1,26 @@
+# Usage (source = a `git archive` of the commit, never a working directory):
+#   git archive --format=tar.gz -o src.tgz <commit>
+#   gcloud builds submit src.tgz --config cloudbuild.yaml --project <PROJECT> \
+#     --substitutions=_REGISTRY=<REGION>-docker.pkg.dev/<PROJECT>/<REPOSITORY>,_TAG=<tag>,_REVISION=<full commit id>,_SOURCE_URL=<repository URL>
+# The defaults below are placeholders and must be overridden.
+substitutions:
+  _REGISTRY: REGISTRY_PLACEHOLDER
+  _TAG: TAG_PLACEHOLDER
+  _REVISION: REVISION_PLACEHOLDER
+  _SOURCE_URL: SOURCE_URL_PLACEHOLDER
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --platform=linux/amd64
+      - --build-arg
+      - REVISION=${_REVISION}
+      - --build-arg
+      - IMAGE_SOURCE=${_SOURCE_URL}
+      - -t
+      - ${_REGISTRY}/kluro-messagix:${_TAG}
+      - .
+images:
+  - ${_REGISTRY}/kluro-messagix:${_TAG}
+options:
+  logging: CLOUD_LOGGING_ONLY
