@@ -76,6 +76,7 @@ type messagixSession struct {
 	stopping     bool
 	stopped      bool
 	logoutOnly   bool
+	platform     string
 
 	lastState       time.Time
 	lastStateBlob   []byte
@@ -129,6 +130,7 @@ func newSession() *messagixSession {
 // the secure-history enrollment and the thread facts that are not re-learned on
 // reconnect (cutover and hybrid links).
 type savedState struct {
+	Platform      string                `json:"platform,omitempty"`
 	Messagix      json.RawMessage       `json:"messagix,omitempty"`
 	WADB          []byte                `json:"wa_db,omitempty"`
 	WADevice      string                `json:"wa_device,omitempty"`
@@ -137,10 +139,33 @@ type savedState struct {
 	FBToWA        map[int64]int64       `json:"fb_to_wa,omitempty"`
 }
 
-func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub, cookieMap map[string]string, state []byte, mode string) (Ready, []Frame, error) {
+func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub, cookieMap map[string]string, state []byte, mode, platform string) (Ready, []Frame, error) {
 	if mode != "" && mode != "logout_only" {
 		return Ready{}, nil, errCode("bad_request")
 	}
+	selected := types.Messenger
+	switch platform {
+	case "", "messenger":
+		platform = "messenger"
+	case "facebook":
+		selected = types.Facebook
+	default:
+		return Ready{}, nil, errCode("bad_request")
+	}
+	var st savedState
+	if len(state) > 0 {
+		if err := json.Unmarshal(state, &st); err != nil {
+			return Ready{}, nil, errCode("bad_request")
+		}
+		statePlatform := st.Platform
+		if statePlatform == "" {
+			statePlatform = "messenger"
+		}
+		if statePlatform != platform {
+			return Ready{}, nil, errCode("bad_request")
+		}
+	}
+	s.platform = platform
 	s.logoutOnly = mode == "logout_only"
 	s.emit = emit
 	s.acks = acks
@@ -148,7 +173,7 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 	s.stateLoopDone = make(chan struct{})
 	go s.stateLoop()
 
-	ck := &cookies.Cookies{Platform: types.Messenger}
+	ck := &cookies.Cookies{Platform: selected}
 	values := make(map[cookies.MetaCookieName]string, len(cookieMap))
 	for k, v := range cookieMap {
 		values[cookies.MetaCookieName(k)] = v
@@ -163,11 +188,7 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 	}
 	s.selfID = selfID
 
-	var st savedState
 	if len(state) > 0 {
-		if err := json.Unmarshal(state, &st); err != nil {
-			return Ready{}, nil, errCode("bad_request")
-		}
 		s.restore(&st)
 	}
 
@@ -245,6 +266,9 @@ func (s *messagixSession) restore(st *savedState) {
 func (s *messagixSession) dump() []byte {
 	s.mu.Lock()
 	st := savedState{HistoryDevice: s.histDev, WADevice: s.waDeviceJID}
+	if s.platform == "facebook" {
+		st.Platform = s.platform
+	}
 	if len(s.cutover) > 0 {
 		st.Cutover = maps.Clone(s.cutover)
 	}

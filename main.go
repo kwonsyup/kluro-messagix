@@ -23,7 +23,7 @@ type backend interface {
 	// Start signs in with cookies and restores state; it returns the ready
 	// answer and the initial thread events to emit right after it. acks is
 	// the hub whose wait blocks an event until the connector commits it.
-	Start(ctx context.Context, emit emitFunc, acks *ackHub, cookies map[string]string, state []byte, mode string) (Ready, []Frame, error)
+	Start(ctx context.Context, emit emitFunc, acks *ackHub, cookies map[string]string, state []byte, mode, platform string) (Ready, []Frame, error)
 	// HistoryPIN restores the secure-storage enrollment. It returns the new
 	// history state, or an error: *authErr for a wrong/locked PIN.
 	HistoryPIN(ctx context.Context, pin []byte) (HistoryState, error)
@@ -193,7 +193,7 @@ func run(r io.Reader, w io.Writer, mkBackend func() backend) int {
 				em.emit(Frame{T: TError, ID: f.ID, Err: "bad_request"})
 				return -1
 			}
-			ready, initial, err := b.Start(ctx, em.emit, acks, f.Cookies, f.State, f.Mode)
+			ready, initial, err := b.Start(ctx, em.emit, acks, f.Cookies, f.State, f.Mode, f.Platform)
 			var auth *authErr
 			if err != nil {
 				logCode("warn", "start_failed")
