@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	_ "golang.org/x/crypto/x509roots/fallback" // roots for an image without ca-certificates (the connector image has none)
 	"io"
 	"os"
 	"sync"
