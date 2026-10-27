@@ -71,20 +71,22 @@ func stderrLinesAreLevelAndCode(buf *bytes.Buffer) bool {
 
 // fakeBackend scripts the loop's backend.
 type fakeBackend struct {
-	sentText  string
-	sendErr   error
-	histories map[string]*Page
-	stopped   bool
-	loggedOut bool
-	stopState bool
-	acks      *ackHub
-	emit      emitFunc
-	startMode string
+	sentText      string
+	sendErr       error
+	histories     map[string]*Page
+	stopped       bool
+	loggedOut     bool
+	stopState     bool
+	acks          *ackHub
+	emit          emitFunc
+	startMode     string
+	startPlatform string
 }
 
-func (f *fakeBackend) Start(_ context.Context, emit emitFunc, acks *ackHub, cookies map[string]string, state []byte, mode string) (Ready, []Frame, error) {
+func (f *fakeBackend) Start(_ context.Context, emit emitFunc, acks *ackHub, cookies map[string]string, state []byte, mode, platform string) (Ready, []Frame, error) {
 	f.acks, f.emit = acks, emit
 	f.startMode = mode
+	f.startPlatform = platform
 	th := Thread{ID: "e:42", Kind: "user", Encrypted: true, Predecessor: "42", Participants: []Person{{ID: "1", Self: true}, {ID: "42", Name: "P"}}}
 	emit(Frame{T: TState, State: []byte("s1")})
 	return Ready{Self: "1", Name: "Me", History: HistoryNeedsPIN}, []Frame{threadFrame(th)}, nil

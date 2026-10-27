@@ -18,6 +18,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
+	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waConsumerApplication"
 	waTypes "go.mau.fi/whatsmeow/types"
@@ -142,7 +143,7 @@ func TestLogoutOnlyLoadsWebStateWithoutRegisteringOrConnecting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ready, initial, err := s.Start(t.Context(), rec.emit, hub, map[string]string{"c_user": "1", "xs": "test-cookie", "datr": "test-device"}, state, "logout_only")
+	ready, initial, err := s.Start(t.Context(), rec.emit, hub, map[string]string{"c_user": "1", "xs": "test-cookie", "datr": "test-device"}, state, "logout_only", "")
 	t.Cleanup(s.Stop)
 	if err != nil || ready.Self != "1" || len(initial) != 0 {
 		t.Fatalf("start: ready=%+v initial=%d err=%v", ready, len(initial), err)
@@ -587,5 +588,81 @@ func TestProtocolDocumentsHeadCheckpointAndHealth(t *testing.T) {
 	text := string(header)
 	if !strings.Contains(text, "head checkpoint") || !strings.Contains(text, "newest page on start") || strings.Contains(text, "history backfill reconciles") || !strings.Contains(text, "health       Code, Bytes") {
 		t.Fatal("protocol header misstates reconciliation or omits health")
+	}
+}
+
+func TestStartPlatformSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name, platform string
+		want           types.Platform
+	}{
+		{"facebook", "facebook", types.Facebook},
+		{"messenger", "messenger", types.Messenger},
+		{"default", "", types.Messenger},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSession()
+			hub := newAckHub()
+			rec := &emitRecorder{hub: hub}
+			state, err := json.Marshal(savedState{
+				Platform: tc.platform,
+				Messagix: json.RawMessage(`{"Configs":{"BrowserConfigTable":{"CurrentUserInitialData":{"ACCOUNT_ID":"1","USER_ID":"1","NAME":"Me"}},"Bitmap":{},"CSRBitmap":{}},"SyncStore":{}}`),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = s.Start(t.Context(), rec.emit, hub, map[string]string{"c_user": "1", "xs": "x", "datr": "d"}, state, "logout_only", tc.platform)
+			t.Cleanup(s.Stop)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := s.client.GetPlatform(); got != tc.want {
+				t.Fatalf("platform = %v, want %v", got, tc.want)
+			}
+			var saved savedState
+			if err := json.Unmarshal(s.dump(), &saved); err != nil {
+				t.Fatal(err)
+			}
+			if tc.platform == "facebook" && saved.Platform != "facebook" {
+				t.Fatalf("saved platform = %q", saved.Platform)
+			}
+		})
+	}
+}
+
+func TestStartPlatformRefusals(t *testing.T) {
+	validCookies := map[string]string{"c_user": "1", "xs": "x", "datr": "d"}
+	for _, tc := range []struct {
+		name, platform, state string
+		cookies               map[string]string
+	}{
+		{"unknown", "instagram", "", validCookies},
+		{"facebook missing required cookie", "facebook", "", map[string]string{"c_user": "1", "xs": "x", "sb": "s", "fr": "f"}},
+		{"legacy state on facebook", "facebook", `{}`, validCookies},
+		{"messenger state on facebook", "facebook", `{"platform":"messenger"}`, validCookies},
+		{"facebook state on messenger", "messenger", `{"platform":"facebook"}`, validCookies},
+		{"unknown state platform", "messenger", `{"platform":"instagram"}`, validCookies},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSession()
+			hub := newAckHub()
+			rec := &emitRecorder{hub: hub}
+			_, _, err := s.Start(t.Context(), rec.emit, hub, tc.cookies, []byte(tc.state), "logout_only", tc.platform)
+			t.Cleanup(s.Stop)
+			if codeOf(err) != "bad_request" {
+				t.Fatalf("error = %v, want bad_request", err)
+			}
+			if s.client != nil || s.waSnap != nil {
+				t.Fatal("refused input restored a session")
+			}
+		})
+	}
+}
+
+func TestStartFramePassesPlatform(t *testing.T) {
+	fb := &fakeBackend{}
+	runLoop(t, fb, `{"t":"start","id":1,"platform":"facebook"}`, `{"t":"stop","id":2}`)
+	if fb.startPlatform != "facebook" {
+		t.Fatalf("platform = %q", fb.startPlatform)
 	}
 }

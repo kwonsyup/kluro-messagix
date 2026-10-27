@@ -18,7 +18,7 @@ import (
 // protocol and encrypted-history cryptography. Every message carries "t".
 //
 // connector -> sidecar (commands; ID is echoed by the answer):
-//   start        Cookies, State, Mode  connect; optional Mode "logout_only"
+//   start        Cookies, State, Mode, Platform  connect; optional Mode "logout_only"
 //                                      loads only web logout state, registers
 //                                      nothing; accepts only logout and stop
 //   history_pin  PIN                   restore encrypted-history enrollment
@@ -60,6 +60,10 @@ import (
 // redelivery and the connector's head checkpoint reconciles them by paging
 // the newest page on start. State acks block only secure-history enrollment:
 // before AddDevice the sidecar waits up to 60 seconds for its state ack.
+//
+// Start Platform is "facebook" or "messenger"; absent or empty defaults to
+// "messenger". Other values and state from another platform are refused.
+// Legacy state without a platform belongs to Messenger.
 //
 // A sidecar exit without "stop" is a crash: the connector restarts it from the
 // sealed state and resumes from its own checkpoints.
@@ -164,16 +168,17 @@ type Frame struct {
 	waitAck bool `json:"-"`
 
 	// commands
-	Target  int64             `json:"target,omitempty"`
-	Cookies map[string]string `json:"cookies,omitempty"`
-	Mode    string            `json:"mode,omitempty"`
-	State   []byte            `json:"state,omitempty"`
-	PIN     string            `json:"pin,omitempty"`
-	Thread  string            `json:"thread,omitempty"`
-	Cursor  string            `json:"cursor,omitempty"`
-	Count   int               `json:"count,omitempty"`
-	OTID    string            `json:"otid,omitempty"`
-	Text    string            `json:"text,omitempty"`
+	Target   int64             `json:"target,omitempty"`
+	Cookies  map[string]string `json:"cookies,omitempty"`
+	Mode     string            `json:"mode,omitempty"`
+	Platform string            `json:"platform,omitempty"`
+	State    []byte            `json:"state,omitempty"`
+	PIN      string            `json:"pin,omitempty"`
+	Thread   string            `json:"thread,omitempty"`
+	Cursor   string            `json:"cursor,omitempty"`
+	Count    int               `json:"count,omitempty"`
+	OTID     string            `json:"otid,omitempty"`
+	Text     string            `json:"text,omitempty"`
 
 	// events
 	Self      string       `json:"self,omitempty"`
