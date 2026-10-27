@@ -22,6 +22,8 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
+	"github.com/imroc/req/v3"
+	utls "github.com/refraction-networking/utls"
 	"github.com/rs/zerolog"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
@@ -200,7 +202,11 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 	// Library logs are discarded: they are not audited for sensitive content,
 	// and stderr may carry only the sidecar's own level+code lines.
 	cli := messagix.NewClient(ck, zerolog.Nop(), &messagix.Config{})
-	if os.Getenv("MESSENGER_PLAIN_TRANSPORT") == "1" {
+	if os.Getenv("MESSENGER_TLS_NO_PQ") == "1" {
+		// The same Chrome impersonation with a pre-post-quantum ClientHello
+		// (Chrome 120: no ML-KEM key share), which fits in one packet.
+		cli.GetHTTP().SetTransportOverride(chromeNoPQTransport())
+	} else if os.Getenv("MESSENGER_PLAIN_TRANSPORT") == "1" {
 		// Meta does not answer the impersonated (uTLS Chrome) client from some
 		// cloud egress; the standard Go transport (HTTP/2, system TLS) is the
 		// fallback. Requests, cookies and headers are unchanged.
@@ -946,6 +952,13 @@ func mapAuthError(err error) error {
 		return &authErr{AuthCheckpoint}
 	}
 	return errCode("unknown")
+}
+
+func chromeNoPQTransport() http.RoundTripper {
+	c := req.C().ImpersonateChrome().SetTLSFingerprint(utls.HelloChrome_120)
+	t := c.GetTransport()
+	t.SetResponseHeaderTimeout(20 * time.Second)
+	return t
 }
 
 func plainTransport() http.RoundTripper {
