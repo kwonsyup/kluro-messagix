@@ -4,15 +4,20 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/coder/websocket"
@@ -214,12 +219,12 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 	if currentUser == nil {
 		ui, tbl, err := cli.LoadMessagesPage(ctx)
 		if err != nil {
-			return Ready{}, nil, mapAuthError(err)
+			return Ready{}, nil, classifyStartError("load_page", err)
 		}
 		currentUser, initial = ui, tbl
 	}
 	if currentUser.GetFBID() == 0 {
-		return Ready{}, nil, errCode("unknown")
+		return Ready{}, nil, errCode("load_page_no_user")
 	}
 	s.selfName = currentUser.GetName()
 	if s.logoutOnly {
@@ -236,7 +241,7 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 	}
 	if err := cli.Connect(s.ctx); err != nil {
 		logCode("warn", "connect_failed")
-		return Ready{}, nil, mapAuthError(err)
+		return Ready{}, nil, classifyStartError("connect", err)
 	}
 	s.scheduleE2EE()
 
@@ -935,6 +940,47 @@ func mapAuthError(err error) error {
 		return &authErr{AuthCheckpoint}
 	}
 	return errCode("unknown")
+}
+
+// classifyStartError keeps auth answers as they are and names every other
+// start failure by stage and a fixed class (never the error text, which can
+// carry provider content): load_page_timeout, connect_dns, load_page_other...
+func classifyStartError(stage string, err error) error {
+	mapped := mapAuthError(err)
+	var auth *authErr
+	if errors.As(mapped, &auth) {
+		return mapped
+	}
+	code := stage + "_" + errorClass(err)
+	logCode("warn", code)
+	return errCode(code)
+}
+
+func errorClass(err error) string {
+	var dns *net.DNSError
+	var netErr net.Error
+	var tlsRecord tls.RecordHeaderError
+	var unknownAuthority x509.UnknownAuthorityError
+	var hostname x509.HostnameError
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "cancelled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.As(err, &dns):
+		return "dns"
+	case errors.As(err, &tlsRecord), errors.As(err, &unknownAuthority), errors.As(err, &hostname):
+		return "tls"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "refused"
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
+		return "reset"
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return "timeout"
+	case errors.As(err, &netErr):
+		return "net"
+	}
+	return "other"
 }
 
 func zero(b []byte) {
