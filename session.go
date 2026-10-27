@@ -200,6 +200,12 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 	// Library logs are discarded: they are not audited for sensitive content,
 	// and stderr may carry only the sidecar's own level+code lines.
 	cli := messagix.NewClient(ck, zerolog.Nop(), &messagix.Config{})
+	if os.Getenv("MESSENGER_PLAIN_TRANSPORT") == "1" {
+		// Meta does not answer the impersonated (uTLS Chrome) client from some
+		// cloud egress; the standard Go transport (HTTP/2, system TLS) is the
+		// fallback. Requests, cookies and headers are unchanged.
+		cli.GetHTTP().SetTransportOverride(plainTransport())
+	}
 	if !s.logoutOnly {
 		cli.SetEventHandler(s.handleMetaEvent)
 	}
@@ -940,6 +946,12 @@ func mapAuthError(err error) error {
 		return &authErr{AuthCheckpoint}
 	}
 	return errCode("unknown")
+}
+
+func plainTransport() http.RoundTripper {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = 20 * time.Second
+	return t
 }
 
 // classifyStartError keeps auth answers as they are and names every other
