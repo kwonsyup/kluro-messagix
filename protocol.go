@@ -38,8 +38,8 @@ import (
 //   state        State, Seq            durable sidecar state changed: seal and ack
 //   health       Code, Bytes           fixed health code and state byte count; no ack
 //   thread       Thread                a thread exists / changed
-//   threads_done Gap                   the answer to "threads"; a Gap means the listing ended early
-//                                      (e2ee_range_timeout) with every thread found so far emitted
+//   threads_done Stats, Gap            the answer to "threads"; Stats are listing counts (integers only); a Gap
+//                                      (requests_incomplete) means known message requests were left unread
 //   message      Message, Seq          a live message
 //   edit         Edit, Seq             a live edit
 //   unsend       Unsend, Seq           a live unsend
@@ -182,20 +182,21 @@ type Frame struct {
 	Text     string            `json:"text,omitempty"`
 
 	// events
-	Self      string       `json:"self,omitempty"`
-	Name      string       `json:"name,omitempty"`
-	History   HistoryState `json:"history,omitempty"`
-	ThreadEvt *Thread      `json:"thread_evt,omitempty"`
-	Message   *Message     `json:"message,omitempty"`
-	Edit      *Edit        `json:"edit,omitempty"`
-	Unsend    *Unsend      `json:"unsend,omitempty"`
-	Page      *Page        `json:"page,omitempty"`
-	Sent      *Sent        `json:"sent,omitempty"`
-	Auth      AuthState    `json:"auth,omitempty"`
-	Err       string       `json:"err,omitempty"`   // a fixed code, never provider text
-	Gap       string       `json:"gap,omitempty"`   // threads_done: why the listing ended early (a fixed code)
-	Code      string       `json:"code,omitempty"`  // health: a fixed code
-	Bytes     int          `json:"bytes,omitempty"` // health: unencoded state bytes
+	Self      string         `json:"self,omitempty"`
+	Name      string         `json:"name,omitempty"`
+	History   HistoryState   `json:"history,omitempty"`
+	ThreadEvt *Thread        `json:"thread_evt,omitempty"`
+	Message   *Message       `json:"message,omitempty"`
+	Edit      *Edit          `json:"edit,omitempty"`
+	Unsend    *Unsend        `json:"unsend,omitempty"`
+	Page      *Page          `json:"page,omitempty"`
+	Sent      *Sent          `json:"sent,omitempty"`
+	Auth      AuthState      `json:"auth,omitempty"`
+	Err       string         `json:"err,omitempty"`   // a fixed code, never provider text
+	Stats     map[string]int `json:"stats,omitempty"` // threads_done: listing counts, never ids or names
+	Gap       string         `json:"gap,omitempty"`   // threads_done: why the listing ended early (a fixed code)
+	Code      string         `json:"code,omitempty"`  // health: a fixed code
+	Bytes     int            `json:"bytes,omitempty"` // health: unencoded state bytes
 }
 
 // Frame types.

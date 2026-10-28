@@ -70,6 +70,10 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame)
 	touched := map[string]bool{}
 	upsertThread := func(key int64, typ table.ThreadType, name string, last int64) {
 		originalKey := key
+		s.rowKeys[originalKey] = true
+		if typ.IsWhatsApp() {
+			s.encRowKeys[originalKey] = true
+		}
 		enc := typ.IsWhatsApp()
 		if mapped, ok := s.fbToWA[key]; ok {
 			key, enc = mapped, true
@@ -102,6 +106,12 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame)
 	}
 	for _, th := range tbl.LSUpdateOrInsertThread {
 		upsertThread(th.ThreadKey, th.ThreadType, th.ThreadName, th.LastActivityTimestampMs)
+	}
+	// A bare existence row names an encrypted chat the inbox rows may not have.
+	for _, th := range tbl.LSVerifyThreadExists {
+		if th.ThreadType.IsWhatsApp() {
+			upsertThread(th.ThreadKey, th.ThreadType, "", 0)
+		}
 	}
 	for _, p := range tbl.LSAddParticipantIdToGroupThread {
 		key, enc := s.mapKey(p.ThreadKey)
@@ -463,4 +473,50 @@ func consumerContent(app *waConsumerApplication.ConsumerApplication) (text, medi
 		media = "attachment"
 	}
 	return text, media, ""
+}
+
+// encryptedCounts reports how many encrypted chats the helper knows of (a thread
+// record, a cutover link or a hybrid mapping) and how many of those no table
+// has named, so they have no thread record and were not listed.
+func (s *messagixSession) encryptedCounts() (known, unlisted int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keys := map[int64]bool{}
+	for k := range s.cutover {
+		keys[k] = true
+	}
+	for _, k := range s.fbToWA {
+		keys[k] = true
+	}
+	for _, t := range s.threads {
+		if t.Enc {
+			keys[t.Key] = true
+		}
+	}
+	for k := range keys {
+		if s.threads[wireID(true, k)] == nil {
+			unlisted++
+		}
+	}
+	return len(keys), unlisted
+}
+
+// listingStats is the counts-only diagnostic on threads_done.
+func (s *messagixSession) listingStats(known, emitted, unlisted int) map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	connected := 0
+	if s.e2ee != nil && s.e2ee.IsConnected() {
+		connected = 1
+	}
+	return map[string]int{
+		"group1_threads":        len(s.rowKeys),
+		"group1_encrypted_rows": len(s.encRowKeys),
+		"hybrid_mappings":       len(s.fbToWA),
+		"cutover_links":         len(s.cutover),
+		"encrypted_known":       known,
+		"encrypted_emitted":     emitted,
+		"e2ee_connected":        connected,
+		"encrypted_unlisted":    unlisted,
+	}
 }

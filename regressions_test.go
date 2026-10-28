@@ -233,10 +233,10 @@ func TestLogoutWaitsForExistingWorkAndClosesAdmission(t *testing.T) {
 
 type cancellableListingBackend struct{ fakeBackend }
 
-func (b *cancellableListingBackend) Threads(ctx context.Context, emit emitFunc) error {
+func (b *cancellableListingBackend) Threads(ctx context.Context, emit emitFunc) (listingDone, error) {
 	emit(threadFrame(Thread{ID: "first-batch", Kind: "group"}))
 	<-ctx.Done()
-	return ctx.Err()
+	return listingDone{}, ctx.Err()
 }
 
 func TestStopAndLogoutCancelListingAfterFirstBatch(t *testing.T) {
