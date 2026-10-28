@@ -353,6 +353,8 @@ type threadRanges interface {
 	ThreadRangeGeneration(syncGroup int64) uint64
 	GetSyncGroupKeyStore(syncGroup int64) *socket.KeyStoreData
 	FetchMoreThreads(ctx context.Context, syncGroup int64) (*socket.KeyStoreData, *table.LSTable, error)
+	ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error)
+	PostHandlePublishResponse(tbl *table.LSTable)
 }
 
 // waitE2EERange runs one encrypted-range wait for at most e2eeRangeWait. It
@@ -406,6 +408,51 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadRanges, emi
 	return nil
 }
 
+// explicitE2EEFetch sends the group-95 FetchThreadsTask the first socket connect
+// would have sent (the same parameters as the library's initial sync), emits the
+// threads it returns and reports whether the reply carried the range, so the
+// encrypted listing is known to be complete up to the keystore. One attempt,
+// bounded by e2eeRangeWait; a failure or an empty reply is not an error and
+// leaves the caller's gap in place.
+func (s *messagixSession) explicitE2EEFetch(ctx context.Context, cli threadRanges, emit emitFunc) (bool, error) {
+	logCode("warn", "e2ee_explicit_fetch")
+	wctx, cancel := context.WithTimeout(ctx, e2eeRangeWait)
+	defer cancel()
+	gen := cli.ThreadRangeGeneration(e2eeSyncGroup)
+	tbl, err := cli.ExecuteTasks(wctx, &socket.FetchThreadsTask{
+		IsAfter:                    0,
+		ParentThreadKey:            -1,
+		ReferenceThreadKey:         0,
+		ReferenceActivityTimestamp: 9999999999999,
+		AdditionalPagesToFetch:     0,
+		SyncGroup:                  e2eeSyncGroup,
+	})
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	if err != nil || tbl == nil {
+		logCode("warn", "e2ee_explicit_fetch_failed")
+		return false, nil
+	}
+	cli.PostHandlePublishResponse(tbl)
+	threads := 0
+	for _, f := range s.handleTableFrames(tbl) {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if f.T == TThread {
+			threads++
+		}
+		emit(f)
+	}
+	if threads == 0 {
+		logCode("warn", "e2ee_explicit_fetch_empty")
+	} else {
+		logCode("warn", "e2ee_explicit_fetch_threads")
+	}
+	return cli.ThreadRangeGeneration(e2eeSyncGroup) > gen, nil
+}
+
 func (s *messagixSession) pageThreads(ctx context.Context, cli threadRanges, group int64, emit emitFunc) error {
 	if group == e2eeSyncGroup {
 		// Only the update itself fills the keystore, so the wait has to come
@@ -417,7 +464,15 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadRanges, gro
 			return err
 		}
 		if timedOut {
-			return &listingGap{gapE2EERangeTimeout}
+			// The initial group-95 fetch only goes out on a client's first socket
+			// connect, so a restarted helper never gets the range: ask for it once.
+			known, err := s.explicitE2EEFetch(ctx, cli, emit)
+			if err != nil {
+				return err
+			}
+			if !known {
+				return &listingGap{gapE2EERangeTimeout}
+			}
 		}
 	}
 	var prevMin int64

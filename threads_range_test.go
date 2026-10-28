@@ -15,8 +15,14 @@ import (
 // silentRanges is a client for which no group-95 range update ever arrives:
 // the waits honour only their context, as the library's do.
 type silentRanges struct {
-	more         bool // the keystore reports more encrypted threads
-	initialReady bool // the initial range wait returns at once
+	explicit      *table.LSTable // the reply to the explicit group-95 fetch
+	explicitErr   error
+	explicitBlock bool // the explicit fetch honours only its context
+	rangeInReply  bool // the explicit reply carries the range update
+	tasks         []socket.Task
+	gen           uint64
+	more          bool // the keystore reports more encrypted threads
+	initialReady  bool // the initial range wait returns at once
 }
 
 func (r *silentRanges) WaitForInitialThreadRange(ctx context.Context, _ int64) error {
@@ -32,7 +38,22 @@ func (r *silentRanges) WaitForThreadRange(ctx context.Context, _ int64, _ uint64
 	return ctx.Err()
 }
 
-func (r *silentRanges) ThreadRangeGeneration(int64) uint64 { return 0 }
+func (r *silentRanges) ThreadRangeGeneration(int64) uint64 { return r.gen }
+
+func (r *silentRanges) ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error) {
+	r.tasks = append(r.tasks, tasks...)
+	if r.explicitBlock {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return r.explicit, r.explicitErr
+}
+
+func (r *silentRanges) PostHandlePublishResponse(*table.LSTable) {
+	if r.rangeInReply {
+		r.gen++
+	}
+}
 
 func (r *silentRanges) GetSyncGroupKeyStore(int64) *socket.KeyStoreData {
 	return &socket.KeyStoreData{HasMoreBefore: r.more}
@@ -153,5 +174,106 @@ func TestListingWithRangeUpdatesPresentHasNoGap(t *testing.T) {
 	_, err, done := listWithin(t, s, &silentRanges{initialReady: true}, context.Background(), 3*time.Second)
 	if !done || err != nil {
 		t.Fatalf("listing done=%v err=%v", done, err)
+	}
+}
+
+func encryptedTable() *table.LSTable {
+	return &table.LSTable{
+		LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{
+			{ThreadKey: 4242, ThreadType: table.ENCRYPTED_OVER_WA_GROUP, ThreadName: "Group", LastActivityTimestampMs: 20},
+			{ThreadKey: 5151, ThreadType: table.ENCRYPTED_OVER_WA_ONE_TO_ONE, LastActivityTimestampMs: 10},
+		},
+		LSAddParticipantIdToGroupThread: []*table.LSAddParticipantIdToGroupThread{{ThreadKey: 4242, ContactId: 42}},
+	}
+}
+
+func threadsByID(frames []Frame) map[string]*Thread {
+	out := map[string]*Thread{}
+	for _, f := range frames {
+		if f.T == TThread {
+			out[f.ThreadEvt.ID] = f.ThreadEvt
+		}
+	}
+	return out
+}
+
+func checkEncryptedPair(t *testing.T, frames []Frame) {
+	t.Helper()
+	got := threadsByID(frames)
+	if g := got["e:4242"]; g == nil || g.Kind != "group" || !g.Encrypted || g.Title != "Group" {
+		t.Fatalf("encrypted group = %+v", g)
+	}
+	if u := got["e:5151"]; u == nil || u.Kind != "user" || !u.Encrypted {
+		t.Fatalf("encrypted 1:1 = %+v", u)
+	}
+}
+
+func TestExplicitE2EEFetchNamesTheThreadsWhenTheRangeNeverArrives(t *testing.T) {
+	old := e2eeRangeWait
+	e2eeRangeWait = 100 * time.Millisecond
+	defer func() { e2eeRangeWait = old }()
+
+	// The reply carries the range: the encrypted listing is complete, no gap.
+	r := &silentRanges{explicit: encryptedTable(), rangeInReply: true}
+	frames, err, done := listWithin(t, newTestSession(), r, context.Background(), 3*time.Second)
+	if !done || err != nil {
+		t.Fatalf("listing done=%v err=%v", done, err)
+	}
+	checkEncryptedPair(t, frames)
+	if len(r.tasks) != 1 {
+		t.Fatalf("want exactly one explicit fetch, got %d", len(r.tasks))
+	}
+	task, ok := r.tasks[0].(*socket.FetchThreadsTask)
+	if !ok || *task != (socket.FetchThreadsTask{ParentThreadKey: -1, ReferenceActivityTimestamp: 9999999999999, SyncGroup: 95}) {
+		t.Fatalf("explicit task = %+v", r.tasks[0])
+	}
+
+	// No range in the reply: the threads are still named, but the listing may be incomplete.
+	r = &silentRanges{explicit: encryptedTable()}
+	frames, err, done = listWithin(t, newTestSession(), r, context.Background(), 3*time.Second)
+	var gap *listingGap
+	if !done || !errors.As(err, &gap) || gap.code != "e2ee_range_timeout" {
+		t.Fatalf("listing done=%v err=%v", done, err)
+	}
+	checkEncryptedPair(t, frames)
+}
+
+func TestExplicitE2EEFetchFailureKeepsTheGap(t *testing.T) {
+	old := e2eeRangeWait
+	e2eeRangeWait = 100 * time.Millisecond
+	defer func() { e2eeRangeWait = old }()
+
+	for name, r := range map[string]*silentRanges{
+		"error":   {explicitErr: errors.New("boom")},
+		"nothing": {},
+		"timeout": {explicitBlock: true},
+		"empty":   {explicit: &table.LSTable{}, rangeInReply: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			frames, err, done := listWithin(t, newTestSession(), r, context.Background(), 3*time.Second)
+			var gap *listingGap
+			if !done || !errors.As(err, &gap) || gap.code != "e2ee_range_timeout" {
+				t.Fatalf("listing done=%v err=%v", done, err)
+			}
+			if len(threadsByID(frames)) != 0 || len(r.tasks) != 1 {
+				t.Fatalf("threads=%d fetches=%d", len(threadsByID(frames)), len(r.tasks))
+			}
+		})
+	}
+}
+
+func TestExplicitE2EEFetchHonoursCancel(t *testing.T) {
+	old := e2eeRangeWait
+	e2eeRangeWait = 300 * time.Millisecond
+	defer func() { e2eeRangeWait = old }()
+
+	// The initial wait expires at 300 ms; the cancel lands inside the blocked explicit fetch.
+	r := &silentRanges{explicitBlock: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(450 * time.Millisecond); cancel() }()
+	_, err, done := listWithin(t, newTestSession(), r, ctx, 3*time.Second)
+	var gap *listingGap
+	if !done || err == nil || errors.As(err, &gap) || len(r.tasks) != 1 {
+		t.Fatalf("a cancelled listing must report the cancel after one fetch, got done=%v err=%v fetches=%d", done, err, len(r.tasks))
 	}
 }
