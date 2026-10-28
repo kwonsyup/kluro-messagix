@@ -360,6 +360,8 @@ type threadRanges interface {
 	ThreadRangeGeneration(syncGroup int64) uint64
 	GetSyncGroupKeyStore(syncGroup int64) *socket.KeyStoreData
 	FetchMoreThreads(ctx context.Context, syncGroup int64) (*socket.KeyStoreData, *table.LSTable, error)
+	ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error)
+	PostHandlePublishResponse(tbl *table.LSTable)
 }
 
 // waitE2EERange runs one encrypted-range wait for at most e2eeRangeWait. It
@@ -423,6 +425,55 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadRanges, emi
 	return listingDone{Stats: s.listingStats(known, len(emitted), unlisted), Gap: gap}, nil
 }
 
+// fetchRequests sends the group-95 FetchThreadsTask the first socket connect of
+// a fresh session sends (the library's initial-sync parameters), applies the
+// reply to the library's sync state, and emits the threads it returns. One
+// attempt, bounded by e2eeRangeWait, cancel honoured. A failed or timed-out
+// fetch leaves the requests unknown: a requests_incomplete gap. A reply with no
+// range or no threads is an empty request inbox. The caller then pages on from
+// the keystore the reply filled.
+func (s *messagixSession) fetchRequests(ctx context.Context, cli threadRanges, emit emitFunc) error {
+	logCode("info", "requests_fetch")
+	wctx, cancel := context.WithTimeout(ctx, e2eeRangeWait)
+	defer cancel()
+	tbl, err := cli.ExecuteTasks(wctx, &socket.FetchThreadsTask{
+		IsAfter:                    0,
+		ParentThreadKey:            -1,
+		ReferenceThreadKey:         0,
+		ReferenceActivityTimestamp: 9999999999999,
+		AdditionalPagesToFetch:     0,
+		SyncGroup:                  e2eeSyncGroup,
+	})
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil {
+		logCode("warn", "requests_fetch_failed")
+		return &listingGap{gapRequestsIncomplete}
+	}
+	if tbl == nil {
+		logCode("info", "requests_fetch_empty")
+		return nil
+	}
+	cli.PostHandlePublishResponse(tbl)
+	threads := 0
+	for _, f := range s.handleTableFrames(tbl) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if f.T == TThread {
+			threads++
+		}
+		emit(f)
+	}
+	if threads == 0 {
+		logCode("info", "requests_fetch_empty")
+	} else {
+		logCode("info", "requests_fetch_threads")
+	}
+	return nil
+}
+
 func (s *messagixSession) pageThreads(ctx context.Context, cli threadRanges, group int64, emit emitFunc) error {
 	if group == e2eeSyncGroup {
 		// Only the update itself fills the keystore, so the wait has to come
@@ -434,7 +485,11 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadRanges, gro
 			return err
 		}
 		if timedOut {
-			return nil
+			// A resumed session never sent the initial group-95 fetch, so the wait
+			// proves nothing about pending requests: ask once.
+			if err := s.fetchRequests(ctx, cli, emit); err != nil {
+				return err
+			}
 		}
 	}
 	var prevMin int64

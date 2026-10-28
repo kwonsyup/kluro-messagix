@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -14,9 +15,15 @@ import (
 // silentRanges is a client for which no group-95 range update ever arrives:
 // the waits honour only their context, as the library's do.
 type silentRanges struct {
-	more         bool // the keystore reports more threads
-	initialReady bool // the initial range wait returns at once
-	group1       *table.LSTable
+	more          bool // the keystore reports more threads
+	initialReady  bool // the initial range wait returns at once
+	group1        *table.LSTable
+	explicit      *table.LSTable // the reply to the explicit group-95 fetch
+	explicitErr   error
+	explicitBlock bool // the explicit fetch honours only its context
+	rangeInReply  bool // the explicit reply carries the range update
+	tasks         []socket.Task
+	gen           uint64
 }
 
 func (r *silentRanges) WaitForInitialThreadRange(ctx context.Context, _ int64) error {
@@ -32,7 +39,22 @@ func (r *silentRanges) WaitForThreadRange(ctx context.Context, _ int64, _ uint64
 	return ctx.Err()
 }
 
-func (r *silentRanges) ThreadRangeGeneration(int64) uint64 { return 0 }
+func (r *silentRanges) ThreadRangeGeneration(int64) uint64 { return r.gen }
+
+func (r *silentRanges) ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error) {
+	r.tasks = append(r.tasks, tasks...)
+	if r.explicitBlock {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return r.explicit, r.explicitErr
+}
+
+func (r *silentRanges) PostHandlePublishResponse(*table.LSTable) {
+	if r.rangeInReply {
+		r.gen++
+	}
+}
 
 func (r *silentRanges) GetSyncGroupKeyStore(int64) *socket.KeyStoreData {
 	return &socket.KeyStoreData{HasMoreBefore: r.more}
@@ -102,7 +124,7 @@ func TestListingGroup95Timeouts(t *testing.T) {
 		r       *silentRanges
 		wantGap string
 	}{
-		"initial range absent": {&silentRanges{}, ""},
+		"initial range absent": {&silentRanges{explicit: &table.LSTable{}}, ""},
 		"batch wait":           {&silentRanges{more: true, initialReady: true}, "requests_incomplete"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -251,5 +273,81 @@ func TestStateWithHybridKindStillLoads(t *testing.T) {
 	s.restore(&st)
 	if s.fbToWA[400] != 1400 || s.cutover[1100] != 100 {
 		t.Fatalf("restored fbToWA=%v cutover=%v", s.fbToWA, s.cutover)
+	}
+}
+
+func requestTable() *table.LSTable {
+	return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{
+		{ThreadKey: 8181, ThreadType: table.ONE_TO_ONE, LastActivityTimestampMs: 30},
+	}}
+}
+
+// A resumed session never sends the initial group-95 fetch, so when the initial
+// wait expires the helper asks once itself.
+func TestExplicitRequestsFetchWhenTheInitialWaitExpires(t *testing.T) {
+	shortWait(t, 100*time.Millisecond)
+
+	// One fetch with the library's initial-sync parameters; a request thread is emitted;
+	// the range says no more, so the listing is complete.
+	r := &silentRanges{explicit: requestTable(), rangeInReply: true}
+	frames, res, err, done := listWithin(t, newTestSession(), r, context.Background(), 3*time.Second)
+	if !done || err != nil || res.Gap != "" {
+		t.Fatalf("done=%v err=%v res=%+v", done, err, res)
+	}
+	if u := threadsByID(frames)["8181"]; u == nil || u.Kind != "user" {
+		t.Fatalf("request thread = %+v", threadsByID(frames))
+	}
+	if len(r.tasks) != 1 {
+		t.Fatalf("want exactly one explicit fetch, got %d", len(r.tasks))
+	}
+	task, ok := r.tasks[0].(*socket.FetchThreadsTask)
+	if !ok || *task != (socket.FetchThreadsTask{ParentThreadKey: -1, ReferenceActivityTimestamp: 9999999999999, SyncGroup: 95}) {
+		t.Fatalf("explicit task = %+v", r.tasks[0])
+	}
+
+	// A range that says more exist and a later batch that never arrives: known requests are unread.
+	r = &silentRanges{explicit: requestTable(), rangeInReply: true, more: true}
+	_, res, err, done = listWithin(t, newTestSession(), r, context.Background(), 3*time.Second)
+	if !done || err != nil || res.Gap != "requests_incomplete" || len(r.tasks) != 1 {
+		t.Fatalf("done=%v err=%v res=%+v fetches=%d", done, err, res, len(r.tasks))
+	}
+
+	// The initial range arrived on its own: no explicit fetch.
+	r = &silentRanges{initialReady: true}
+	if _, _, _, done = listWithin(t, newTestSession(), r, context.Background(), 3*time.Second); !done || len(r.tasks) != 0 {
+		t.Fatalf("done=%v fetches=%d, want none", done, len(r.tasks))
+	}
+}
+
+func TestExplicitRequestsFetchOutcomes(t *testing.T) {
+	shortWait(t, 100*time.Millisecond)
+	for name, tc := range map[string]struct {
+		r       *silentRanges
+		wantGap string
+	}{
+		"error":             {&silentRanges{explicitErr: errors.New("boom")}, "requests_incomplete"},
+		"timeout":           {&silentRanges{explicitBlock: true}, "requests_incomplete"},
+		"empty reply":       {&silentRanges{explicit: &table.LSTable{}}, ""},
+		"range, no rows":    {&silentRanges{explicit: &table.LSTable{}, rangeInReply: true}, ""},
+		"threads, no range": {&silentRanges{explicit: requestTable()}, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, res, err, done := listWithin(t, newTestSession(), tc.r, context.Background(), 3*time.Second)
+			if !done || err != nil || res.Gap != tc.wantGap || len(tc.r.tasks) != 1 {
+				t.Fatalf("done=%v err=%v res=%+v fetches=%d", done, err, res, len(tc.r.tasks))
+			}
+		})
+	}
+}
+
+func TestExplicitRequestsFetchHonoursCancel(t *testing.T) {
+	shortWait(t, 300*time.Millisecond)
+	// The initial wait expires at 300 ms; the cancel lands inside the blocked explicit fetch.
+	r := &silentRanges{explicitBlock: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(450 * time.Millisecond); cancel() }()
+	_, res, err, done := listWithin(t, newTestSession(), r, ctx, 3*time.Second)
+	if !done || err == nil || res.Gap != "" || len(r.tasks) != 1 {
+		t.Fatalf("a cancelled listing must report the cancel after one fetch: done=%v err=%v res=%+v fetches=%d", done, err, res, len(r.tasks))
 	}
 }
