@@ -17,7 +17,6 @@ import (
 	waTypes "go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 
-	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
@@ -334,21 +333,60 @@ const (
 	e2eeSyncGroup    = 95
 )
 
+// e2eeRangeWait bounds each wait for an encrypted-range update. Some accounts
+// never receive one, and the library wait honours only its context.
+var e2eeRangeWait = 20 * time.Second
+
+// listingGap is returned by Threads when the listing ended early for a fixed
+// reason: the loop answers with threads_done carrying that code as its gap,
+// not with an error.
+type listingGap struct{ code string }
+
+func (g *listingGap) Error() string { return "messenger: listing gap " + g.code }
+
+const gapE2EERangeTimeout = "e2ee_range_timeout"
+
+// threadRanges is the part of the messagix client the thread listing uses.
+type threadRanges interface {
+	WaitForInitialThreadRange(ctx context.Context, syncGroup int64) error
+	WaitForThreadRange(ctx context.Context, syncGroup int64, generation uint64) error
+	ThreadRangeGeneration(syncGroup int64) uint64
+	GetSyncGroupKeyStore(syncGroup int64) *socket.KeyStoreData
+	FetchMoreThreads(ctx context.Context, syncGroup int64) (*socket.KeyStoreData, *table.LSTable, error)
+}
+
+// waitE2EERange runs one encrypted-range wait for at most e2eeRangeWait. It
+// reports true when only the bound expired, with the caller's ctx still live.
+func waitE2EERange(ctx context.Context, wait func(context.Context) error) (bool, error) {
+	wctx, cancel := context.WithTimeout(ctx, e2eeRangeWait)
+	defer cancel()
+	err := wait(wctx)
+	if err != nil && ctx.Err() == nil && wctx.Err() != nil {
+		logCode("warn", gapE2EERangeTimeout)
+		return true, nil
+	}
+	return false, err
+}
+
 // Threads lists every thread: the ones already known, then the rest of the
 // inbox by paging the lightspeed thread ranges (the pre-encryption inbox and
 // the encrypted-chat range), as the web client scrolls them in.
 func (s *messagixSession) Threads(ctx context.Context, emit emitFunc) error {
-	for _, f := range s.sortedThreadFrames() {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		emit(f)
-	}
 	s.mu.Lock()
 	cli := s.client
 	s.mu.Unlock()
 	if cli == nil {
 		return errCode("not_started")
+	}
+	return s.listThreads(ctx, cli, emit)
+}
+
+func (s *messagixSession) listThreads(ctx context.Context, cli threadRanges, emit emitFunc) error {
+	for _, f := range s.sortedThreadFrames() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		emit(f)
 	}
 	if err := s.pageThreads(ctx, cli, 1, emit); err != nil {
 		return err
@@ -357,6 +395,10 @@ func (s *messagixSession) Threads(ctx context.Context, emit emitFunc) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		var gap *listingGap
+		if errors.As(err, &gap) {
+			return gap
+		}
 		// The encrypted range is optional: a failure leaves those threads to
 		// arrive live.
 		logCode("warn", "e2ee_threads_failed")
@@ -364,10 +406,18 @@ func (s *messagixSession) Threads(ctx context.Context, emit emitFunc) error {
 	return nil
 }
 
-func (s *messagixSession) pageThreads(ctx context.Context, cli *messagix.Client, group int64, emit emitFunc) error {
+func (s *messagixSession) pageThreads(ctx context.Context, cli threadRanges, group int64, emit emitFunc) error {
 	if group == e2eeSyncGroup {
-		if err := cli.WaitForInitialThreadRange(ctx, group); err != nil {
+		// Only the update itself fills the keystore, so the wait has to come
+		// before the "no more threads" test below.
+		timedOut, err := waitE2EERange(ctx, func(wctx context.Context) error {
+			return cli.WaitForInitialThreadRange(wctx, group)
+		})
+		if err != nil {
 			return err
+		}
+		if timedOut {
+			return &listingGap{gapE2EERangeTimeout}
 		}
 	}
 	var prevMin int64
@@ -396,8 +446,14 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli *messagix.Client,
 			emit(f)
 		}
 		if group == e2eeSyncGroup {
-			if err := cli.WaitForThreadRange(ctx, group, gen); err != nil {
+			timedOut, err := waitE2EERange(ctx, func(wctx context.Context) error {
+				return cli.WaitForThreadRange(wctx, group, gen)
+			})
+			if err != nil {
 				return err
+			}
+			if timedOut {
+				return &listingGap{gapE2EERangeTimeout}
 			}
 		}
 		if !ks.HasMoreBefore || ks.MinThreadKey == prevMin {

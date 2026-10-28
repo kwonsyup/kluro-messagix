@@ -81,6 +81,7 @@ type fakeBackend struct {
 	emit          emitFunc
 	startMode     string
 	startPlatform string
+	threadsErr    error // returned by Threads after it emits its thread
 }
 
 func (f *fakeBackend) Start(_ context.Context, emit emitFunc, acks *ackHub, cookies map[string]string, state []byte, mode, platform string) (Ready, []Frame, error) {
@@ -105,7 +106,7 @@ func (f *fakeBackend) Threads(_ context.Context, emit emitFunc) error {
 		}
 	}
 	emit(threadFrame(Thread{ID: "42", Kind: "user"}))
-	return nil
+	return f.threadsErr
 }
 func (f *fakeBackend) History(_ context.Context, thread, cursor string, count int) (*Page, error) {
 	if p, ok := f.histories[thread+"|"+cursor]; ok {

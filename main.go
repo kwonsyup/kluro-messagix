@@ -249,6 +249,11 @@ func run(r io.Reader, w io.Writer, mkBackend func() backend) int {
 			listingCancel = nil
 			commandMu.Unlock()
 			cancelList()
+			var gap *listingGap
+			if errors.As(err, &gap) {
+				em.emit(Frame{T: TThreadsDone, ID: f.ID, Gap: gap.code})
+				return -1
+			}
 			if err != nil {
 				em.emit(Frame{T: TError, ID: f.ID, Err: codeOf(err)})
 				return -1
