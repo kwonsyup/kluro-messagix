@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -69,8 +71,9 @@ func TestListingFinishesWhenNoEncryptedRangeUpdateArrives(t *testing.T) {
 			if !done {
 				t.Fatal("thread listing blocked on a group-95 range update that never arrives")
 			}
-			if err != nil {
-				t.Fatalf("listing must end cleanly so threads_done is emitted, got %v", err)
+			var gap *listingGap
+			if !errors.As(err, &gap) || gap.code != "e2ee_range_timeout" {
+				t.Fatalf("listing must end with the e2ee_range_timeout gap, got %v", err)
 			}
 		})
 	}
@@ -84,7 +87,8 @@ func TestListingKeepsKnownThreadsWhenEncryptedRangeTimesOut(t *testing.T) {
 	s := newTestSession()
 	s.threads["100"] = &threadInfo{Key: 100, Kind: "user", Title: "Known", LastActivity: 5}
 	frames, err, done := listWithin(t, s, &silentRanges{more: true}, context.Background(), 3*time.Second)
-	if !done || err != nil {
+	var gap *listingGap
+	if !done || !errors.As(err, &gap) {
 		t.Fatalf("listing done=%v err=%v", done, err)
 	}
 	if len(frames) == 0 || frames[0].T != TThread {
@@ -106,5 +110,48 @@ func TestListingCancelStillWinsOverTheBound(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("a cancelled listing must report the cancel, not a clean end")
+	}
+}
+
+// The loop answers a gap listing with threads_done carrying gap, and a normal
+// listing with a threads_done that has none.
+func TestThreadsDoneCarriesTheGapOnlyWhenTheListingEndedEarly(t *testing.T) {
+	const startAndList = `{"t":"start","id":1,"cookies":{"c_user":"1","xs":"x","datr":"d"}}`
+	for name, tc := range map[string]struct {
+		err  error
+		want string
+	}{
+		"gap":    {&listingGap{gapE2EERangeTimeout}, "e2ee_range_timeout"},
+		"normal": {nil, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			frames := runLoop(t, &fakeBackend{threadsErr: tc.err}, startAndList, `{"t":"threads","id":2}`)
+			var done *Frame
+			for i, f := range frames {
+				if f.ID == 2 {
+					done = &frames[i]
+				}
+			}
+			if done == nil || done.T != TThreadsDone || done.Gap != tc.want || done.Err != "" {
+				t.Fatalf("threads answer = %+v", done)
+			}
+		})
+	}
+	// the wire key is "gap"
+	b, _ := json.Marshal(Frame{T: TThreadsDone, ID: 2, Gap: "e2ee_range_timeout"})
+	if string(b) != `{"t":"threads_done","id":2,"gap":"e2ee_range_timeout"}` {
+		t.Fatalf("wire = %s", b)
+	}
+	b, _ = json.Marshal(Frame{T: TThreadsDone, ID: 2})
+	if string(b) != `{"t":"threads_done","id":2}` {
+		t.Fatalf("wire = %s", b)
+	}
+}
+
+func TestListingWithRangeUpdatesPresentHasNoGap(t *testing.T) {
+	s := newTestSession()
+	_, err, done := listWithin(t, s, &silentRanges{initialReady: true}, context.Background(), 3*time.Second)
+	if !done || err != nil {
+		t.Fatalf("listing done=%v err=%v", done, err)
 	}
 }

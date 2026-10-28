@@ -337,6 +337,15 @@ const (
 // never receive one, and the library wait honours only its context.
 var e2eeRangeWait = 20 * time.Second
 
+// listingGap is returned by Threads when the listing ended early for a fixed
+// reason: the loop answers with threads_done carrying that code as its gap,
+// not with an error.
+type listingGap struct{ code string }
+
+func (g *listingGap) Error() string { return "messenger: listing gap " + g.code }
+
+const gapE2EERangeTimeout = "e2ee_range_timeout"
+
 // threadRanges is the part of the messagix client the thread listing uses.
 type threadRanges interface {
 	WaitForInitialThreadRange(ctx context.Context, syncGroup int64) error
@@ -353,7 +362,7 @@ func waitE2EERange(ctx context.Context, wait func(context.Context) error) (bool,
 	defer cancel()
 	err := wait(wctx)
 	if err != nil && ctx.Err() == nil && wctx.Err() != nil {
-		logCode("warn", "e2ee_range_timeout")
+		logCode("warn", gapE2EERangeTimeout)
 		return true, nil
 	}
 	return false, err
@@ -386,6 +395,10 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadRanges, emi
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		var gap *listingGap
+		if errors.As(err, &gap) {
+			return gap
+		}
 		// The encrypted range is optional: a failure leaves those threads to
 		// arrive live.
 		logCode("warn", "e2ee_threads_failed")
@@ -404,7 +417,7 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadRanges, gro
 			return err
 		}
 		if timedOut {
-			return nil
+			return &listingGap{gapE2EERangeTimeout}
 		}
 	}
 	var prevMin int64
@@ -440,7 +453,7 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadRanges, gro
 				return err
 			}
 			if timedOut {
-				return nil
+				return &listingGap{gapE2EERangeTimeout}
 			}
 		}
 		if !ks.HasMoreBefore || ks.MinThreadKey == prevMin {
