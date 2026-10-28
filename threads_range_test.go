@@ -46,22 +46,22 @@ func (r *silentRanges) FetchMoreThreads(_ context.Context, group int64) (*socket
 	return &socket.KeyStoreData{HasMoreBefore: r.more, MinThreadKey: 7}, tbl, nil
 }
 
-func listWithin(t *testing.T, s *messagixSession, r threadRanges, ctx context.Context, bound time.Duration) (frames []Frame, stats map[string]int, err error, done bool) {
+func listWithin(t *testing.T, s *messagixSession, r threadRanges, ctx context.Context, bound time.Duration) (frames []Frame, res listingDone, err error, done bool) {
 	t.Helper()
 	type result struct {
-		stats map[string]int
-		err   error
+		res listingDone
+		err error
 	}
-	res := make(chan result, 1)
+	ch := make(chan result, 1)
 	go func() {
-		st, err := s.listThreads(ctx, r, func(f Frame) int64 { frames = append(frames, f); return 0 })
-		res <- result{st, err}
+		d, err := s.listThreads(ctx, r, func(f Frame) int64 { frames = append(frames, f); return 0 })
+		ch <- result{d, err}
 	}()
 	select {
-	case v := <-res:
-		return frames, v.stats, v.err, true
+	case v := <-ch:
+		return frames, v.res, v.err, true
 	case <-time.After(bound):
-		return nil, nil, nil, false
+		return nil, listingDone{}, nil, false
 	}
 }
 
@@ -93,23 +93,27 @@ func wantStats(t *testing.T, got map[string]int, want map[string]int) {
 	}
 }
 
-// Group 95 is the message-requests inbox: no pending requests means no range
-// row. The bounded wait ends the encrypted part quietly and the listing is complete.
-func TestListingFinishesCleanlyWhenGroup95NeverAnswers(t *testing.T) {
+// Group 95 is the message-requests inbox. An initial range that never arrives
+// means there are no requests: the listing is complete. A later batch that never
+// arrives, after the range said more exist, leaves known requests unread: a gap.
+func TestListingGroup95Timeouts(t *testing.T) {
 	shortWait(t, 100*time.Millisecond)
-	for name, r := range map[string]*silentRanges{
-		"initial wait": {},
-		"batch wait":   {more: true, initialReady: true},
+	for name, tc := range map[string]struct {
+		r       *silentRanges
+		wantGap string
+	}{
+		"initial range absent": {&silentRanges{}, ""},
+		"batch wait":           {&silentRanges{more: true, initialReady: true}, "requests_incomplete"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := newTestSession()
 			s.threads["100"] = &threadInfo{Key: 100, Kind: "user", Typed: true, Title: "Known", LastActivity: 5}
-			frames, stats, err, done := listWithin(t, s, r, context.Background(), 3*time.Second)
+			frames, res, err, done := listWithin(t, s, tc.r, context.Background(), 3*time.Second)
 			if !done {
 				t.Fatal("thread listing blocked on a group-95 range update that never arrives")
 			}
-			if err != nil || stats == nil {
-				t.Fatalf("listing must end cleanly with stats, got stats=%v err=%v", stats, err)
+			if err != nil || res.Stats == nil || res.Gap != tc.wantGap {
+				t.Fatalf("want stats and gap %q, got %+v err=%v", tc.wantGap, res, err)
 			}
 			if len(frames) == 0 || frames[0].T != TThread || frames[0].ThreadEvt.ID != "100" {
 				t.Fatalf("known thread not emitted first: %+v", frames)
@@ -122,12 +126,12 @@ func TestListingCancelStillWinsOverTheBound(t *testing.T) {
 	shortWait(t, time.Minute)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(100 * time.Millisecond); cancel() }()
-	_, stats, err, done := listWithin(t, newTestSession(), &silentRanges{}, ctx, 3*time.Second)
+	_, res, err, done := listWithin(t, newTestSession(), &silentRanges{}, ctx, 3*time.Second)
 	if !done {
 		t.Fatal("cancel did not free the listing")
 	}
-	if err == nil || stats != nil {
-		t.Fatalf("a cancelled listing must report the cancel, not stats: stats=%v err=%v", stats, err)
+	if err == nil || res.Stats != nil || res.Gap != "" {
+		t.Fatalf("a cancelled listing must report the cancel, not stats: %+v err=%v", res, err)
 	}
 }
 
@@ -149,6 +153,20 @@ func TestThreadsDoneCarriesStats(t *testing.T) {
 	b, _ := json.Marshal(Frame{T: TThreadsDone, ID: 2, Stats: map[string]int{"a": 1}})
 	if string(b) != `{"t":"threads_done","id":2,"stats":{"a":1}}` {
 		t.Fatalf("wire = %s", b)
+	}
+	b, _ = json.Marshal(Frame{T: TThreadsDone, ID: 2, Gap: "requests_incomplete"})
+	if string(b) != `{"t":"threads_done","id":2,"gap":"requests_incomplete"}` {
+		t.Fatalf("wire = %s", b)
+	}
+	frames = runLoop(t, &fakeBackend{threadGap: "requests_incomplete"}, startAndList, `{"t":"threads","id":2}`)
+	done = nil
+	for i, f := range frames {
+		if f.ID == 2 {
+			done = &frames[i]
+		}
+	}
+	if done == nil || done.T != TThreadsDone || done.Gap != "requests_incomplete" || done.Err != "" {
+		t.Fatalf("gap answer = %+v", done)
 	}
 	b, _ = json.Marshal(Frame{T: TThreadsDone, ID: 2})
 	if string(b) != `{"t":"threads_done","id":2}` {
@@ -172,7 +190,7 @@ func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
 		},
 		LSAddParticipantIdToGroupThread: []*table.LSAddParticipantIdToGroupThread{{ThreadKey: 4242, ContactId: 42}},
 	}}
-	frames, stats, err, done := listWithin(t, newTestSession(), r, context.Background(), 3*time.Second)
+	frames, res, err, done := listWithin(t, newTestSession(), r, context.Background(), 3*time.Second)
 	if !done || err != nil {
 		t.Fatalf("done=%v err=%v", done, err)
 	}
@@ -188,7 +206,7 @@ func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
 	if got["7171"] != nil || got["e:7171"] != nil {
 		t.Fatal("a plain existence row must not create a thread")
 	}
-	wantStats(t, stats, map[string]int{
+	wantStats(t, res.Stats, map[string]int{
 		"group1_threads": 3, "group1_encrypted_rows": 3, "hybrid_mappings": 0, "cutover_links": 0,
 		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_skipped_group": 0,
 	})
@@ -217,7 +235,7 @@ func TestUnlistedEncryptedChatsAreListedOnlyWhenProvablyOneToOne(t *testing.T) {
 	s.threads["e:1600"] = &threadInfo{Key: 1600, Enc: true, Kind: "user", Typed: true, Participants: []int64{1600}}
 	s.cutover[1600] = 600
 
-	frames, stats, err, done := listWithin(t, s, &silentRanges{initialReady: true}, context.Background(), 3*time.Second)
+	frames, res, err, done := listWithin(t, s, &silentRanges{initialReady: true}, context.Background(), 3*time.Second)
 	if !done || err != nil {
 		t.Fatalf("done=%v err=%v", done, err)
 	}
@@ -247,8 +265,50 @@ func TestUnlistedEncryptedChatsAreListedOnlyWhenProvablyOneToOne(t *testing.T) {
 		t.Fatalf("hybrid thread = %+v", b)
 	}
 	// every synthesized frame is before the listing ends: listThreads returned it
-	wantStats(t, stats, map[string]int{
+	wantStats(t, res.Stats, map[string]int{
 		"group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 2, "cutover_links": 4,
 		"encrypted_known": 6, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_skipped_group": 3,
 	})
+}
+
+// The hybrid kind proof is saved next to the hybrid mapping, so a restarted
+// helper still lists a hybrid one-to-one and still skips a hybrid group; state
+// saved before the proof was kept loads and leaves those chats skipped.
+func TestHybridKindSurvivesARestart(t *testing.T) {
+	shortWait(t, 50*time.Millisecond)
+	s := newTestSession()
+	s.handleTableFrames(&table.LSTable{LSVerifyHybridThreadExists: []*table.LSVerifyHybridThreadExists{
+		{ThreadKey: 400, ThreadJID: 1400, ThreadType: table.ONE_TO_ONE},
+		{ThreadKey: 500, ThreadJID: 1500, ThreadType: table.GROUP_THREAD, IsGroupThread: true},
+	}})
+	saved := s.dump()
+
+	list := func(st savedState) (map[string]*Thread, map[string]int) {
+		fresh := newTestSession()
+		fresh.restore(&st)
+		frames, res, err, done := listWithin(t, fresh, &silentRanges{initialReady: true}, context.Background(), 3*time.Second)
+		if !done || err != nil {
+			t.Fatalf("done=%v err=%v", done, err)
+		}
+		return threadsByID(frames), res.Stats
+	}
+
+	var st savedState
+	if err := json.Unmarshal(saved, &st); err != nil {
+		t.Fatal(err)
+	}
+	got, stats := list(st)
+	if u := got["e:1400"]; u == nil || u.Kind != "user" || u.Predecessor != "400" {
+		t.Fatalf("restored hybrid one-to-one = %+v", got)
+	}
+	if got["e:1500"] != nil || stats["encrypted_skipped_group"] != 1 {
+		t.Fatalf("restored hybrid group must be skipped and counted: %v %v", got, stats)
+	}
+
+	old := st
+	old.HybridKind = nil // state written before the proof was saved
+	got, stats = list(old)
+	if len(got) != 0 || stats["encrypted_skipped_group"] != 2 {
+		t.Fatalf("old state must skip both until the hybrid row is seen again: %v %v", got, stats)
+	}
 }

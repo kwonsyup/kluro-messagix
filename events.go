@@ -56,10 +56,15 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame)
 			s.fbToWA[j.ThreadKey] = j.ThreadJID
 			dirty = true
 		}
+		kind := ""
 		if j.ThreadType.IsOneToOne() {
-			s.hybridKind[j.ThreadJID] = "user"
+			kind = "user"
 		} else if j.IsGroupThread {
-			s.hybridKind[j.ThreadJID] = "group"
+			kind = "group"
+		}
+		if kind != "" && s.hybridKind[j.ThreadJID] != kind {
+			s.hybridKind[j.ThreadJID] = kind
+			dirty = true
 		}
 	}
 	for _, c := range tbl.LSDeleteThenInsertContact {

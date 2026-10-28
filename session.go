@@ -148,6 +148,7 @@ type savedState struct {
 	HistoryDevice *securehistory.Device `json:"history_device,omitempty"`
 	Cutover       map[int64]int64       `json:"cutover,omitempty"`
 	FBToWA        map[int64]int64       `json:"fb_to_wa,omitempty"`
+	HybridKind    map[int64]string      `json:"hybrid_kind,omitempty"` // encrypted chat id -> "user"/"group"; absent in older state
 }
 
 func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub, cookieMap map[string]string, state []byte, mode, platform string) (Ready, []Frame, error) {
@@ -271,6 +272,11 @@ func (s *messagixSession) restore(st *savedState) {
 	for k, v := range st.FBToWA {
 		s.fbToWA[k] = v
 	}
+	for k, v := range st.HybridKind {
+		if v == "user" || v == "group" {
+			s.hybridKind[k] = v
+		}
+	}
 }
 
 // dump returns the state blob the sidecar would restore from right now.
@@ -285,6 +291,9 @@ func (s *messagixSession) dump() []byte {
 	}
 	if len(s.fbToWA) > 0 {
 		st.FBToWA = maps.Clone(s.fbToWA)
+	}
+	if len(s.hybridKind) > 0 {
+		st.HybridKind = maps.Clone(s.hybridKind)
 	}
 	if s.waDevice != nil && s.waDevice.ID != nil {
 		st.WADevice = s.waDevice.ID.String()

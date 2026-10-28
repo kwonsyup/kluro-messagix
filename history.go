@@ -339,6 +339,20 @@ const (
 // normal "nothing there" answer, not an incomplete listing.
 var e2eeRangeWait = 20 * time.Second
 
+// listingDone is what a finished listing reports on threads_done: counts, and a
+// fixed gap code when known threads were left unread.
+type listingDone struct {
+	Stats map[string]int
+	Gap   string
+}
+
+// listingGap is pageThreads' report that the listing ended early for a fixed reason.
+type listingGap struct{ code string }
+
+func (g *listingGap) Error() string { return "messenger: listing gap " + g.code }
+
+const gapRequestsIncomplete = "requests_incomplete"
+
 // threadRanges is the part of the messagix client the thread listing uses.
 type threadRanges interface {
 	WaitForInitialThreadRange(ctx context.Context, syncGroup int64) error
@@ -365,17 +379,17 @@ func waitE2EERange(ctx context.Context, wait func(context.Context) error) (bool,
 // inbox by paging the lightspeed thread ranges (the main inbox and the
 // message requests), then the encrypted chats the helper knows but no table
 // named. The counts it returns go out on threads_done.
-func (s *messagixSession) Threads(ctx context.Context, emit emitFunc) (map[string]int, error) {
+func (s *messagixSession) Threads(ctx context.Context, emit emitFunc) (listingDone, error) {
 	s.mu.Lock()
 	cli := s.client
 	s.mu.Unlock()
 	if cli == nil {
-		return nil, errCode("not_started")
+		return listingDone{}, errCode("not_started")
 	}
 	return s.listThreads(ctx, cli, emit)
 }
 
-func (s *messagixSession) listThreads(ctx context.Context, cli threadRanges, emit emitFunc) (map[string]int, error) {
+func (s *messagixSession) listThreads(ctx context.Context, cli threadRanges, emit emitFunc) (listingDone, error) {
 	emitted := map[string]bool{}
 	counted := func(f Frame) int64 {
 		if f.T == TThread && f.ThreadEvt != nil && f.ThreadEvt.Encrypted {
@@ -385,29 +399,35 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadRanges, emi
 	}
 	for _, f := range s.sortedThreadFrames() {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return listingDone{}, err
 		}
 		counted(f)
 	}
 	if err := s.pageThreads(ctx, cli, 1, counted); err != nil {
-		return nil, err
+		return listingDone{}, err
 	}
+	var gap string
 	if err := s.pageThreads(ctx, cli, e2eeSyncGroup, counted); err != nil {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return listingDone{}, ctx.Err()
 		}
-		// The message-requests range is optional: a failure leaves those
-		// threads to arrive live.
-		logCode("warn", "e2ee_threads_failed")
+		var lg *listingGap
+		if errors.As(err, &lg) {
+			gap = lg.code
+		} else {
+			// The message-requests range is optional: a failure leaves those
+			// threads to arrive live.
+			logCode("warn", "e2ee_threads_failed")
+		}
 	}
 	frames, skipped, known := s.unlistedEncryptedFrames()
 	for _, f := range frames {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return listingDone{}, err
 		}
 		counted(f)
 	}
-	return s.listingStats(known, len(emitted), skipped), nil
+	return listingDone{Stats: s.listingStats(known, len(emitted), skipped), Gap: gap}, nil
 }
 
 func (s *messagixSession) pageThreads(ctx context.Context, cli threadRanges, group int64, emit emitFunc) error {
@@ -457,7 +477,8 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadRanges, gro
 				return err
 			}
 			if timedOut {
-				return nil
+				// The range said more requests exist and the next one never came.
+				return &listingGap{gapRequestsIncomplete}
 			}
 		}
 		if !ks.HasMoreBefore || ks.MinThreadKey == prevMin {
