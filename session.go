@@ -273,7 +273,7 @@ func (s *messagixSession) restore(st *savedState) {
 		s.fbToWA[k] = v
 	}
 	for k, v := range st.HybridKind {
-		if v == "user" || v == "group" {
+		if v == "user" || v == "group" || v == kindConflict {
 			s.hybridKind[k] = v
 		}
 	}

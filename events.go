@@ -62,7 +62,8 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame)
 		} else if j.IsGroupThread {
 			kind = "group"
 		}
-		if kind != "" && s.hybridKind[j.ThreadJID] != kind {
+		// A conflict between kind sources stays a conflict: it is never proof.
+		if cur := s.hybridKind[j.ThreadJID]; kind != "" && cur != kind && cur != kindConflict {
 			s.hybridKind[j.ThreadJID] = kind
 			dirty = true
 		}
@@ -104,6 +105,11 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame)
 				t.addParticipant(key)
 			} else {
 				t.Kind = "group"
+			}
+			// A row that names the kind of an encrypted chat, or of the open thread
+			// a cutover link continues, can contradict a saved hybrid proof.
+			if s.noteKindLocked(originalKey, key, t.Kind) {
+				dirty = true
 			}
 		}
 		if name != "" {
@@ -486,6 +492,29 @@ func consumerContent(app *waConsumerApplication.ConsumerApplication) (text, medi
 	return text, media, ""
 }
 
+// kindConflict is the saved hybrid proof once two kind sources disagree.
+const kindConflict = "conflict"
+
+// noteKindLocked checks a thread row's kind against the saved hybrid proof of
+// every encrypted chat the row speaks for (the row's own chat, and the chats a
+// cutover link continues from this thread). A disagreement turns the proof into
+// a conflict, which synthesis never accepts. It reports whether state changed.
+func (s *messagixSession) noteKindLocked(rowKey, chatKey int64, kind string) (changed bool) {
+	check := func(chat int64) {
+		if cur, ok := s.hybridKind[chat]; ok && cur != kind && cur != kindConflict {
+			s.hybridKind[chat] = kindConflict
+			changed = true
+		}
+	}
+	check(chatKey)
+	for chat, open := range s.cutover {
+		if open == rowKey {
+			check(chat)
+		}
+	}
+	return changed
+}
+
 // unlistedEncryptedFrames builds a thread for every encrypted chat the helper
 // has a cutover link or hybrid mapping for but no thread record, so the listing
 // names it. Only a chat that is provably one-to-one is built: the kind comes
@@ -523,11 +552,16 @@ func (s *messagixSession) unlistedEncryptedFrames() (frames []Frame, skipped, kn
 	for _, k := range sorted {
 		o := open[k]
 		ot := s.threads[wireID(false, o)]
-		kind := s.hybridKind[k]
-		if kind == "" && ot != nil && ot.Typed {
-			kind = ot.Kind
+		// Every known kind source must say one-to-one; a missing source proves
+		// nothing and a disagreeing one makes the chat unprovable.
+		var sources []string
+		if h := s.hybridKind[k]; h != "" {
+			sources = append(sources, h)
 		}
-		if kind != "user" {
+		if ot != nil && ot.Typed {
+			sources = append(sources, ot.Kind)
+		}
+		if len(sources) == 0 || slices.ContainsFunc(sources, func(k string) bool { return k != "user" }) {
 			skipped++
 			continue
 		}
@@ -541,11 +575,16 @@ func (s *messagixSession) unlistedEncryptedFrames() (frames []Frame, skipped, kn
 			}
 		}
 		if len(t.Participants) == 0 {
-			if _, hybrid := s.fbToWA[o]; !hybrid {
+			// A one-to-one facebook thread key is the other person: take it from the hybrid mapping.
+			for fb, w := range s.fbToWA {
+				if w == k {
+					t.addParticipant(fb)
+				}
+			}
+			if len(t.Participants) == 0 {
 				skipped++
 				continue
 			}
-			t.addParticipant(o) // a one-to-one facebook thread key is the other person
 		}
 		out := s.wireThreadLocked(t)
 		out.Predecessor = wireID(false, o)
