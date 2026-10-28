@@ -377,8 +377,7 @@ func waitE2EERange(ctx context.Context, wait func(context.Context) error) (bool,
 
 // Threads lists every thread: the ones already known, then the rest of the
 // inbox by paging the lightspeed thread ranges (the main inbox and the
-// message requests), then the encrypted chats the helper knows but no table
-// named. The counts it returns go out on threads_done.
+// message requests). The counts it returns go out on threads_done.
 func (s *messagixSession) Threads(ctx context.Context, emit emitFunc) (listingDone, error) {
 	s.mu.Lock()
 	cli := s.client
@@ -420,14 +419,8 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadRanges, emi
 			logCode("warn", "e2ee_threads_failed")
 		}
 	}
-	frames, skipped, known := s.unlistedEncryptedFrames()
-	for _, f := range frames {
-		if err := ctx.Err(); err != nil {
-			return listingDone{}, err
-		}
-		counted(f)
-	}
-	return listingDone{Stats: s.listingStats(known, len(emitted), skipped), Gap: gap}, nil
+	known, unlisted := s.encryptedCounts()
+	return listingDone{Stats: s.listingStats(known, len(emitted), unlisted), Gap: gap}, nil
 }
 
 func (s *messagixSession) pageThreads(ctx context.Context, cli threadRanges, group int64, emit emitFunc) error {

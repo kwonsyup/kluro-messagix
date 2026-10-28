@@ -2,7 +2,6 @@
 package main
 
 import (
-	"slices"
 	"strconv"
 	"sync"
 
@@ -56,17 +55,6 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame)
 			s.fbToWA[j.ThreadKey] = j.ThreadJID
 			dirty = true
 		}
-		kind := ""
-		if j.ThreadType.IsOneToOne() {
-			kind = "user"
-		} else if j.IsGroupThread {
-			kind = "group"
-		}
-		// A conflict between kind sources stays a conflict: it is never proof.
-		if cur := s.hybridKind[j.ThreadJID]; kind != "" && cur != kind && cur != kindConflict {
-			s.hybridKind[j.ThreadJID] = kind
-			dirty = true
-		}
 	}
 	for _, c := range tbl.LSDeleteThenInsertContact {
 		if c.Name != "" {
@@ -105,11 +93,6 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame)
 				t.addParticipant(key)
 			} else {
 				t.Kind = "group"
-			}
-			// A row that names the kind of an encrypted chat, or of the open thread
-			// a cutover link continues, can contradict a saved hybrid proof.
-			if s.noteKindLocked(originalKey, key, t.Kind) {
-				dirty = true
 			}
 		}
 		if name != "" {
@@ -492,49 +475,17 @@ func consumerContent(app *waConsumerApplication.ConsumerApplication) (text, medi
 	return text, media, ""
 }
 
-// kindConflict is the saved hybrid proof once two kind sources disagree.
-const kindConflict = "conflict"
-
-// noteKindLocked checks a thread row's kind against the saved hybrid proof of
-// every encrypted chat the row speaks for (the row's own chat, and the chats a
-// cutover link continues from this thread). A disagreement turns the proof into
-// a conflict, which synthesis never accepts. It reports whether state changed.
-func (s *messagixSession) noteKindLocked(rowKey, chatKey int64, kind string) (changed bool) {
-	check := func(chat int64) {
-		if cur, ok := s.hybridKind[chat]; ok && cur != kind && cur != kindConflict {
-			s.hybridKind[chat] = kindConflict
-			changed = true
-		}
-	}
-	check(chatKey)
-	for chat, open := range s.cutover {
-		if open == rowKey {
-			check(chat)
-		}
-	}
-	return changed
-}
-
-// unlistedEncryptedFrames builds a thread for every encrypted chat the helper
-// has a cutover link or hybrid mapping for but no thread record, so the listing
-// names it. Only a chat that is provably one-to-one is built: the kind comes
-// from the hybrid row, or from the open thread it continues. Anything else is
-// skipped and counted, never guessed. It also returns how many encrypted chats
-// the helper knows of in all.
-func (s *messagixSession) unlistedEncryptedFrames() (frames []Frame, skipped, known int) {
+// encryptedCounts reports how many encrypted chats the helper knows of (a thread
+// record, a cutover link or a hybrid mapping) and how many of those no table
+// has named, so they have no thread record and were not listed.
+func (s *messagixSession) encryptedCounts() (known, unlisted int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	open := map[int64]int64{}
-	for k, o := range s.cutover {
-		open[k] = o
-	}
-	for fb, k := range s.fbToWA {
-		if _, ok := open[k]; !ok {
-			open[k] = fb
-		}
-	}
 	keys := map[int64]bool{}
-	for k := range open {
+	for k := range s.cutover {
+		keys[k] = true
+	}
+	for _, k := range s.fbToWA {
 		keys[k] = true
 	}
 	for _, t := range s.threads {
@@ -542,59 +493,16 @@ func (s *messagixSession) unlistedEncryptedFrames() (frames []Frame, skipped, kn
 			keys[t.Key] = true
 		}
 	}
-	sorted := make([]int64, 0, len(open))
-	for k := range open {
+	for k := range keys {
 		if s.threads[wireID(true, k)] == nil {
-			sorted = append(sorted, k)
+			unlisted++
 		}
 	}
-	slices.Sort(sorted)
-	for _, k := range sorted {
-		o := open[k]
-		ot := s.threads[wireID(false, o)]
-		// Every known kind source must say one-to-one; a missing source proves
-		// nothing and a disagreeing one makes the chat unprovable.
-		var sources []string
-		if h := s.hybridKind[k]; h != "" {
-			sources = append(sources, h)
-		}
-		if ot != nil && ot.Typed {
-			sources = append(sources, ot.Kind)
-		}
-		if len(sources) == 0 || slices.ContainsFunc(sources, func(k string) bool { return k != "user" }) {
-			skipped++
-			continue
-		}
-		t := &threadInfo{Key: k, Enc: true, Kind: "user", Typed: true}
-		if ot != nil {
-			t.LastActivity = ot.LastActivity
-			for _, p := range ot.Participants {
-				if p != s.selfID {
-					t.addParticipant(p)
-				}
-			}
-		}
-		if len(t.Participants) == 0 {
-			// A one-to-one facebook thread key is the other person: take it from the hybrid mapping.
-			for fb, w := range s.fbToWA {
-				if w == k {
-					t.addParticipant(fb)
-				}
-			}
-			if len(t.Participants) == 0 {
-				skipped++
-				continue
-			}
-		}
-		out := s.wireThreadLocked(t)
-		out.Predecessor = wireID(false, o)
-		frames = append(frames, threadFrame(out))
-	}
-	return frames, skipped, len(keys)
+	return len(keys), unlisted
 }
 
 // listingStats is the counts-only diagnostic on threads_done.
-func (s *messagixSession) listingStats(known, emitted, skipped int) map[string]int {
+func (s *messagixSession) listingStats(known, emitted, unlisted int) map[string]int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	connected := 0
@@ -602,13 +510,13 @@ func (s *messagixSession) listingStats(known, emitted, skipped int) map[string]i
 		connected = 1
 	}
 	return map[string]int{
-		"group1_threads":          len(s.rowKeys),
-		"group1_encrypted_rows":   len(s.encRowKeys),
-		"hybrid_mappings":         len(s.fbToWA),
-		"cutover_links":           len(s.cutover),
-		"encrypted_known":         known,
-		"encrypted_emitted":       emitted,
-		"e2ee_connected":          connected,
-		"encrypted_skipped_group": skipped,
+		"group1_threads":        len(s.rowKeys),
+		"group1_encrypted_rows": len(s.encRowKeys),
+		"hybrid_mappings":       len(s.fbToWA),
+		"cutover_links":         len(s.cutover),
+		"encrypted_known":       known,
+		"encrypted_emitted":     emitted,
+		"e2ee_connected":        connected,
+		"encrypted_unlisted":    unlisted,
 	}
 }

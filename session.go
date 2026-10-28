@@ -74,7 +74,6 @@ type messagixSession struct {
 	names        map[int64]string
 	cutover      map[int64]int64   // encrypted chat id -> its pre-encryption (open) thread key
 	fbToWA       map[int64]int64   // facebook thread key -> encrypted chat id (hybrid threads)
-	hybridKind   map[int64]string  // encrypted chat id -> "user" or "group", when a hybrid row proves it
 	rowKeys      map[int64]bool    // thread rows seen this run (counts only)
 	encRowKeys   map[int64]bool    // ... of an encrypted-over-WA type
 	msgIndex     map[string]string // message id -> wire thread id
@@ -128,7 +127,6 @@ func newSession() *messagixSession {
 		names:        map[int64]string{},
 		cutover:      map[int64]int64{},
 		fbToWA:       map[int64]int64{},
-		hybridKind:   map[int64]string{},
 		rowKeys:      map[int64]bool{},
 		encRowKeys:   map[int64]bool{},
 		msgIndex:     map[string]string{},
@@ -148,7 +146,6 @@ type savedState struct {
 	HistoryDevice *securehistory.Device `json:"history_device,omitempty"`
 	Cutover       map[int64]int64       `json:"cutover,omitempty"`
 	FBToWA        map[int64]int64       `json:"fb_to_wa,omitempty"`
-	HybridKind    map[int64]string      `json:"hybrid_kind,omitempty"` // encrypted chat id -> "user"/"group"; absent in older state
 }
 
 func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub, cookieMap map[string]string, state []byte, mode, platform string) (Ready, []Frame, error) {
@@ -272,11 +269,6 @@ func (s *messagixSession) restore(st *savedState) {
 	for k, v := range st.FBToWA {
 		s.fbToWA[k] = v
 	}
-	for k, v := range st.HybridKind {
-		if v == "user" || v == "group" || v == kindConflict {
-			s.hybridKind[k] = v
-		}
-	}
 }
 
 // dump returns the state blob the sidecar would restore from right now.
@@ -291,9 +283,6 @@ func (s *messagixSession) dump() []byte {
 	}
 	if len(s.fbToWA) > 0 {
 		st.FBToWA = maps.Clone(s.fbToWA)
-	}
-	if len(s.hybridKind) > 0 {
-		st.HybridKind = maps.Clone(s.hybridKind)
 	}
 	if s.waDevice != nil && s.waDevice.ID != nil {
 		st.WADevice = s.waDevice.ID.String()

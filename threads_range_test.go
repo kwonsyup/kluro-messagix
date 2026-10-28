@@ -208,169 +208,48 @@ func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
 	}
 	wantStats(t, res.Stats, map[string]int{
 		"group1_threads": 3, "group1_encrypted_rows": 3, "hybrid_mappings": 0, "cutover_links": 0,
-		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_skipped_group": 0,
+		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_unlisted": 0,
 	})
 }
 
-// A cutover or hybrid link whose chat no table named is listed when it is
-// provably one-to-one, and skipped and counted when it is not.
-func TestUnlistedEncryptedChatsAreListedOnlyWhenProvablyOneToOne(t *testing.T) {
+// A cutover link or hybrid mapping whose chat no table named is counted in
+// encrypted_unlisted and not emitted: nothing is synthesized from the links.
+func TestKnownEncryptedKeyWithNoTableRowIsCountedNotEmitted(t *testing.T) {
 	shortWait(t, 50*time.Millisecond)
 	s := newTestSession()
-	// 1: cutover to a known one-to-one open thread -> listed with that thread as its predecessor.
-	s.threads["100"] = &threadInfo{Key: 100, Kind: "user", Typed: true, LastActivity: 9, Participants: []int64{1, 100}}
-	s.cutover[1100] = 100
-	// 2: cutover to a known group open thread -> skipped.
-	s.threads["200"] = &threadInfo{Key: 200, Kind: "group", Typed: true, Participants: []int64{1, 2, 3}}
-	s.cutover[1200] = 200
-	// 3: cutover to an open thread the helper never saw -> skipped.
-	s.cutover[1300] = 300
-	// 4: hybrid mapping whose row proves a one-to-one -> listed, the peer is the facebook thread key.
-	s.fbToWA[400] = 1400
-	s.hybridKind[1400] = "user"
-	// 5: hybrid mapping whose row proves a group -> skipped.
-	s.fbToWA[500] = 1500
-	s.hybridKind[1500] = "group"
-	// 6: already a thread record -> not synthesized again.
-	s.threads["e:1600"] = &threadInfo{Key: 1600, Enc: true, Kind: "user", Typed: true, Participants: []int64{1600}}
+	s.threads["100"] = &threadInfo{Key: 100, Kind: "user", Typed: true, Participants: []int64{1, 100}}
+	s.cutover[1100] = 100                                                                                           // no row for e:1100
+	s.fbToWA[400] = 1400                                                                                            // no row for e:1400
+	s.threads["e:1600"] = &threadInfo{Key: 1600, Enc: true, Kind: "user", Typed: true, Participants: []int64{1600}} // listed
 	s.cutover[1600] = 600
 
 	frames, res, err, done := listWithin(t, s, &silentRanges{initialReady: true}, context.Background(), 3*time.Second)
 	if !done || err != nil {
 		t.Fatalf("done=%v err=%v", done, err)
 	}
-	count := map[string]int{}
-	for _, f := range frames {
-		if f.T == TThread {
-			count[f.ThreadEvt.ID]++
-		}
-	}
-	for _, id := range []string{"e:1100", "e:1400", "e:1600"} {
-		if count[id] != 1 {
-			t.Fatalf("%s emitted %d times, want once: %v", id, count[id], count)
-		}
-	}
-	for _, id := range []string{"e:1200", "e:1300", "e:1500"} {
-		if count[id] != 0 {
-			t.Fatalf("%s must be skipped: %v", id, count)
-		}
-	}
 	got := threadsByID(frames)
-	a := got["e:1100"]
-	if a.Kind != "user" || !a.Encrypted || a.Predecessor != "100" || len(a.Participants) != 2 || a.Participants[1].ID != "100" || a.LastActivity != 9 {
-		t.Fatalf("cutover thread = %+v", a)
+	if got["e:1100"] != nil || got["e:1400"] != nil {
+		t.Fatalf("a link alone must not create a thread: %v", got)
 	}
-	b := got["e:1400"]
-	if b.Kind != "user" || b.Predecessor != "400" || len(b.Participants) != 2 || b.Participants[1].ID != "400" {
-		t.Fatalf("hybrid thread = %+v", b)
+	if got["e:1600"] == nil {
+		t.Fatal("the already-known encrypted thread must still be listed")
 	}
-	// every synthesized frame is before the listing ends: listThreads returned it
 	wantStats(t, res.Stats, map[string]int{
-		"group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 2, "cutover_links": 4,
-		"encrypted_known": 6, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_skipped_group": 3,
+		"group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 1, "cutover_links": 2,
+		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "encrypted_unlisted": 2,
 	})
 }
 
-// The hybrid kind proof is saved next to the hybrid mapping, so a restarted
-// helper still lists a hybrid one-to-one and still skips a hybrid group; state
-// saved before the proof was kept loads and leaves those chats skipped.
-func TestHybridKindSurvivesARestart(t *testing.T) {
-	shortWait(t, 50*time.Millisecond)
-	s := newTestSession()
-	s.handleTableFrames(&table.LSTable{LSVerifyHybridThreadExists: []*table.LSVerifyHybridThreadExists{
-		{ThreadKey: 400, ThreadJID: 1400, ThreadType: table.ONE_TO_ONE},
-		{ThreadKey: 500, ThreadJID: 1500, ThreadType: table.GROUP_THREAD, IsGroupThread: true},
-	}})
-	saved := s.dump()
-
-	list := func(st savedState) (map[string]*Thread, map[string]int) {
-		fresh := newTestSession()
-		fresh.restore(&st)
-		frames, res, err, done := listWithin(t, fresh, &silentRanges{initialReady: true}, context.Background(), 3*time.Second)
-		if !done || err != nil {
-			t.Fatalf("done=%v err=%v", done, err)
-		}
-		return threadsByID(frames), res.Stats
-	}
-
+// State saved by the build that kept a hybrid kind proof still loads; the field is ignored.
+func TestStateWithHybridKindStillLoads(t *testing.T) {
 	var st savedState
-	if err := json.Unmarshal(saved, &st); err != nil {
+	blob := `{"cutover":{"1100":100},"fb_to_wa":{"400":1400},"hybrid_kind":{"1400":"user"}}`
+	if err := json.Unmarshal([]byte(blob), &st); err != nil {
 		t.Fatal(err)
 	}
-	got, stats := list(st)
-	if u := got["e:1400"]; u == nil || u.Kind != "user" || u.Predecessor != "400" {
-		t.Fatalf("restored hybrid one-to-one = %+v", got)
-	}
-	if got["e:1500"] != nil || stats["encrypted_skipped_group"] != 1 {
-		t.Fatalf("restored hybrid group must be skipped and counted: %v %v", got, stats)
-	}
-
-	old := st
-	old.HybridKind = nil // state written before the proof was saved
-	got, stats = list(old)
-	if len(got) != 0 || stats["encrypted_skipped_group"] != 2 {
-		t.Fatalf("old state must skip both until the hybrid row is seen again: %v %v", got, stats)
-	}
-}
-
-// A later row that names the chat's kind differently from the saved hybrid
-// proof makes the proof a conflict: after a restart the chat is skipped and
-// counted, never listed as a one-to-one that may really be a group.
-func TestConflictingKindIsNeverProvablyOneToOne(t *testing.T) {
-	shortWait(t, 50*time.Millisecond)
-	hybrid := func(typ table.ThreadType, group bool) *table.LSTable {
-		return &table.LSTable{LSVerifyHybridThreadExists: []*table.LSVerifyHybridThreadExists{
-			{ThreadKey: 400, ThreadJID: 1400, ThreadType: typ, IsGroupThread: group},
-		}}
-	}
-	update := func(typ table.ThreadType) *table.LSTable {
-		return &table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 400, ThreadType: typ}}}
-	}
-	for name, tc := range map[string]struct {
-		first, then *table.LSTable
-		cutoverOpen int64 // the update names the open thread a cutover link continues, not the mapped key
-	}{
-		"hybrid user, then a group update": {hybrid(table.ONE_TO_ONE, false), update(table.GROUP_THREAD), 0},
-		"hybrid group, then a user update": {hybrid(table.GROUP_THREAD, true), update(table.ONE_TO_ONE), 0},
-		"hybrid user, group open thread":   {hybrid(table.ONE_TO_ONE, false), &table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 900, ThreadType: table.GROUP_THREAD}}}, 900},
-	} {
-		t.Run(name, func(t *testing.T) {
-			s := newTestSession()
-			if tc.cutoverOpen != 0 {
-				s.cutover[1400] = tc.cutoverOpen
-			}
-			s.handleTableFrames(tc.first)
-			s.handleTableFrames(tc.then)
-			var st savedState
-			if err := json.Unmarshal(s.dump(), &st); err != nil {
-				t.Fatal(err)
-			}
-			fresh := newTestSession()
-			fresh.restore(&st)
-			frames, res, err, done := listWithin(t, fresh, &silentRanges{initialReady: true}, context.Background(), 3*time.Second)
-			if !done || err != nil {
-				t.Fatalf("done=%v err=%v", done, err)
-			}
-			if got := threadsByID(frames); got["e:1400"] != nil {
-				t.Fatalf("a conflicting chat must not be listed as one-to-one: %+v", got["e:1400"])
-			}
-			if res.Stats["encrypted_skipped_group"] != 1 {
-				t.Fatalf("the conflicting chat must be counted as skipped: %v", res.Stats)
-			}
-		})
-	}
-}
-
-// Every kind source must agree: a saved hybrid "user" proof does not outvote an
-// open thread the listing just showed to be a group.
-func TestOpenThreadGroupOutvotesASavedUserProof(t *testing.T) {
-	shortWait(t, 50*time.Millisecond)
 	s := newTestSession()
-	s.fbToWA[400] = 1400
-	s.hybridKind[1400] = "user"
-	s.threads["400"] = &threadInfo{Key: 400, Kind: "group", Typed: true, Participants: []int64{1, 2, 3}}
-	frames, res, err, done := listWithin(t, s, &silentRanges{initialReady: true}, context.Background(), 3*time.Second)
-	if !done || err != nil || threadsByID(frames)["e:1400"] != nil || res.Stats["encrypted_skipped_group"] != 1 {
-		t.Fatalf("done=%v err=%v frames=%v stats=%v", done, err, threadsByID(frames), res.Stats)
+	s.restore(&st)
+	if s.fbToWA[400] != 1400 || s.cutover[1100] != 100 {
+		t.Fatalf("restored fbToWA=%v cutover=%v", s.fbToWA, s.cutover)
 	}
 }
