@@ -74,6 +74,9 @@ type messagixSession struct {
 	names        map[int64]string
 	cutover      map[int64]int64   // encrypted chat id -> its pre-encryption (open) thread key
 	fbToWA       map[int64]int64   // facebook thread key -> encrypted chat id (hybrid threads)
+	hybridKind   map[int64]string  // encrypted chat id -> "user" or "group", when a hybrid row proves it
+	rowKeys      map[int64]bool    // thread rows seen this run (counts only)
+	encRowKeys   map[int64]bool    // ... of an encrypted-over-WA type
 	msgIndex     map[string]string // message id -> wire thread id
 	msgOrder     []string
 	collectors   map[int64]*pageCollector
@@ -125,6 +128,9 @@ func newSession() *messagixSession {
 		names:        map[int64]string{},
 		cutover:      map[int64]int64{},
 		fbToWA:       map[int64]int64{},
+		hybridKind:   map[int64]string{},
+		rowKeys:      map[int64]bool{},
+		encRowKeys:   map[int64]bool{},
 		msgIndex:     map[string]string{},
 		collectors:   map[int64]*pageCollector{},
 	}

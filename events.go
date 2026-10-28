@@ -2,6 +2,7 @@
 package main
 
 import (
+	"slices"
 	"strconv"
 	"sync"
 
@@ -55,6 +56,11 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame)
 			s.fbToWA[j.ThreadKey] = j.ThreadJID
 			dirty = true
 		}
+		if j.ThreadType.IsOneToOne() {
+			s.hybridKind[j.ThreadJID] = "user"
+		} else if j.IsGroupThread {
+			s.hybridKind[j.ThreadJID] = "group"
+		}
 	}
 	for _, c := range tbl.LSDeleteThenInsertContact {
 		if c.Name != "" {
@@ -70,6 +76,10 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame)
 	touched := map[string]bool{}
 	upsertThread := func(key int64, typ table.ThreadType, name string, last int64) {
 		originalKey := key
+		s.rowKeys[originalKey] = true
+		if typ.IsWhatsApp() {
+			s.encRowKeys[originalKey] = true
+		}
 		enc := typ.IsWhatsApp()
 		if mapped, ok := s.fbToWA[key]; ok {
 			key, enc = mapped, true
@@ -102,6 +112,12 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame)
 	}
 	for _, th := range tbl.LSUpdateOrInsertThread {
 		upsertThread(th.ThreadKey, th.ThreadType, th.ThreadName, th.LastActivityTimestampMs)
+	}
+	// A bare existence row names an encrypted chat the inbox rows may not have.
+	for _, th := range tbl.LSVerifyThreadExists {
+		if th.ThreadType.IsWhatsApp() {
+			upsertThread(th.ThreadKey, th.ThreadType, "", 0)
+		}
 	}
 	for _, p := range tbl.LSAddParticipantIdToGroupThread {
 		key, enc := s.mapKey(p.ThreadKey)
@@ -463,4 +479,92 @@ func consumerContent(app *waConsumerApplication.ConsumerApplication) (text, medi
 		media = "attachment"
 	}
 	return text, media, ""
+}
+
+// unlistedEncryptedFrames builds a thread for every encrypted chat the helper
+// has a cutover link or hybrid mapping for but no thread record, so the listing
+// names it. Only a chat that is provably one-to-one is built: the kind comes
+// from the hybrid row, or from the open thread it continues. Anything else is
+// skipped and counted, never guessed. It also returns how many encrypted chats
+// the helper knows of in all.
+func (s *messagixSession) unlistedEncryptedFrames() (frames []Frame, skipped, known int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	open := map[int64]int64{}
+	for k, o := range s.cutover {
+		open[k] = o
+	}
+	for fb, k := range s.fbToWA {
+		if _, ok := open[k]; !ok {
+			open[k] = fb
+		}
+	}
+	keys := map[int64]bool{}
+	for k := range open {
+		keys[k] = true
+	}
+	for _, t := range s.threads {
+		if t.Enc {
+			keys[t.Key] = true
+		}
+	}
+	sorted := make([]int64, 0, len(open))
+	for k := range open {
+		if s.threads[wireID(true, k)] == nil {
+			sorted = append(sorted, k)
+		}
+	}
+	slices.Sort(sorted)
+	for _, k := range sorted {
+		o := open[k]
+		ot := s.threads[wireID(false, o)]
+		kind := s.hybridKind[k]
+		if kind == "" && ot != nil && ot.Typed {
+			kind = ot.Kind
+		}
+		if kind != "user" {
+			skipped++
+			continue
+		}
+		t := &threadInfo{Key: k, Enc: true, Kind: "user", Typed: true}
+		if ot != nil {
+			t.LastActivity = ot.LastActivity
+			for _, p := range ot.Participants {
+				if p != s.selfID {
+					t.addParticipant(p)
+				}
+			}
+		}
+		if len(t.Participants) == 0 {
+			if _, hybrid := s.fbToWA[o]; !hybrid {
+				skipped++
+				continue
+			}
+			t.addParticipant(o) // a one-to-one facebook thread key is the other person
+		}
+		out := s.wireThreadLocked(t)
+		out.Predecessor = wireID(false, o)
+		frames = append(frames, threadFrame(out))
+	}
+	return frames, skipped, len(keys)
+}
+
+// listingStats is the counts-only diagnostic on threads_done.
+func (s *messagixSession) listingStats(known, emitted, skipped int) map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	connected := 0
+	if s.e2ee != nil && s.e2ee.IsConnected() {
+		connected = 1
+	}
+	return map[string]int{
+		"group1_threads":          len(s.rowKeys),
+		"group1_encrypted_rows":   len(s.encRowKeys),
+		"hybrid_mappings":         len(s.fbToWA),
+		"cutover_links":           len(s.cutover),
+		"encrypted_known":         known,
+		"encrypted_emitted":       emitted,
+		"e2ee_connected":          connected,
+		"encrypted_skipped_group": skipped,
+	}
 }
