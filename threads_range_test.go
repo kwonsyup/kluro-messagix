@@ -233,7 +233,7 @@ func TestUnacceptedThreadsAreNeverTyped(t *testing.T) {
 		"pending": threadRow(500, "pending"),
 		"spam":    threadRow(500, "spam"),
 		"status 1": {
-			LSDeleteThenInsertThread:         []*table.LSDeleteThenInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE}},
+			LSDeleteThenInsertThread:         []*table.LSDeleteThenInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, ThreadName: "Stranger", LastActivityTimestampMs: 77}},
 			LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 500, MessageRequestStatus: 1}},
 		},
 	} {
