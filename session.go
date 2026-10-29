@@ -281,9 +281,7 @@ func (s *messagixSession) openSocket(ctx context.Context, resumed bool, saved js
 	if resumed {
 		// A resumed session skipped the page load, whose sync carries the cutover
 		// links and the typed rows a socket-only sync does not: run it once.
-		if tbl := s.resumeSync(ctx, saved); tbl != nil {
-			frames = s.handleTableFrames(tbl)
-		}
+		frames = s.resumeSync(ctx, saved)
 		// The caller cancelled Start during the sync: do not open the socket. The
 		// sync's own timeout is not a cancel and falls through to connect.
 		if err := ctx.Err(); err != nil {

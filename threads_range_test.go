@@ -563,16 +563,16 @@ func TestResumeSyncAsksOnceForDatabases1_2_95AndFeedsTheNormalPath(t *testing.T)
 		}
 		return &table.LSTable{}, nil
 	}
-	tbl := s.resumeSync(context.Background(), savedConfig(t, 123))
+	frames := s.resumeSync(context.Background(), savedConfig(t, 123))
 	want := []lsCall{{1, 123, "mb-params", nil, 0}, {2, 123, "ct-params", nil, 0}, {95, 123, "ct-params", nil, 0}}
 	if len(calls) != 3 || calls[0] != want[0] || calls[1] != want[1] || calls[2] != want[2] {
 		t.Fatalf("sync calls = %+v, want %+v", calls, want)
 	}
-	if tbl == nil || len(tbl.LSCreateOpenToE2EEThreadLink) != 1 {
-		t.Fatalf("database 95's cutover links must be added to database 1's table: %+v", tbl)
+	if s.cutover[4242] != 42 {
+		t.Fatalf("database 95's cutover link must be applied: %v", s.cutover)
 	}
 	var got []Frame
-	s.initialEmitter(s.handleTableFrames(tbl))(func(f Frame) int64 { got = append(got, f); return 0 })
+	s.initialEmitter(frames)(func(f Frame) int64 { got = append(got, f); return 0 })
 	enc := lastThread(got, "e:4242")
 	if enc == nil || enc.Kind != "user" || !enc.Encrypted || !enc.Typed || enc.Predecessor != "42" {
 		t.Fatalf("a typed encrypted one-to-one must be emitted as an e: thread: %+v", enc)
@@ -584,8 +584,9 @@ func TestResumeSyncAsksOnceForDatabases1_2_95AndFeedsTheNormalPath(t *testing.T)
 	if s.fbToWA[77] != 7777 {
 		t.Fatalf("the hybrid mapping must be recorded: %v", s.fbToWA)
 	}
-	if got := s.listingStats(0, 0, 0)["resume_sync_rows"]; got != countRows(tbl) || got == 0 {
-		t.Fatalf("resume_sync_rows = %d, want %d", got, countRows(tbl))
+	// rows: db 1 has 2 threads + 1 hybrid, db 2 none, db 95 one cutover link
+	if got := s.listingStats(0, 0, 0)["resume_sync_rows"]; got != 4 {
+		t.Fatalf("resume_sync_rows = %d, want 4", got)
 	}
 }
 
@@ -612,9 +613,9 @@ func TestResumeSyncFailureNeverBlocksTheListing(t *testing.T) {
 				}
 				return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 600, ThreadType: table.ONE_TO_ONE}}}, nil
 			}
-			tbl := s.resumeSync(context.Background(), savedConfig(t, tc.version))
-			if (tbl == nil) != tc.wantNil || n != tc.calls {
-				t.Fatalf("table nil=%v calls=%d, want nil=%v calls=%d", tbl == nil, n, tc.wantNil, tc.calls)
+			frames := s.resumeSync(context.Background(), savedConfig(t, tc.version))
+			if (frames == nil) != tc.wantNil || n != tc.calls {
+				t.Fatalf("frames nil=%v calls=%d, want nil=%v calls=%d", frames == nil, n, tc.wantNil, tc.calls)
 			}
 			_, stats, err, done := listWithin(t, s, &pager{}, context.Background(), 3*time.Second)
 			if !done || err != nil || stats == nil {
@@ -632,7 +633,7 @@ func TestResumeSyncHonoursCancel(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
-	done := make(chan *table.LSTable, 1)
+	done := make(chan []Frame, 1)
 	go func() { done <- s.resumeSync(ctx, savedConfig(t, 123)) }()
 	select {
 	case tbl := <-done:
@@ -887,4 +888,56 @@ func TestResumeSyncTablesAreAppliedToTheLibraryBeforeConnect(t *testing.T) {
 	if !done || err != nil || stats2["group1_range_wait_ms"] < 50 || stats2["group1_range_wait_ms"] >= 3000 || r2.pages < 2 {
 		t.Fatalf("the live-socket range must end the wait: done=%v err=%v wait=%d pages=%d", done, err, stats2["group1_range_wait_ms"], r2.pages)
 	}
+}
+
+// Databases 2 and 95 are applied whole, before their cursors move: a contact row in database 2 is consumed
+// (a participant name is recorded) before the table reaches the library's bookkeeping, and a pending thread
+// in database 95 still goes out as the minimal frame.
+func TestResumeSyncAppliesEveryDatabaseBeforeItsCursorMoves(t *testing.T) {
+	s := newTestSession()
+	var order []string
+	s.postHandle = func(tbl *table.LSTable) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		switch {
+		case len(tbl.LSDeleteThenInsertContact) > 0:
+			order = append(order, "db2 posted, name known="+s.names[42])
+		case len(tbl.LSCreateOpenToE2EEThreadLink) > 0:
+			order = append(order, "db95 posted, request flagged="+boolStr(s.folderMark[500]))
+		default:
+			order = append(order, "db1 posted")
+		}
+	}
+	s.lsRequest = func(ctx context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
+		switch v.Database {
+		case 2:
+			return &table.LSTable{LSDeleteThenInsertContact: []*table.LSDeleteThenInsertContact{{Id: 42, Name: "Renamed"}}}, nil
+		case 95:
+			return &table.LSTable{
+				LSCreateOpenToE2EEThreadLink: []*table.LSCreateOpenToE2EEThreadLink{{OpenThreadID: 42, ArmadilloThreadID: 4242}},
+				LSDeleteThenInsertThread:     []*table.LSDeleteThenInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, FolderName: "pending", ThreadName: "Stranger"}},
+			}, nil
+		}
+		return &table.LSTable{}, nil
+	}
+	frames := s.resumeSync(context.Background(), savedConfig(t, 123))
+	want := []string{"db1 posted", "db2 posted, name known=Renamed", "db95 posted, request flagged=true"}
+	if len(order) != 3 || order[0] != want[0] || order[1] != want[1] || order[2] != want[2] {
+		t.Fatalf("every table must be applied before its own bookkeeping: %v, want %v", order, want)
+	}
+	var got []Frame
+	s.initialEmitter(frames)(func(f Frame) int64 { got = append(got, f); return 0 })
+	if req := lastThread(got, "500"); req == nil || req.Kind != "" || req.Typed || req.Title != "" || len(req.Participants) != 0 {
+		t.Fatalf("a pending thread in database 95 must still be minimal: %+v", req)
+	}
+	if s.cutover[4242] != 42 || s.names[42] != "Renamed" {
+		t.Fatalf("db 2's contact and db 95's link must be applied: names=%v cutover=%v", s.names, s.cutover)
+	}
+}
+
+func boolStr(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
 }
