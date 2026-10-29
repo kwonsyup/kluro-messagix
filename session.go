@@ -76,6 +76,7 @@ type messagixSession struct {
 	cutover        map[int64]int64                                                                                    // encrypted chat id -> its pre-encryption (open) thread key
 	fbToWA         map[int64]int64                                                                                    // facebook thread key -> encrypted chat id (hybrid threads)
 	folderMark     map[int64]bool                                                                                     // facebook thread keys whose latest non-empty folder is pending or spam (memory only)
+	requestSource  map[int64]bool                                                                                     // ... whose thread row came from the message-requests database (95) and has not been accepted since (memory only)
 	statusMark     map[int64]bool                                                                                     // ... whose latest message request status row is 1 (memory only)
 	postHandle     func(tbl *table.LSTable)                                                                           // test seam; nil means the client's PostHandlePublishResponse
 	group1WaitMS   int                                                                                                // how long the listing waited for the initial group-1 range (the cap on a timeout), count only
@@ -132,17 +133,18 @@ func parseWire(id string) (enc bool, key int64, ok bool) {
 
 func newSession() *messagixSession {
 	return &messagixSession{
-		threads:      map[string]*threadInfo{},
-		participants: map[int64][]int64{},
-		names:        map[int64]string{},
-		cutover:      map[int64]int64{},
-		fbToWA:       map[int64]int64{},
-		folderMark:   map[int64]bool{},
-		statusMark:   map[int64]bool{},
-		rowKeys:      map[int64]bool{},
-		encRowKeys:   map[int64]bool{},
-		msgIndex:     map[string]string{},
-		collectors:   map[int64]*pageCollector{},
+		threads:       map[string]*threadInfo{},
+		participants:  map[int64][]int64{},
+		names:         map[int64]string{},
+		cutover:       map[int64]int64{},
+		fbToWA:        map[int64]int64{},
+		folderMark:    map[int64]bool{},
+		statusMark:    map[int64]bool{},
+		requestSource: map[int64]bool{},
+		rowKeys:       map[int64]bool{},
+		encRowKeys:    map[int64]bool{},
+		msgIndex:      map[string]string{},
+		collectors:    map[int64]*pageCollector{},
 	}
 }
 

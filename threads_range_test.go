@@ -941,3 +941,75 @@ func boolStr(b bool) string {
 	}
 	return "false"
 }
+
+// Database 95 is the message-requests inbox: every thread row the resume sync gets from it is a request, folder
+// or not, and only a later accepted signal types it. Database 1's rows are unaffected.
+func TestResumeSyncDatabase95ThreadRowsFailClosed(t *testing.T) {
+	s := newTestSession()
+	s.lsRequest = func(ctx context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
+		switch v.Database {
+		case 1:
+			return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 600, ThreadType: table.ONE_TO_ONE, FolderName: "inbox", ThreadName: "Friend", LastActivityTimestampMs: 5}}}, nil
+		case 95:
+			return &table.LSTable{
+				LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 700, ThreadType: table.ONE_TO_ONE, ThreadName: "Stranger", LastActivityTimestampMs: 9}}, // no folder
+				LSUpdateOrInsertThread:   []*table.LSUpdateOrInsertThread{{ThreadKey: 701, ThreadType: table.ONE_TO_ONE, ThreadName: "Other"}},
+			}, nil
+		}
+		return &table.LSTable{}, nil
+	}
+	frames := s.resumeSync(context.Background(), savedConfig(t, 123))
+	var got []Frame
+	s.initialEmitter(frames)(func(f Frame) int64 { got = append(got, f); return 0 })
+	for _, id := range []string{"700", "701"} {
+		th := lastThread(got, id)
+		if th == nil || th.Kind != "" || th.Typed || th.Title != "" || len(th.Participants) != 0 || connectorWouldQualify(th) {
+			t.Fatalf("a database-95 thread row with no folder must go out minimal: %s %+v", id, th)
+		}
+	}
+	if th := lastThread(got, "600"); th == nil || th.Kind != "user" || !th.Typed || th.Title != "Friend" || !connectorWouldQualify(th) {
+		t.Fatalf("database 1 rows are unaffected: %+v", th)
+	}
+	// a later inbox-folder row accepts it and re-emits it typed
+	if th := lastThread(s.handleTableFrames(threadRow(700, "inbox")), "700"); th == nil || th.Kind != "user" || !th.Typed || !connectorWouldQualify(th) {
+		t.Fatalf("an inbox row must accept a request-source thread: %+v", th)
+	}
+	// a request status other than 1 accepts the other one
+	st0 := &table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 701, MessageRequestStatus: 0}}}
+	if th := lastThread(s.handleTableFrames(st0), "701"); th == nil || th.Kind != "user" || !th.Typed {
+		t.Fatalf("status 0 must accept a request-source thread: %+v", th)
+	}
+}
+
+// A socket table whose sync blocks all name database 95 is treated the same way; other tables are not.
+func TestSocketTablesFromDatabase95AreMarkedAsRequests(t *testing.T) {
+	rows := func(block int64) *table.LSTable {
+		return &table.LSTable{
+			LSExecuteFirstBlockForSyncTransactionV4: []*table.LSExecuteFirstBlockForSyncTransactionV4{{DatabaseID: block}},
+			LSDeleteThenInsertThread:                []*table.LSDeleteThenInsertThread{{ThreadKey: 700, ThreadType: table.ONE_TO_ONE, ThreadName: "N"}},
+		}
+	}
+	for name, tc := range map[string]struct {
+		tbl     *table.LSTable
+		minimal bool
+	}{
+		"database 95 block": {rows(95), true},
+		"database 1 block":  {rows(1), false},
+		"mixed blocks": {func() *table.LSTable {
+			m := rows(95)
+			m.LSExecuteFirstBlockForSyncTransactionV4 = append(m.LSExecuteFirstBlockForSyncTransactionV4, &table.LSExecuteFirstBlockForSyncTransactionV4{DatabaseID: 1})
+			return m
+		}(), false},
+		"no sync block": {&table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 700, ThreadType: table.ONE_TO_ONE, ThreadName: "N"}}}, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newTestSession()
+			var got []Frame
+			s.handleTableEmit(tc.tbl, func(f Frame) int64 { got = append(got, f); return 0 })
+			th := lastThread(got, "700")
+			if th == nil || (th.Kind == "") != tc.minimal {
+				t.Fatalf("minimal=%v expected, got %+v", tc.minimal, th)
+			}
+		})
+	}
+}

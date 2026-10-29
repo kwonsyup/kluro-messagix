@@ -45,9 +45,57 @@ func (s *messagixSession) handleTable(tbl *table.LSTable) {
 func (s *messagixSession) handleTableEmit(tbl *table.LSTable, emit emitFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if fromRequestsDatabase(tbl) {
+		s.markRequestRowsLocked(tbl)
+	}
 	for _, f := range s.buildTableFramesLocked(tbl) {
 		emit(f)
 	}
+}
+
+// handleRequestTableFrames is handleTableFrames for a table known to come from the
+// message-requests database (95): see markRequestRowsLocked.
+func (s *messagixSession) handleRequestTableFrames(tbl *table.LSTable) []Frame {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.markRequestRowsLocked(tbl)
+	return s.buildTableFramesLocked(tbl)
+}
+
+// markRequestRowsLocked marks every thread row of a table from the message-requests
+// database as unaccepted, before its frame is built, so it goes out minimal whether or
+// not the row names a folder. Only a later accepted signal clears the mark (a thread row
+// in a folder other than pending or spam, or a request row with a status other than 1).
+// The caller holds s.mu.
+func (s *messagixSession) markRequestRowsLocked(tbl *table.LSTable) {
+	for _, th := range tbl.LSDeleteThenInsertThread {
+		s.requestSource[th.ThreadKey] = true
+	}
+	for _, th := range tbl.LSUpdateOrInsertThread {
+		s.requestSource[th.ThreadKey] = true
+	}
+	for _, th := range tbl.LSVerifyThreadExists {
+		s.requestSource[th.ThreadKey] = true
+	}
+}
+
+// requestsDatabaseID is the sync database of message requests.
+const requestsDatabaseID = 95
+
+// fromRequestsDatabase reports whether a table is a database-95 sync batch: its sync
+// transaction blocks all name database 95. A live push carries no block and is not
+// identified here; the folder rule guards those.
+func fromRequestsDatabase(tbl *table.LSTable) bool {
+	blocks := tbl.GetLSExecuteFirstBlockForSyncTransactionV4()
+	if len(blocks) == 0 {
+		return false
+	}
+	for _, b := range blocks {
+		if b.DatabaseID != requestsDatabaseID {
+			return false
+		}
+	}
+	return true
 }
 
 // handleTableFrames builds the frames of a table and returns them for the caller
@@ -120,6 +168,7 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []F
 			set(s.folderMark, key, true)
 		default:
 			set(s.folderMark, key, false)
+			set(s.requestSource, key, false)
 		}
 	}
 	for _, th := range tbl.LSDeleteThenInsertThread {
@@ -134,6 +183,9 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []F
 	for _, r := range tbl.LSDeleteThenInsertMessageRequest {
 		// MessageRequestStatus 1 means the thread is in the pending folder.
 		set(s.statusMark, r.ThreadKey, r.MessageRequestStatus == 1)
+		if r.MessageRequestStatus != 1 {
+			set(s.requestSource, r.ThreadKey, false)
+		}
 	}
 	upsertThread := func(key int64, typ table.ThreadType, name string, last int64) {
 		originalKey := key
@@ -333,7 +385,7 @@ func (s *messagixSession) wireThread(t *threadInfo) Thread {
 // unacceptedLocked reports whether a facebook thread is a message request or
 // spam by either source. The caller holds s.mu.
 func (s *messagixSession) unacceptedLocked(key int64) bool {
-	return s.folderMark[key] || s.statusMark[key]
+	return s.folderMark[key] || s.statusMark[key] || s.requestSource[key]
 }
 
 // emitKnownThreads emits a thread frame for every thread the helper knows. Each
