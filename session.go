@@ -77,6 +77,7 @@ type messagixSession struct {
 	fbToWA         map[int64]int64                                                                                    // facebook thread key -> encrypted chat id (hybrid threads)
 	folderMark     map[int64]bool                                                                                     // facebook thread keys whose latest non-empty folder is pending or spam (memory only)
 	statusMark     map[int64]bool                                                                                     // ... whose latest message request status row is 1 (memory only)
+	group1WaitMS   int                                                                                                // how long the listing waited for the initial group-1 range (the cap on a timeout), count only
 	e2eeOffline    int                                                                                                // queued E2EE messages the server said it would flush at connect (OfflineSyncPreview), count only
 	e2eeOfflineEnd bool                                                                                               // OfflineSyncCompleted seen
 	resumeRows     int                                                                                                // rows the resumed-start sync returned, count only

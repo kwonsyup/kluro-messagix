@@ -335,7 +335,13 @@ const (
 // threadPager is the part of the messagix client the thread listing uses.
 type threadPager interface {
 	FetchMoreThreads(ctx context.Context, syncGroup int64) (*socket.KeyStoreData, *table.LSTable, error)
+	WaitForInitialThreadRange(ctx context.Context, syncGroup int64) error
 }
+
+// group1RangeWait bounds the wait for the initial group-1 range. The range only
+// arrives from the server once the socket is up, and until it does the keystore
+// says there is nothing more to page, so paging first stops after one page.
+var group1RangeWait = 15 * time.Second
 
 // Threads lists every thread: the ones already known, then the rest of the main
 // inbox (sync group 1) by paging it as the web client scrolls it in. Message
@@ -369,8 +375,33 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit
 	return s.listingStats(known, len(emitted), unlisted), nil
 }
 
+// waitGroup1Range waits for the initial group-1 range before paging. A timeout is
+// not an error: the inbox list is still usable, so it logs a fixed code and pages
+// anyway. It records how long the wait took (the cap on a timeout).
+func (s *messagixSession) waitGroup1Range(ctx context.Context, cli threadPager) error {
+	wctx, cancel := context.WithTimeout(ctx, group1RangeWait)
+	defer cancel()
+	start := time.Now()
+	err := cli.WaitForInitialThreadRange(wctx, 1)
+	waited := time.Since(start)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		logCode("info", "group1_range_timeout")
+		waited = group1RangeWait
+	}
+	s.mu.Lock()
+	s.group1WaitMS = int(waited.Milliseconds())
+	s.mu.Unlock()
+	return nil
+}
+
 func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit emitFunc) error {
 	const group = 1
+	if err := s.waitGroup1Range(ctx, cli); err != nil {
+		return err
+	}
 	var prevMin int64
 	for batch := 0; batch < threadBatchLimit; batch++ {
 		if err := ctx.Err(); err != nil {

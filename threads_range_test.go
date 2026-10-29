@@ -2,9 +2,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,6 +32,47 @@ func (r *pager) FetchMoreThreads(_ context.Context, group int64) (*socket.KeySto
 		tbl = r.group1
 	}
 	return &socket.KeyStoreData{MinThreadKey: 7}, tbl, nil
+}
+
+func (r *pager) WaitForInitialThreadRange(context.Context, int64) error { return nil }
+
+// rangePager models the real client: until the initial group-1 range arrives the keystore says there
+// is nothing more to page, so a page fetched early is the only one.
+type rangePager struct {
+	mu       sync.Mutex
+	delay    time.Duration // when the range arrives; negative: never
+	arrived  bool
+	pages    int
+	waitedOn int
+}
+
+func (r *rangePager) WaitForInitialThreadRange(ctx context.Context, _ int64) error {
+	r.mu.Lock()
+	r.waitedOn++
+	r.mu.Unlock()
+	if r.delay < 0 {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	select {
+	case <-time.After(r.delay):
+		r.mu.Lock()
+		r.arrived = true
+		r.mu.Unlock()
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *rangePager) FetchMoreThreads(context.Context, int64) (*socket.KeyStoreData, *table.LSTable, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pages++
+	if !r.arrived {
+		return &socket.KeyStoreData{HasMoreBefore: false, MinThreadKey: 100}, &table.LSTable{}, nil
+	}
+	return &socket.KeyStoreData{HasMoreBefore: r.pages < 3, MinThreadKey: int64(100 - r.pages)}, &table.LSTable{}, nil
 }
 
 func listWithin(t *testing.T, s *messagixSession, r threadPager, ctx context.Context, bound time.Duration) (frames []Frame, stats map[string]int, err error, done bool) {
@@ -130,7 +174,7 @@ func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
 	}
 	wantStats(t, stats, map[string]int{
 		"group1_threads": 3, "group1_encrypted_rows": 3, "hybrid_mappings": 0, "cutover_links": 0,
-		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_unlisted": 0, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
+		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_unlisted": 0, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0, "group1_range_wait_ms": 0,
 	})
 }
 
@@ -157,7 +201,7 @@ func TestKnownEncryptedKeyWithNoTableRowIsCountedNotEmitted(t *testing.T) {
 	}
 	wantStats(t, stats, map[string]int{
 		"group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 1, "cutover_links": 2,
-		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "encrypted_unlisted": 2, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
+		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "encrypted_unlisted": 2, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0, "group1_range_wait_ms": 0,
 	})
 }
 
@@ -695,5 +739,61 @@ func TestOpenSocketChecksTheCallersCancelBeforeConnecting(t *testing.T) {
 	frames, err := s2.openSocket(context.Background(), true, savedConfig(t, 123), func(context.Context) error { connected = true; return nil })
 	if err != nil || !connected || frames != nil {
 		t.Fatalf("a sync timeout must still connect: err=%v connected=%v frames=%v", err, connected, frames)
+	}
+}
+
+func withGroup1Wait(t *testing.T, d time.Duration) {
+	old := group1RangeWait
+	group1RangeWait = d
+	t.Cleanup(func() { group1RangeWait = old })
+}
+
+// The initial group-1 range arrives after the socket is up; paging waits for it, so it goes past the first page.
+func TestPagingWaitsForTheInitialGroup1Range(t *testing.T) {
+	withGroup1Wait(t, 3*time.Second)
+	r := &rangePager{delay: 100 * time.Millisecond}
+	_, stats, err, done := listWithin(t, newTestSession(), r, context.Background(), 10*time.Second)
+	if !done || err != nil {
+		t.Fatalf("done=%v err=%v", done, err)
+	}
+	if r.pages < 2 {
+		t.Fatalf("paged %d time(s): the range had arrived, paging must continue past the first page", r.pages)
+	}
+	if w := stats["group1_range_wait_ms"]; w < 90 || w > 2000 {
+		t.Fatalf("group1_range_wait_ms = %d, want about 100", w)
+	}
+}
+
+// The range never arrives: after the cap the listing pages anyway, with no error, and the stat is the cap.
+func TestPagingGoesAheadWhenTheGroup1RangeNeverArrives(t *testing.T) {
+	withGroup1Wait(t, 100*time.Millisecond)
+	var logged bytes.Buffer
+	oldErr := stderr
+	stderr = &logged
+	defer func() { stderr = oldErr }()
+	r := &rangePager{delay: -1}
+	_, stats, err, done := listWithin(t, newTestSession(), r, context.Background(), 5*time.Second)
+	if !done || err != nil || stats == nil {
+		t.Fatalf("a missing range must not fail the listing: done=%v err=%v", done, err)
+	}
+	if r.pages != 1 {
+		t.Fatalf("pages = %d, want the single early page", r.pages)
+	}
+	if !strings.Contains(logged.String(), `"code":"group1_range_timeout"`) || !strings.Contains(logged.String(), `"level":"info"`) {
+		t.Fatalf("log = %q", logged.String())
+	}
+	if w := stats["group1_range_wait_ms"]; w != 100 {
+		t.Fatalf("group1_range_wait_ms = %d, want the cap 100", w)
+	}
+}
+
+func TestCancelDuringTheGroup1RangeWait(t *testing.T) {
+	withGroup1Wait(t, time.Minute)
+	r := &rangePager{delay: -1}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+	_, stats, err, done := listWithin(t, newTestSession(), r, ctx, 3*time.Second)
+	if !done || err == nil || stats != nil || r.pages != 0 {
+		t.Fatalf("cancel must free the wait and not page: done=%v err=%v stats=%v pages=%d", done, err, stats, r.pages)
 	}
 }
