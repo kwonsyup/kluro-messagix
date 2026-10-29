@@ -69,22 +69,24 @@ type messagixSession struct {
 	selfID        int64
 	selfName      string
 
-	threads      map[string]*threadInfo // by wire id
-	participants map[int64][]int64      // participant rows waiting for their thread
-	names        map[int64]string
-	cutover      map[int64]int64   // encrypted chat id -> its pre-encryption (open) thread key
-	fbToWA       map[int64]int64   // facebook thread key -> encrypted chat id (hybrid threads)
-	unaccepted   map[int64]bool    // facebook thread keys whose latest folder row says request or spam (memory only)
-	rowKeys      map[int64]bool    // thread rows seen this run (counts only)
-	encRowKeys   map[int64]bool    // ... of an encrypted-over-WA type
-	msgIndex     map[string]string // message id -> wire thread id
-	msgOrder     []string
-	collectors   map[int64]*pageCollector
-	lastFullRec  time.Time
-	stopping     bool
-	stopped      bool
-	logoutOnly   bool
-	platform     string
+	threads        map[string]*threadInfo // by wire id
+	participants   map[int64][]int64      // participant rows waiting for their thread
+	names          map[int64]string
+	cutover        map[int64]int64   // encrypted chat id -> its pre-encryption (open) thread key
+	fbToWA         map[int64]int64   // facebook thread key -> encrypted chat id (hybrid threads)
+	folderMark     map[int64]bool    // facebook thread keys whose latest non-empty folder is pending or spam (memory only)
+	statusMark     map[int64]bool    // ... whose latest message request status row is 1 (memory only)
+	beforeListEmit func(id string)   // test seam: runs between the listing's snapshot of ids and its emit of one
+	rowKeys        map[int64]bool    // thread rows seen this run (counts only)
+	encRowKeys     map[int64]bool    // ... of an encrypted-over-WA type
+	msgIndex       map[string]string // message id -> wire thread id
+	msgOrder       []string
+	collectors     map[int64]*pageCollector
+	lastFullRec    time.Time
+	stopping       bool
+	stopped        bool
+	logoutOnly     bool
+	platform       string
 
 	lastState       time.Time
 	lastStateBlob   []byte
@@ -128,7 +130,8 @@ func newSession() *messagixSession {
 		names:        map[int64]string{},
 		cutover:      map[int64]int64{},
 		fbToWA:       map[int64]int64{},
-		unaccepted:   map[int64]bool{},
+		folderMark:   map[int64]bool{},
+		statusMark:   map[int64]bool{},
 		rowKeys:      map[int64]bool{},
 		encRowKeys:   map[int64]bool{},
 		msgIndex:     map[string]string{},

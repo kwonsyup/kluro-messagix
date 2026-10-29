@@ -359,11 +359,8 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit
 		}
 		return emit(f)
 	}
-	for _, f := range s.sortedThreadFrames() {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		counted(f)
+	if err := s.emitKnownThreads(ctx, counted); err != nil {
+		return nil, err
 	}
 	if err := s.pageThreads(ctx, cli, counted); err != nil {
 		return nil, err

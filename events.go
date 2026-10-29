@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"strconv"
 	"sync"
 
@@ -80,16 +81,18 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame)
 	// folder, or a request status other than 1, clears the mark and re-emits the
 	// thread typed; an empty folder does neither. The mark is memory only: after a
 	// restart a request the listing does not type stays untyped.
-	mark := func(key int64, unaccepted bool) {
-		if s.unaccepted[key] == unaccepted {
-			return
-		}
-		if unaccepted {
-			s.unaccepted[key] = true
+	// Two sources are tracked apart: the latest non-empty folder (pending or spam)
+	// and the latest request status row. A status row only clears what a status row
+	// set, and a folder only clears what a folder set, so a spam folder stays
+	// unaccepted next to a status-0 row, as in the library.
+	set := func(marks map[int64]bool, key int64, on bool) {
+		before := s.unacceptedLocked(key)
+		if on {
+			marks[key] = true
 		} else {
-			delete(s.unaccepted, key)
+			delete(marks, key)
 		}
-		if s.threads[wireID(false, key)] != nil {
+		if s.unacceptedLocked(key) != before && s.threads[wireID(false, key)] != nil {
 			touched[wireID(false, key)] = true
 		}
 	}
@@ -97,9 +100,9 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame)
 		switch folder {
 		case "":
 		case folderPending, folderSpam:
-			mark(key, true)
+			set(s.folderMark, key, true)
 		default:
-			mark(key, false)
+			set(s.folderMark, key, false)
 		}
 	}
 	for _, th := range tbl.LSDeleteThenInsertThread {
@@ -113,7 +116,7 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame)
 	}
 	for _, r := range tbl.LSDeleteThenInsertMessageRequest {
 		// MessageRequestStatus 1 means the thread is in the pending folder.
-		mark(r.ThreadKey, r.MessageRequestStatus == 1)
+		set(s.statusMark, r.ThreadKey, r.MessageRequestStatus == 1)
 	}
 	upsertThread := func(key int64, typ table.ThreadType, name string, last int64) {
 		originalKey := key
@@ -279,7 +282,7 @@ func threadFrame(t Thread) Frame { return Frame{T: TThread, ThreadEvt: &t} }
 // wireThreadLocked builds the protocol thread. A one-to-one thread names the
 // other person; an encrypted thread names the open thread it continues.
 func (s *messagixSession) wireThreadLocked(t *threadInfo) Thread {
-	if !t.Enc && s.unaccepted[t.Key] {
+	if !t.Enc && s.unacceptedLocked(t.Key) {
 		// A message request qualifies for nothing: the connector imports any
 		// one-to-one thread that names another person, typed or not, so the frame
 		// carries no kind, no type and no participants. The real ones stay in
@@ -307,6 +310,38 @@ func (s *messagixSession) wireThread(t *threadInfo) Thread {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.wireThreadLocked(t)
+}
+
+// unacceptedLocked reports whether a facebook thread is a message request or
+// spam by either source. The caller holds s.mu.
+func (s *messagixSession) unacceptedLocked(key int64) bool {
+	return s.folderMark[key] || s.statusMark[key]
+}
+
+// emitKnownThreads emits a thread frame for every thread the helper knows. Each
+// frame is built from the current state inside the lock that also covers its
+// emit, so a listing never emits an older mark than a live frame already did.
+func (s *messagixSession) emitKnownThreads(ctx context.Context, emit emitFunc) error {
+	s.mu.Lock()
+	ids := make([]string, 0, len(s.threads))
+	for id := range s.threads {
+		ids = append(ids, id)
+	}
+	s.mu.Unlock()
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if s.beforeListEmit != nil {
+			s.beforeListEmit(id)
+		}
+		s.mu.Lock()
+		if t := s.threads[id]; t != nil {
+			emit(threadFrame(s.wireThreadLocked(t)))
+		}
+		s.mu.Unlock()
+	}
+	return nil
 }
 
 func (s *messagixSession) sortedThreadFrames() []Frame {

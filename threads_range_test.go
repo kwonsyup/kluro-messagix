@@ -309,7 +309,7 @@ func TestAcceptingARequestTypesAndReemitsTheThread(t *testing.T) {
 		t.Fatalf("status 0 must type and re-emit: typed=%v found=%v", typed, found)
 	}
 	// the mark is memory only: a new session knows nothing of it
-	if fresh := newTestSession(); len(fresh.unaccepted) != 0 {
+	if fresh := newTestSession(); len(fresh.folderMark)+len(fresh.statusMark) != 0 {
 		t.Fatal("the mark must not be persisted")
 	}
 }
@@ -322,5 +322,63 @@ func TestEncryptedThreadsAreNotAffectedByTheMark(t *testing.T) {
 	}})
 	if typed, found := typedOf(frames, "e:4242"); !found || !typed {
 		t.Fatalf("encrypted rows are not covered by the mark: typed=%v found=%v", typed, found)
+	}
+}
+
+// A spam or pending folder is only cleared by a folder, and a request status of 0 only clears what a
+// status row set: spam plus a status-0 row in one batch stays unaccepted, as in the library.
+func TestSpamFolderIsNotClearedByAStatusZeroRow(t *testing.T) {
+	s := newTestSession()
+	frames := s.handleTableFrames(&table.LSTable{
+		LSDeleteThenInsertThread:         []*table.LSDeleteThenInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, FolderName: "spam"}},
+		LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 500, MessageRequestStatus: 0}},
+	})
+	for _, f := range frames {
+		if f.T == TThread && f.ThreadEvt.ID == "500" && (f.ThreadEvt.Kind != "" || f.ThreadEvt.Typed || len(f.ThreadEvt.Participants) != 0) {
+			t.Fatalf("spam with a status-0 row must stay unaccepted: %+v", f.ThreadEvt)
+		}
+	}
+	// Each source clears only itself: a status-1 row then a folder row leaves it unaccepted until both clear.
+	s.handleTableFrames(&table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 500, MessageRequestStatus: 1}}})
+	frames = s.handleTableFrames(threadRow(500, "inbox"))
+	if th := lastThread(frames, "500"); th != nil && th.Kind != "" {
+		t.Fatalf("an inbox folder must not clear the status mark: %+v", th)
+	}
+	frames = s.handleTableFrames(&table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 500, MessageRequestStatus: 0}}})
+	if th := lastThread(frames, "500"); th == nil || th.Kind != "user" || !th.Typed {
+		t.Fatalf("both sources cleared: the thread is accepted again: %+v", th)
+	}
+}
+
+func lastThread(frames []Frame, id string) *Thread {
+	for i := len(frames) - 1; i >= 0; i-- {
+		if f := frames[i]; f.T == TThread && f.ThreadEvt.ID == id {
+			return f.ThreadEvt
+		}
+	}
+	return nil
+}
+
+// A live rejection that lands between the listing's snapshot of ids and its emit of a thread
+// must not be undone by a stale typed frame.
+func TestListingNeverEmitsAnOlderMarkThanALiveFrame(t *testing.T) {
+	s := newTestSession()
+	s.handleTableFrames(threadRow(500, "inbox"))
+	var live []Frame
+	s.beforeListEmit = func(id string) {
+		if id == "500" {
+			live = s.handleTableFrames(threadRow(500, "pending")) // the rejection, after the snapshot
+		}
+	}
+	var listed []Frame
+	if err := s.emitKnownThreads(context.Background(), func(f Frame) int64 { listed = append(listed, f); return 0 }); err != nil {
+		t.Fatal(err)
+	}
+	if th := lastThread(live, "500"); th == nil || th.Kind != "" {
+		t.Fatalf("the live frame is the rejected shape: %+v", th)
+	}
+	th := lastThread(listed, "500")
+	if th == nil || th.Kind != "" || th.Typed || len(th.Participants) != 0 {
+		t.Fatalf("the listing must emit the unaccepted shape, not a stale typed frame: %+v", th)
 	}
 }
