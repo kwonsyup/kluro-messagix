@@ -84,13 +84,7 @@ func (s *messagixSession) resumeSync(ctx context.Context, saved json.RawMessage)
 			}
 			continue
 		}
-		if db == requestsDatabaseID {
-			// Database 95 is the message-requests inbox: every thread row in it is a
-			// request, whether or not the row names a folder.
-			frames = append(frames, s.handleRequestTableFrames(tbl)...)
-		} else {
-			frames = append(frames, s.handleTableFrames(tbl)...)
-		}
+		frames = append(frames, s.handleTableFrames(tbl)...)
 		rows += countRows(tbl)
 		// The library applies each database's cursors and thread ranges right after its
 		// request (SyncDataGraphQL); the snapshot's are fresher than the cached ones.
