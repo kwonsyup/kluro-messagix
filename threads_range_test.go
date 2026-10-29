@@ -382,3 +382,45 @@ func TestListingNeverEmitsAnOlderMarkThanALiveFrame(t *testing.T) {
 		t.Fatalf("the listing must emit the unaccepted shape, not a stale typed frame: %+v", th)
 	}
 }
+
+// Live tables and listing pages are built and emitted inside one hold of the session lock, so a later
+// row cannot land between a frame's build and its emit; thread frames stay ahead of their messages.
+func TestTablesAreEmittedUnderTheSameLockAsTheirBuild(t *testing.T) {
+	tbl := func() *table.LSTable {
+		return &table.LSTable{
+			LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, FolderName: "inbox"}},
+			LSInsertMessage:          []*table.LSInsertMessage{{ThreadKey: 500, MessageId: "mid.1", SenderId: 500, Text: "hi", TimestampMs: 1}},
+		}
+	}
+	for name, run := range map[string]func(s *messagixSession, emit emitFunc){
+		"live table": func(s *messagixSession, emit emitFunc) { s.emit = emit; s.handleTable(tbl()) },
+		"listing page": func(s *messagixSession, emit emitFunc) {
+			if _, err := s.listThreads(context.Background(), &pager{group1: tbl()}, emit); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newTestSession()
+			var order []string
+			emit := func(f Frame) int64 {
+				if s.mu.TryLock() {
+					s.mu.Unlock()
+					t.Errorf("a %s frame was emitted outside the lock that built it", f.T)
+				}
+				order = append(order, f.T)
+				return 0
+			}
+			run(s, emit)
+			var types []string
+			for _, o := range order {
+				if o == TThread || o == TMessage {
+					types = append(types, o)
+				}
+			}
+			if len(types) < 2 || types[0] != TThread || types[1] != TMessage {
+				t.Fatalf("the thread frame must come ahead of its message: %v", order)
+			}
+		})
+	}
+}

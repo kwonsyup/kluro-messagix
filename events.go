@@ -36,14 +36,31 @@ func (c *pageCollector) finish() { c.once.Do(func() { close(c.done) }) }
 // messages, edits and unsends. History pages requested through a collector are
 // routed to it instead.
 func (s *messagixSession) handleTable(tbl *table.LSTable) {
-	for _, f := range s.handleTableFrames(tbl) {
-		s.emit(f)
+	s.handleTableEmit(tbl, s.emit)
+}
+
+// handleTableEmit builds the frames of a table and emits them inside one hold of
+// s.mu, thread frames ahead of their messages as built, so a later row (a live
+// rejection, say) cannot land between a frame's build and its emit.
+func (s *messagixSession) handleTableEmit(tbl *table.LSTable, emit emitFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, f := range s.buildTableFramesLocked(tbl) {
+		emit(f)
 	}
 }
 
-func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame) {
+// handleTableFrames builds the frames of a table and returns them for the caller
+// to emit; use handleTableEmit where emit order against later rows matters.
+func (s *messagixSession) handleTableFrames(tbl *table.LSTable) []Frame {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.buildTableFramesLocked(tbl)
+}
+
+// buildTableFramesLocked applies a table to the session and returns its frames.
+// The caller holds s.mu.
+func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []Frame) {
 	dirty := false
 	for _, c := range tbl.LSCreateOpenToE2EEThreadLink {
 		if s.cutover[c.ArmadilloThreadID] != c.OpenThreadID {

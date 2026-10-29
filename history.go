@@ -383,11 +383,14 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 		if tbl == nil || ks == nil {
 			return nil
 		}
-		for _, f := range s.handleTableFrames(tbl) {
-			if err := ctx.Err(); err != nil {
-				return err
+		s.handleTableEmit(tbl, func(f Frame) int64 {
+			if ctx.Err() != nil {
+				return 0
 			}
-			emit(f)
+			return emit(f)
+		})
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		if !ks.HasMoreBefore || ks.MinThreadKey == prevMin {
 			return nil
