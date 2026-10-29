@@ -255,24 +255,38 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 	if initial != nil {
 		initialFrames = s.handleTableFrames(initial)
 	}
-	if err := cli.Connect(s.ctx); err != nil {
+	synced, err := s.openSocket(ctx, resumed, st.Messagix, cli.Connect)
+	if err != nil {
 		logCode("warn", "connect_failed")
 		return Ready{}, nil, classifyStartError("connect", err)
 	}
+	initialFrames = append(initialFrames, synced...)
 	s.scheduleE2EE()
-	if resumed {
-		// A resumed session skipped the page load, whose sync carries the cutover
-		// links and the typed rows a socket-only sync does not: run it once.
-		if tbl := s.resumeSync(ctx, st.Messagix); tbl != nil {
-			initialFrames = append(initialFrames, s.handleTableFrames(tbl)...)
-		}
-	}
 	emitInitial := s.initialEmitter(initialFrames)
 
 	ready := Ready{Self: strconv.FormatInt(s.selfID, 10), Name: s.selfName, History: s.checkHistory(ctx)}
 	s.markStateDirty()
 	logCode("info", "session_started")
 	return ready, emitInitial, nil
+}
+
+// openSocket applies a resumed session's page-load sync and then opens the socket,
+// in that order: the sync is an HTTP request and needs no socket, and applying its
+// snapshot first means every socket row lands after it and wins over it. A
+// session that did not resume only connects.
+func (s *messagixSession) openSocket(ctx context.Context, resumed bool, saved json.RawMessage, connect func(context.Context) error) ([]Frame, error) {
+	var frames []Frame
+	if resumed {
+		// A resumed session skipped the page load, whose sync carries the cutover
+		// links and the typed rows a socket-only sync does not: run it once.
+		if tbl := s.resumeSync(ctx, saved); tbl != nil {
+			frames = s.handleTableFrames(tbl)
+		}
+	}
+	if err := connect(s.ctx); err != nil {
+		return nil, err
+	}
+	return frames, nil
 }
 
 // restore loads everything from a previous state blob except the messagix

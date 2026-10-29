@@ -605,3 +605,59 @@ func TestOfflineSyncStats(t *testing.T) {
 		t.Fatalf("after completion: %v", st)
 	}
 }
+
+// The resume snapshot is applied before the socket opens, so every socket row lands after it and
+// wins: a thread the snapshot shows in the inbox that a socket row then moves to spam stays unaccepted.
+func TestResumeSnapshotIsAppliedBeforeTheSocketOpens(t *testing.T) {
+	s := newTestSession()
+	s.ctx = context.Background()
+	s.lsRequest = func(ctx context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
+		if v.Database == 1 {
+			return &table.LSTable{
+				LSDeleteThenInsertThread:   []*table.LSDeleteThenInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, FolderName: "inbox", ThreadName: "N"}},
+				LSVerifyHybridThreadExists: []*table.LSVerifyHybridThreadExists{{ThreadKey: 77, ThreadJID: 7777, ThreadType: table.ONE_TO_ONE}},
+			}, nil
+		}
+		return &table.LSTable{}, nil
+	}
+	appliedAtConnect := false
+	connect := func(context.Context) error {
+		s.mu.Lock()
+		appliedAtConnect = s.fbToWA[77] == 7777 && s.threads["500"] != nil
+		s.mu.Unlock()
+		// the first socket delta: the thread moves to spam
+		s.handleTableFrames(threadRow(500, "spam"))
+		return nil
+	}
+	frames, err := s.openSocket(context.Background(), true, savedConfig(t, 123), connect)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !appliedAtConnect {
+		t.Fatal("the snapshot must be applied before the socket opens")
+	}
+	if th := lastThread(frames, "500"); th == nil {
+		t.Fatal("the snapshot's thread frame is part of the initial frames")
+	}
+	var got []Frame
+	s.initialEmitter(frames)(func(f Frame) int64 { got = append(got, f); return 0 })
+	if th := lastThread(got, "500"); th == nil || th.Kind != "" || th.Typed || th.Title != "" {
+		t.Fatalf("the socket row that moved the thread to spam must win over the snapshot: %+v", th)
+	}
+
+	// A session that did not resume only connects: no sync request is made.
+	fresh := newTestSession()
+	called := 0
+	fresh.lsRequest = func(context.Context, *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
+		called++
+		return &table.LSTable{}, nil
+	}
+	fresh.ctx = context.Background()
+	if f, err := fresh.openSocket(context.Background(), false, nil, func(context.Context) error { return nil }); err != nil || f != nil || called != 0 {
+		t.Fatalf("a fresh session only connects: frames=%v err=%v syncCalls=%d", f, err, called)
+	}
+	// A connect failure is returned.
+	if _, err := fresh.openSocket(context.Background(), false, nil, func(context.Context) error { return errors.New("down") }); err == nil {
+		t.Fatal("a connect failure must be returned")
+	}
+}
