@@ -8,6 +8,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -921,4 +922,132 @@ func boolStr(b bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+type blockingPager struct {
+	inFlight chan struct{}
+	release  chan struct{}
+	returned atomic.Bool
+}
+
+func (p *blockingPager) WaitForInitialThreadRange(context.Context, int64) error { return nil }
+
+func (p *blockingPager) FetchMoreThreads(ctx context.Context, _ int64) (*socket.KeyStoreData, *table.LSTable, error) {
+	close(p.inFlight)
+	select {
+	case <-p.release:
+	case <-ctx.Done():
+	}
+	p.returned.Store(true)
+	return &socket.KeyStoreData{MinThreadKey: 7}, &table.LSTable{}, nil
+}
+
+func rangeTable(minKey int64) *table.LSTable {
+	return &table.LSTable{LSUpsertSyncGroupThreadsRange: []*table.LSUpsertSyncGroupThreadsRange{{SyncGroup: 1, HasMoreBefore: true, MinThreadKey: minKey}}}
+}
+
+// The socket reader must not wait for a page fetch in flight (its answer arrives through the same reader), and the
+// library's bookkeeping for live tables must not overlap that fetch: the handler returns at once, the tables are applied
+// only after the fetch returns, in arrival order.
+func TestLiveBookkeepingNeverOverlapsAPageFetchAndNeverBlocksTheReader(t *testing.T) {
+	s := newTestSession()
+	s.ctx, s.cancel = context.WithCancel(context.Background())
+	defer s.cancel()
+	p := &blockingPager{inFlight: make(chan struct{}), release: make(chan struct{})}
+	var mu sync.Mutex
+	var applied []int64
+	var afterFetch []bool
+	s.postHandle = func(tbl *table.LSTable) {
+		mu.Lock()
+		defer mu.Unlock()
+		applied = append(applied, tbl.LSUpsertSyncGroupThreadsRange[0].MinThreadKey)
+		afterFetch = append(afterFetch, p.returned.Load())
+	}
+	listed := make(chan struct{})
+	go func() {
+		_, _ = s.listThreads(context.Background(), p, func(Frame) int64 { return 0 })
+		close(listed)
+	}()
+	select {
+	case <-p.inFlight:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the page fetch never started")
+	}
+	for _, key := range []int64{11, 12} {
+		returned := make(chan struct{})
+		go func() { s.handleMetaEvent(context.Background(), rangeTable(key)); close(returned) }()
+		select {
+		case <-returned:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("the reader-path handler blocked behind a page fetch in flight")
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	n := len(applied)
+	mu.Unlock()
+	if n != 0 {
+		t.Fatalf("bookkeeping ran during the page fetch: %v", applied)
+	}
+	close(p.release)
+	<-listed
+	waitFor(t, "the queued bookkeeping", func() bool { mu.Lock(); defer mu.Unlock(); return len(applied) == 2 })
+	mu.Lock()
+	defer mu.Unlock()
+	if applied[0] != 11 || applied[1] != 12 || !afterFetch[0] || !afterFetch[1] {
+		t.Fatalf("tables must be applied after the fetch returned, in arrival order: %v afterFetch=%v", applied, afterFetch)
+	}
+}
+
+// The drainer is tracked by the session and exits when it stops; a table with no sync rows starts nothing.
+func TestBookkeepingDrainerExitsWithTheSession(t *testing.T) {
+	s := newTestSession()
+	s.ctx, s.cancel = context.WithCancel(context.Background())
+	s.postHandle = func(*table.LSTable) {}
+
+	s.queueBookkeeping(&table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 9, ThreadType: table.ONE_TO_ONE}}})
+	s.qMu.Lock()
+	started := s.bookDone != nil
+	s.qMu.Unlock()
+	if started {
+		t.Fatal("a table with no sync rows needs no bookkeeping and no drainer")
+	}
+
+	s.queueBookkeeping(rangeTable(5))
+	s.qMu.Lock()
+	done := s.bookDone
+	s.qMu.Unlock()
+	if done == nil {
+		t.Fatal("a table with a thread range starts the drainer")
+	}
+	select {
+	case <-done:
+		t.Fatal("the drainer must run while the session does")
+	case <-time.After(50 * time.Millisecond):
+	}
+	s.Stop()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the drainer did not exit on Stop")
+	}
+	// after stop, nothing is started or kept
+	s.queueBookkeeping(rangeTable(6))
+	s.qMu.Lock()
+	left := len(s.bookQ)
+	s.qMu.Unlock()
+	if left > 1 {
+		t.Fatalf("queue = %d after stop", left)
+	}
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for i := 0; i < 300; i++ {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
 }

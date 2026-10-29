@@ -32,6 +32,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/dgw"
 	"go.mau.fi/mautrix-meta/pkg/messagix/graphql"
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
+	"go.mau.fi/mautrix-meta/pkg/messagix/methods"
 	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
@@ -73,10 +74,15 @@ type messagixSession struct {
 	threads        map[string]*threadInfo // by wire id
 	participants   map[int64][]int64      // participant rows waiting for their thread
 	names          map[int64]string
-	cutover        map[int64]int64                                                                                    // encrypted chat id -> its pre-encryption (open) thread key
-	fbToWA         map[int64]int64                                                                                    // facebook thread key -> encrypted chat id (hybrid threads)
-	folderMark     map[int64]bool                                                                                     // facebook thread keys whose latest non-empty folder is pending or spam (memory only)
-	statusMark     map[int64]bool                                                                                     // ... whose latest message request status row is 1 (memory only)
+	cutover        map[int64]int64 // encrypted chat id -> its pre-encryption (open) thread key
+	fbToWA         map[int64]int64 // facebook thread key -> encrypted chat id (hybrid threads)
+	folderMark     map[int64]bool  // facebook thread keys whose latest non-empty folder is pending or spam (memory only)
+	statusMark     map[int64]bool  // ... whose latest message request status row is 1 (memory only)
+	bookMu         sync.Mutex      // serialises the library's sync bookkeeping with paging; never held by the socket reader
+	qMu            sync.Mutex      // guards the live bookkeeping queue below
+	bookQ          []*table.LSTable
+	bookWake       chan struct{}                                                                                      // wakes the drainer; capacity 1
+	bookDone       chan struct{}                                                                                      // closed when the drainer has exited; nil until it starts
 	postHandle     func(tbl *table.LSTable)                                                                           // test seam; nil means the client's PostHandlePublishResponse
 	group1WaitMS   int                                                                                                // how long the listing waited for the initial group-1 range (the cap on a timeout), count only
 	e2eeOffline    int                                                                                                // queued E2EE messages the server said it would flush at connect (OfflineSyncPreview), count only
@@ -909,8 +915,12 @@ func (s *messagixSession) webLogout(ctx context.Context, cli *messagix.Client) {
 	logCode("info", "web_logout_attempted")
 }
 
-// postHandleTable feeds a received table to the library's sync bookkeeping.
+// postHandleTable feeds a received table to the library's sync bookkeeping, under
+// bookMu so it never overlaps a page fetch. For callers that are not the socket
+// reader (the resume sync, before the socket opens, and the drainer).
 func (s *messagixSession) postHandleTable(tbl *table.LSTable) {
+	s.bookMu.Lock()
+	defer s.bookMu.Unlock()
 	if s.postHandle != nil {
 		s.postHandle(tbl)
 		return
@@ -921,6 +931,79 @@ func (s *messagixSession) postHandleTable(tbl *table.LSTable) {
 	cli.PostHandlePublishResponse(tbl)
 }
 
+// queueBookkeeping hands a live table's sync bookkeeping to the drainer and returns
+// at once. It runs on the socket reader, and a page fetch in flight is answered
+// through that same reader, so it must never wait for bookMu: it only appends to an
+// unbounded FIFO under a small mutex. Tables with no sync rows need nothing.
+func (s *messagixSession) queueBookkeeping(tbl *table.LSTable) {
+	if !methods.NeedUpdateSyncGroups(tbl) {
+		return
+	}
+	s.qMu.Lock()
+	s.bookQ = append(s.bookQ, tbl)
+	start := s.bookDone == nil
+	if start {
+		s.bookWake = make(chan struct{}, 1)
+		s.bookDone = make(chan struct{})
+	}
+	wake, done := s.bookWake, s.bookDone
+	s.qMu.Unlock()
+	if start && !s.startDrainer(done, wake) {
+		s.qMu.Lock()
+		s.bookQ = nil
+		s.qMu.Unlock()
+		return
+	}
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
+}
+
+// startDrainer starts the single goroutine that applies queued bookkeeping in
+// arrival order. It is tracked by workWG and exits with the session context; it
+// reports false (and closes done) if the session is already stopping.
+func (s *messagixSession) startDrainer(done chan struct{}, wake chan struct{}) bool {
+	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		close(done)
+		return false
+	}
+	ctx := s.ctx
+	s.workWG.Add(1)
+	s.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go func() {
+		defer s.workWG.Done()
+		defer close(done)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-wake:
+			}
+			for {
+				s.qMu.Lock()
+				if len(s.bookQ) == 0 {
+					s.qMu.Unlock()
+					break
+				}
+				tbl := s.bookQ[0]
+				s.bookQ = s.bookQ[1:]
+				s.qMu.Unlock()
+				if ctx.Err() != nil {
+					return
+				}
+				s.postHandleTable(tbl)
+			}
+		}
+	}()
+	return true
+}
+
 // handleMetaEvent forwards messagix connection events; message tables are
 // handled by handleTable in events.go.
 func (s *messagixSession) handleMetaEvent(ctx context.Context, rawEvt any) {
@@ -929,10 +1012,12 @@ func (s *messagixSession) handleMetaEvent(ctx context.Context, rawEvt any) {
 		s.handleTable(evt)
 		// The library applies a table's sync cursors and thread ranges (and moves the
 		// range generation the listing waits on) only when told to; its own handler
-		// does the same for every table after queueing it. Not under s.mu: the call
-		// takes the library's own locks and never calls back here. It ignores a table
-		// with no sync rows, and applying one the library already applied is a no-op.
-		s.postHandleTable(evt)
+		// does the same for every table after queueing it. Here the call is queued for
+		// a drainer, so the socket reader never waits on a page fetch whose answer
+		// arrives through that same reader; the drainer applies tables in arrival
+		// order, never overlapping a fetch. Applying one the library already applied
+		// is a no-op.
+		s.queueBookkeeping(evt)
 	case *messagix.ConnectedEvent, *messagix.ReconnectedEvent:
 		s.markStateDirty()
 		s.scheduleE2EE()

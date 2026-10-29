@@ -407,7 +407,17 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		ks, tbl, err := cli.FetchMoreThreads(ctx, group)
+		// The fetch reads and rewrites the library's keystore and cursors, as the
+		// bookkeeping of live tables does: bookMu keeps the two apart. The wait above
+		// is not under it (the drainer must be free to move the generation).
+		s.bookMu.Lock()
+		liveKS, tbl, err := cli.FetchMoreThreads(ctx, group)
+		var ks *socket.KeyStoreData
+		if liveKS != nil {
+			copied := *liveKS // the library's own keystore: read it only while bookMu is held
+			ks = &copied
+		}
+		s.bookMu.Unlock()
 		if err != nil {
 			return mapSendErr(err)
 		}
