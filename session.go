@@ -30,6 +30,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
 	"go.mau.fi/mautrix-meta/pkg/messagix/dgw"
+	"go.mau.fi/mautrix-meta/pkg/messagix/graphql"
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
@@ -72,14 +73,18 @@ type messagixSession struct {
 	threads        map[string]*threadInfo // by wire id
 	participants   map[int64][]int64      // participant rows waiting for their thread
 	names          map[int64]string
-	cutover        map[int64]int64   // encrypted chat id -> its pre-encryption (open) thread key
-	fbToWA         map[int64]int64   // facebook thread key -> encrypted chat id (hybrid threads)
-	folderMark     map[int64]bool    // facebook thread keys whose latest non-empty folder is pending or spam (memory only)
-	statusMark     map[int64]bool    // ... whose latest message request status row is 1 (memory only)
-	beforeListEmit func(id string)   // test seam: runs between the listing's snapshot of ids and its emit of one
-	rowKeys        map[int64]bool    // thread rows seen this run (counts only)
-	encRowKeys     map[int64]bool    // ... of an encrypted-over-WA type
-	msgIndex       map[string]string // message id -> wire thread id
+	cutover        map[int64]int64                                                                                    // encrypted chat id -> its pre-encryption (open) thread key
+	fbToWA         map[int64]int64                                                                                    // facebook thread key -> encrypted chat id (hybrid threads)
+	folderMark     map[int64]bool                                                                                     // facebook thread keys whose latest non-empty folder is pending or spam (memory only)
+	statusMark     map[int64]bool                                                                                     // ... whose latest message request status row is 1 (memory only)
+	e2eeOffline    int                                                                                                // queued E2EE messages the server said it would flush at connect (OfflineSyncPreview), count only
+	e2eeOfflineEnd bool                                                                                               // OfflineSyncCompleted seen
+	resumeRows     int                                                                                                // rows the resumed-start sync returned, count only
+	lsRequest      func(ctx context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) // test seam; nil means the client
+	beforeListEmit func(id string)                                                                                    // test seam: runs between the listing's snapshot of ids and its emit of one
+	rowKeys        map[int64]bool                                                                                     // thread rows seen this run (counts only)
+	encRowKeys     map[int64]bool                                                                                     // ... of an encrypted-over-WA type
+	msgIndex       map[string]string                                                                                  // message id -> wire thread id
 	msgOrder       []string
 	collectors     map[int64]*pageCollector
 	lastFullRec    time.Time
@@ -218,9 +223,11 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 
 	var currentUser types.UserInfo
 	var initial *table.LSTable
+	resumed := false
 	if len(st.Messagix) > 0 {
 		if err := cli.LoadState(st.Messagix); err == nil {
 			currentUser, _ = cli.GetCurrentAccount()
+			resumed = currentUser != nil
 		} else {
 			logCode("warn", "state_expired")
 		}
@@ -244,20 +251,47 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 
 	// The initial table's threads are returned with the ready answer; its
 	// messages are emitted as live (idempotent) once the loop is running.
-	var emitInitial initialEmit
+	var initialFrames []Frame
 	if initial != nil {
-		emitInitial = s.initialEmitter(s.handleTableFrames(initial))
+		initialFrames = s.handleTableFrames(initial)
 	}
-	if err := cli.Connect(s.ctx); err != nil {
+	synced, err := s.openSocket(ctx, resumed, st.Messagix, cli.Connect)
+	if err != nil {
 		logCode("warn", "connect_failed")
 		return Ready{}, nil, classifyStartError("connect", err)
 	}
+	initialFrames = append(initialFrames, synced...)
 	s.scheduleE2EE()
+	emitInitial := s.initialEmitter(initialFrames)
 
 	ready := Ready{Self: strconv.FormatInt(s.selfID, 10), Name: s.selfName, History: s.checkHistory(ctx)}
 	s.markStateDirty()
 	logCode("info", "session_started")
 	return ready, emitInitial, nil
+}
+
+// openSocket applies a resumed session's page-load sync and then opens the socket,
+// in that order: the sync is an HTTP request and needs no socket, and applying its
+// snapshot first means every socket row lands after it and wins over it. A
+// session that did not resume only connects.
+func (s *messagixSession) openSocket(ctx context.Context, resumed bool, saved json.RawMessage, connect func(context.Context) error) ([]Frame, error) {
+	var frames []Frame
+	if resumed {
+		// A resumed session skipped the page load, whose sync carries the cutover
+		// links and the typed rows a socket-only sync does not: run it once.
+		if tbl := s.resumeSync(ctx, saved); tbl != nil {
+			frames = s.handleTableFrames(tbl)
+		}
+		// The caller cancelled Start during the sync: do not open the socket. The
+		// sync's own timeout is not a cancel and falls through to connect.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	if err := connect(s.ctx); err != nil {
+		return nil, err
+	}
+	return frames, nil
 }
 
 // restore loads everything from a previous state blob except the messagix

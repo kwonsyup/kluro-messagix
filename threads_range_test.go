@@ -4,11 +4,16 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
+	"go.mau.fi/mautrix-meta/pkg/messagix/graphql"
+	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
+	"go.mau.fi/mautrix-meta/pkg/messagix/types"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
 // pager is a group-1 thread pager that records which sync groups were asked for.
@@ -125,7 +130,7 @@ func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
 	}
 	wantStats(t, stats, map[string]int{
 		"group1_threads": 3, "group1_encrypted_rows": 3, "hybrid_mappings": 0, "cutover_links": 0,
-		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_unlisted": 0,
+		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_unlisted": 0, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
 	})
 }
 
@@ -152,7 +157,7 @@ func TestKnownEncryptedKeyWithNoTableRowIsCountedNotEmitted(t *testing.T) {
 	}
 	wantStats(t, stats, map[string]int{
 		"group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 1, "cutover_links": 2,
-		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "encrypted_unlisted": 2,
+		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "encrypted_unlisted": 2, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
 	})
 }
 
@@ -456,5 +461,239 @@ func TestInitialThreadFramesAreBuiltAtEmitTime(t *testing.T) {
 	// a table with nothing to emit yields no emitter
 	if s.initialEmitter(nil) != nil {
 		t.Fatal("no frames, no emitter")
+	}
+}
+
+func savedConfig(t *testing.T, version int64) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(struct{ Configs *httpclient.Configs }{&httpclient.Configs{
+		VersionID: version,
+		BrowserConfigTable: &types.SchedulerJSDefineConfig{LSPlatformMessengerSyncParams: types.LSPlatformMessengerSyncParams{
+			Mailbox: "mb-params", Contact: "ct-params", E2Ee: "e2-params",
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+type lsCall struct {
+	db      int
+	version int64
+	params  string
+	cursor  any
+	epoch   int64
+}
+
+// A resumed start makes one GraphQL sync of databases 1, 2 and 95 with the saved version and sync
+// params, adds database 95's cutover links to database 1's table, and the rows flow through the
+// normal path: a typed encrypted one-to-one is emitted as an e: thread, a pending row is minimal.
+func TestResumeSyncAsksOnceForDatabases1_2_95AndFeedsTheNormalPath(t *testing.T) {
+	s := newTestSession()
+	var calls []lsCall
+	s.lsRequest = func(ctx context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
+		p, _ := v.SyncParams.(*string)
+		calls = append(calls, lsCall{v.Database, v.Version, *p, v.LastAppliedCursor, v.EpochID})
+		switch v.Database {
+		case 1:
+			return &table.LSTable{
+				LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{
+					{ThreadKey: 4242, ThreadType: table.ENCRYPTED_OVER_WA_ONE_TO_ONE, ThreadName: "Enc", LastActivityTimestampMs: 5},
+					{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, FolderName: "pending", ThreadName: "Stranger", LastActivityTimestampMs: 9},
+				},
+				LSVerifyHybridThreadExists: []*table.LSVerifyHybridThreadExists{{ThreadKey: 77, ThreadJID: 7777, ThreadType: table.ONE_TO_ONE}},
+			}, nil
+		case 95:
+			return &table.LSTable{LSCreateOpenToE2EEThreadLink: []*table.LSCreateOpenToE2EEThreadLink{{OpenThreadID: 42, ArmadilloThreadID: 4242}}}, nil
+		}
+		return &table.LSTable{}, nil
+	}
+	tbl := s.resumeSync(context.Background(), savedConfig(t, 123))
+	want := []lsCall{{1, 123, "mb-params", nil, 0}, {2, 123, "ct-params", nil, 0}, {95, 123, "ct-params", nil, 0}}
+	if len(calls) != 3 || calls[0] != want[0] || calls[1] != want[1] || calls[2] != want[2] {
+		t.Fatalf("sync calls = %+v, want %+v", calls, want)
+	}
+	if tbl == nil || len(tbl.LSCreateOpenToE2EEThreadLink) != 1 {
+		t.Fatalf("database 95's cutover links must be added to database 1's table: %+v", tbl)
+	}
+	var got []Frame
+	s.initialEmitter(s.handleTableFrames(tbl))(func(f Frame) int64 { got = append(got, f); return 0 })
+	enc := lastThread(got, "e:4242")
+	if enc == nil || enc.Kind != "user" || !enc.Encrypted || !enc.Typed || enc.Predecessor != "42" {
+		t.Fatalf("a typed encrypted one-to-one must be emitted as an e: thread: %+v", enc)
+	}
+	req := lastThread(got, "500")
+	if req == nil || req.Kind != "" || req.Typed || req.Title != "" || len(req.Participants) != 0 {
+		t.Fatalf("a pending row from the sync must be minimal: %+v", req)
+	}
+	if s.fbToWA[77] != 7777 {
+		t.Fatalf("the hybrid mapping must be recorded: %v", s.fbToWA)
+	}
+	if got := s.listingStats(0, 0, 0)["resume_sync_rows"]; got != countRows(tbl) || got == 0 {
+		t.Fatalf("resume_sync_rows = %d, want %d", got, countRows(tbl))
+	}
+}
+
+// A failed call never blocks the listing: database 1 failing yields nothing, a later database failing keeps
+// database 1's table, and a saved config without a version skips the sync without any call.
+func TestResumeSyncFailureNeverBlocksTheListing(t *testing.T) {
+	for name, tc := range map[string]struct {
+		fail    int
+		version int64
+		wantNil bool
+		calls   int
+	}{
+		"database 1 fails":  {1, 123, true, 1},
+		"database 95 fails": {95, 123, false, 3},
+		"no saved version":  {0, 0, true, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newTestSession()
+			n := 0
+			s.lsRequest = func(ctx context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
+				n++
+				if v.Database == tc.fail {
+					return nil, errors.New("boom")
+				}
+				return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 600, ThreadType: table.ONE_TO_ONE}}}, nil
+			}
+			tbl := s.resumeSync(context.Background(), savedConfig(t, tc.version))
+			if (tbl == nil) != tc.wantNil || n != tc.calls {
+				t.Fatalf("table nil=%v calls=%d, want nil=%v calls=%d", tbl == nil, n, tc.wantNil, tc.calls)
+			}
+			_, stats, err, done := listWithin(t, s, &pager{}, context.Background(), 3*time.Second)
+			if !done || err != nil || stats == nil {
+				t.Fatalf("the listing must still finish: done=%v err=%v", done, err)
+			}
+		})
+	}
+}
+
+func TestResumeSyncHonoursCancel(t *testing.T) {
+	s := newTestSession()
+	s.lsRequest = func(ctx context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+	done := make(chan *table.LSTable, 1)
+	go func() { done <- s.resumeSync(ctx, savedConfig(t, 123)) }()
+	select {
+	case tbl := <-done:
+		if tbl != nil {
+			t.Fatal("a cancelled sync returns nothing")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("cancel did not free the sync")
+	}
+}
+
+// The E2EE offline-sync counts reach the stats.
+func TestOfflineSyncStats(t *testing.T) {
+	s := newTestSession()
+	if st := s.listingStats(0, 0, 0); st["e2ee_offline_events"] != 0 || st["e2ee_offline_done"] != 0 {
+		t.Fatalf("before any event: %v", st)
+	}
+	s.handleWAEvent(&events.OfflineSyncPreview{Total: 9, Messages: 7})
+	if st := s.listingStats(0, 0, 0); st["e2ee_offline_events"] != 7 || st["e2ee_offline_done"] != 0 {
+		t.Fatalf("after the preview: %v", st)
+	}
+	s.handleWAEvent(&events.OfflineSyncCompleted{})
+	if st := s.listingStats(0, 0, 0); st["e2ee_offline_events"] != 7 || st["e2ee_offline_done"] != 1 {
+		t.Fatalf("after completion: %v", st)
+	}
+}
+
+// The resume snapshot is applied before the socket opens, so every socket row lands after it and
+// wins: a thread the snapshot shows in the inbox that a socket row then moves to spam stays unaccepted.
+func TestResumeSnapshotIsAppliedBeforeTheSocketOpens(t *testing.T) {
+	s := newTestSession()
+	s.ctx = context.Background()
+	s.lsRequest = func(ctx context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
+		if v.Database == 1 {
+			return &table.LSTable{
+				LSDeleteThenInsertThread:   []*table.LSDeleteThenInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, FolderName: "inbox", ThreadName: "N"}},
+				LSVerifyHybridThreadExists: []*table.LSVerifyHybridThreadExists{{ThreadKey: 77, ThreadJID: 7777, ThreadType: table.ONE_TO_ONE}},
+			}, nil
+		}
+		return &table.LSTable{}, nil
+	}
+	appliedAtConnect := false
+	connect := func(context.Context) error {
+		s.mu.Lock()
+		appliedAtConnect = s.fbToWA[77] == 7777 && s.threads["500"] != nil
+		s.mu.Unlock()
+		// the first socket delta: the thread moves to spam
+		s.handleTableFrames(threadRow(500, "spam"))
+		return nil
+	}
+	frames, err := s.openSocket(context.Background(), true, savedConfig(t, 123), connect)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !appliedAtConnect {
+		t.Fatal("the snapshot must be applied before the socket opens")
+	}
+	if th := lastThread(frames, "500"); th == nil {
+		t.Fatal("the snapshot's thread frame is part of the initial frames")
+	}
+	var got []Frame
+	s.initialEmitter(frames)(func(f Frame) int64 { got = append(got, f); return 0 })
+	if th := lastThread(got, "500"); th == nil || th.Kind != "" || th.Typed || th.Title != "" {
+		t.Fatalf("the socket row that moved the thread to spam must win over the snapshot: %+v", th)
+	}
+
+	// A session that did not resume only connects: no sync request is made.
+	fresh := newTestSession()
+	called := 0
+	fresh.lsRequest = func(context.Context, *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
+		called++
+		return &table.LSTable{}, nil
+	}
+	fresh.ctx = context.Background()
+	if f, err := fresh.openSocket(context.Background(), false, nil, func(context.Context) error { return nil }); err != nil || f != nil || called != 0 {
+		t.Fatalf("a fresh session only connects: frames=%v err=%v syncCalls=%d", f, err, called)
+	}
+	// A connect failure is returned.
+	if _, err := fresh.openSocket(context.Background(), false, nil, func(context.Context) error { return errors.New("down") }); err == nil {
+		t.Fatal("a connect failure must be returned")
+	}
+}
+
+// Cancelling Start during the resume sync stops it before the socket opens; the sync's own timeout
+// is not a cancel and still connects.
+func TestOpenSocketChecksTheCallersCancelBeforeConnecting(t *testing.T) {
+	blocked := func(ctx context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	// the caller cancels during the sync
+	s := newTestSession()
+	s.ctx = context.Background()
+	s.lsRequest = blocked
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+	connected := false
+	_, err := s.openSocket(ctx, true, savedConfig(t, 123), func(context.Context) error { connected = true; return nil })
+	if !errors.Is(err, context.Canceled) || connected {
+		t.Fatalf("a cancelled Start must not connect: err=%v connected=%v", err, connected)
+	}
+	if code := codeOf(classifyStartError("connect", err)); code != "connect_cancelled" {
+		t.Fatalf("Start reports %q", code)
+	}
+
+	// the sync's internal timeout still falls through to connect
+	old := resumeSyncTimeout
+	resumeSyncTimeout = 50 * time.Millisecond
+	defer func() { resumeSyncTimeout = old }()
+	s2 := newTestSession()
+	s2.ctx = context.Background()
+	s2.lsRequest = blocked
+	connected = false
+	frames, err := s2.openSocket(context.Background(), true, savedConfig(t, 123), func(context.Context) error { connected = true; return nil })
+	if err != nil || !connected || frames != nil {
+		t.Fatalf("a sync timeout must still connect: err=%v connected=%v frames=%v", err, connected, frames)
 	}
 }

@@ -468,7 +468,16 @@ func (s *messagixSession) handleWAEvent(raw any) bool {
 	switch evt := raw.(type) {
 	case *events.FBMessage:
 		return s.deliverEncrypted(evt)
-	case *events.Connected, *events.OfflineSyncCompleted:
+	case *events.OfflineSyncPreview:
+		s.mu.Lock()
+		s.e2eeOffline = evt.Messages
+		s.mu.Unlock()
+	case *events.OfflineSyncCompleted:
+		s.mu.Lock()
+		s.e2eeOfflineEnd = true
+		s.mu.Unlock()
+		s.markStateDirty()
+	case *events.Connected:
 		s.markStateDirty()
 	case *events.Disconnected:
 		logCode("info", "e2ee_disconnected")
@@ -653,6 +662,10 @@ func (s *messagixSession) listingStats(known, emitted, unlisted int) map[string]
 	if s.e2ee != nil && s.e2ee.IsConnected() {
 		connected = 1
 	}
+	offlineDone := 0
+	if s.e2eeOfflineEnd {
+		offlineDone = 1
+	}
 	return map[string]int{
 		"group1_threads":        len(s.rowKeys),
 		"group1_encrypted_rows": len(s.encRowKeys),
@@ -661,6 +674,9 @@ func (s *messagixSession) listingStats(known, emitted, unlisted int) map[string]
 		"encrypted_known":       known,
 		"encrypted_emitted":     emitted,
 		"e2ee_connected":        connected,
+		"e2ee_offline_events":   s.e2eeOffline,
+		"e2ee_offline_done":     offlineDone,
+		"resume_sync_rows":      s.resumeRows,
 		"encrypted_unlisted":    unlisted,
 	}
 }
