@@ -825,3 +825,66 @@ func TestCancelDuringTheGroup1RangeWait(t *testing.T) {
 		t.Fatalf("cancel must free the wait and not page: done=%v err=%v stats=%v pages=%d", done, err, stats, r.pages)
 	}
 }
+
+// The resume-sync tables go through the library's bookkeeping before connect, in the order they were fetched:
+// a group-1 range row in the snapshot is applied before the socket opens, so the listing's wait returns at once.
+func TestResumeSyncTablesAreAppliedToTheLibraryBeforeConnect(t *testing.T) {
+	withGroup1Wait(t, 5*time.Second)
+	rangeRow := &table.LSTable{LSUpsertSyncGroupThreadsRange: []*table.LSUpsertSyncGroupThreadsRange{{SyncGroup: 1, HasMoreBefore: true, MinThreadKey: 5}}}
+	snapshot := func(withRange bool) func(context.Context, *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
+		return func(_ context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
+			if v.Database == 1 && withRange {
+				return &table.LSTable{LSUpsertSyncGroupThreadsRange: rangeRow.LSUpsertSyncGroupThreadsRange, LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 600, ThreadType: table.ONE_TO_ONE}}}, nil
+			}
+			return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: int64(600 + v.Database), ThreadType: table.ONE_TO_ONE}}}, nil
+		}
+	}
+
+	// With a range row: the generation has advanced before connect; the wait returns at once; paging goes on.
+	s := newTestSession()
+	s.ctx = context.Background()
+	r := newRangePager()
+	var applied []int
+	s.postHandle = func(tbl *table.LSTable) {
+		applied = append(applied, len(tbl.LSDeleteThenInsertThread)*10+len(tbl.LSUpsertSyncGroupThreadsRange))
+		r.PostHandlePublishResponse(tbl)
+	}
+	s.lsRequest = snapshot(true)
+	genAtConnect := uint64(99)
+	if _, err := s.openSocket(context.Background(), true, savedConfig(t, 123), func(context.Context) error {
+		r.mu.Lock()
+		genAtConnect = r.gen
+		r.mu.Unlock()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if genAtConnect != 1 || len(applied) != 3 || applied[0] != 11 || applied[1] != 10 || applied[2] != 10 {
+		t.Fatalf("the snapshot's tables (db 1, 2, 95, in that order) must reach the bookkeeping before connect: gen=%d applied=%v", genAtConnect, applied)
+	}
+	_, stats, err, done := listWithin(t, s, r, context.Background(), 10*time.Second)
+	if !done || err != nil || stats["group1_range_wait_ms"] > 500 || r.pages < 2 {
+		t.Fatalf("the wait must return at once and paging go past page 1: done=%v err=%v wait=%d pages=%d", done, err, stats["group1_range_wait_ms"], r.pages)
+	}
+
+	// Without a range row: nothing advances, the wait goes on to the live socket path.
+	s2 := newTestSession()
+	s2.ctx = context.Background()
+	r2 := newRangePager()
+	s2.postHandle = r2.PostHandlePublishResponse
+	s2.lsRequest = snapshot(false)
+	if _, err := s2.openSocket(context.Background(), true, savedConfig(t, 123), func(context.Context) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if r2.gen != 0 {
+		t.Fatal("a snapshot without a range row must not advance the generation")
+	}
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		s2.handleMetaEvent(context.Background(), rangeRow)
+	}()
+	_, stats2, err, done := listWithin(t, s2, r2, context.Background(), 10*time.Second)
+	if !done || err != nil || stats2["group1_range_wait_ms"] < 50 || stats2["group1_range_wait_ms"] >= 3000 || r2.pages < 2 {
+		t.Fatalf("the live-socket range must end the wait: done=%v err=%v wait=%d pages=%d", done, err, stats2["group1_range_wait_ms"], r2.pages)
+	}
+}

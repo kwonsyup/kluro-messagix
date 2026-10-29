@@ -25,8 +25,9 @@ var resumeSyncDatabases = []int64{1, 2, 95}
 // params come from the saved state's own copy of the page config, so nothing needs
 // the page. One attempt, bounded by resumeSyncTimeout, cancel honoured: a failure
 // logs a fixed code and returns whatever database 1 gave (nothing if it failed).
-// The library's own bookkeeping (cursors, thread ranges) is not touched: its sync
-// manager is not reachable from here, and the socket sync that follows does it.
+// Each database's table is then given to the library's sync bookkeeping
+// (PostHandlePublishResponse), in the order the library applies them, so the
+// snapshot's cursors and thread ranges are in place before the socket opens.
 func (s *messagixSession) resumeSync(ctx context.Context, saved json.RawMessage) *table.LSTable {
 	var cfg struct {
 		Configs struct {
@@ -77,6 +78,10 @@ func (s *messagixSession) resumeSync(ctx context.Context, saved json.RawMessage)
 			}
 			continue
 		}
+		// The library applies each database's cursors and thread ranges right after its
+		// request (SyncDataGraphQL); the snapshot's are fresher than the cached ones.
+		// Outside s.mu, before connect.
+		s.postHandleTable(tbl)
 		switch db {
 		case 1:
 			out = tbl
