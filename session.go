@@ -74,8 +74,9 @@ type messagixSession struct {
 	names        map[int64]string
 	cutover      map[int64]int64                                              // encrypted chat id -> its pre-encryption (open) thread key
 	fbToWA       map[int64]int64                                              // facebook thread key -> encrypted chat id (hybrid threads)
-	requestKeys  map[int64]bool                                               // facebook thread keys known to be message requests: never listed
-	requestSkips int                                                          // request thread rows and messages skipped this run (count only)
+	requestKeys  map[int64]bool                                               // facebook thread keys whose latest classifying row says message request
+	classSeq     map[int64]uint64                                             // facebook thread key -> sequence of its latest classifying row
+	classCount   uint64                                                       // classifying rows seen
 	typeAsked    map[int64]bool                                               // untyped live threads already asked about this run
 	typeSent     []time.Time                                                  // when those asks went out, for the per-minute cap
 	typeAsks     int                                                          // how many asks went out this run (count only)
@@ -134,6 +135,7 @@ func newSession() *messagixSession {
 		cutover:      map[int64]int64{},
 		fbToWA:       map[int64]int64{},
 		requestKeys:  map[int64]bool{},
+		classSeq:     map[int64]uint64{},
 		typeAsked:    map[int64]bool{},
 		rowKeys:      map[int64]bool{},
 		encRowKeys:   map[int64]bool{},

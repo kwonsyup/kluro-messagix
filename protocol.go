@@ -99,6 +99,10 @@ type Thread struct {
 	Predecessor  string   `json:"predecessor,omitempty"`
 	Participants []Person `json:"participants,omitempty"`
 	LastActivity int64    `json:"last_activity_ms,omitempty"`
+	// Request marks a message request the user has not accepted (the thread's
+	// latest classifying row says pending or spam). The helper only labels it;
+	// the connector decides what to do with it. It flips when the row changes.
+	Request bool `json:"request,omitempty"`
 }
 
 type Person struct {

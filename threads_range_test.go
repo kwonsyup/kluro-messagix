@@ -126,7 +126,7 @@ func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
 	}
 	wantStats(t, stats, map[string]int{
 		"group1_threads": 3, "group1_encrypted_rows": 3, "hybrid_mappings": 0, "cutover_links": 0,
-		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_unlisted": 0, "request_rows_skipped": 0, "untyped_typed_requests": 0,
+		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_unlisted": 0, "request_threads": 0, "untyped_typed_requests": 0,
 	})
 }
 
@@ -153,7 +153,7 @@ func TestKnownEncryptedKeyWithNoTableRowIsCountedNotEmitted(t *testing.T) {
 	}
 	wantStats(t, stats, map[string]int{
 		"group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 1, "cutover_links": 2,
-		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "encrypted_unlisted": 2, "request_rows_skipped": 0, "untyped_typed_requests": 0,
+		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "encrypted_unlisted": 2, "request_threads": 0, "untyped_typed_requests": 0,
 	})
 }
 
@@ -210,54 +210,105 @@ func frameKinds(frames []Frame) (threads map[string]*Thread, messages int) {
 	return threads, messages
 }
 
-// A thread row in the pending folder, a message request status row, and live
-// messages in either are skipped and counted; no frame is built. Moving the
-// thread to the inbox lists it again.
-func TestRequestThreadsAndTheirMessagesAreSkippedAndCounted(t *testing.T) {
+// The helper only labels: a thread whose latest classifying row says pending or
+// spam (or a status-1 request row) carries request=true, any other folder or
+// status clears it, and every flip re-emits the thread frame.
+func TestRequestFlagFollowsTheLatestClassifyingRow(t *testing.T) {
+	s := newTestSession()
+	flag := func(frames []Frame, id string) (bool, bool) {
+		th, _ := frameKinds(frames)
+		if th[id] == nil {
+			return false, false
+		}
+		return th[id].Request, true
+	}
+	row := func(folder string) *table.LSTable {
+		return &table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, FolderName: folder}}}
+	}
+	if r, ok := flag(s.handleTableFrames(row("pending")), "500"); !ok || !r {
+		t.Fatalf("a pending row must flag the thread frame: %v %v", r, ok)
+	}
+	if r, ok := flag(s.handleTableFrames(row("inbox")), "500"); !ok || r {
+		t.Fatalf("an accepted row must flip the flag and re-emit: %v %v", r, ok)
+	}
+	if r, ok := flag(s.handleTableFrames(row("spam")), "500"); !ok || !r {
+		t.Fatalf("spam counts as not accepted: %v %v", r, ok)
+	}
+	// A status row alone flips an existing thread and re-emits it.
+	status := func(n int64) *table.LSTable {
+		return &table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 500, MessageRequestStatus: n}}}
+	}
+	if r, ok := flag(s.handleTableFrames(status(0)), "500"); !ok || r {
+		t.Fatalf("status 0 clears: %v %v", r, ok)
+	}
+	if r, ok := flag(s.handleTableFrames(status(1)), "500"); !ok || !r {
+		t.Fatalf("status 1 flags: %v %v", r, ok)
+	}
+	// A row that repeats the state re-emits nothing new for the flag, and the stat counts flagged threads.
+	if got := s.listingStats(0, 0, 0)["request_threads"]; got != 1 {
+		t.Fatalf("request_threads = %d, want 1", got)
+	}
+	// A row with no folder does not classify.
+	if r, _ := flag(s.handleTableFrames(&table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE}}}), "500"); !r {
+		t.Fatal("a folderless row must not clear the flag")
+	}
+	if got := s.listingStats(0, 0, 0)["group1_threads"]; got != 1 {
+		t.Fatalf("group1_threads = %d: flagged threads are still rows the listing saw", got)
+	}
+}
+
+// The helper suppresses nothing: messages, edits and unsends in a flagged thread
+// are emitted exactly as in any other thread.
+func TestMessagesEditsAndUnsendsInARequestFlowUnchanged(t *testing.T) {
 	s := newTestSession()
 	frames := s.handleTableFrames(&table.LSTable{
-		LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{
-			{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, FolderName: "pending", ThreadName: "Stranger"},
-			{ThreadKey: 600, ThreadType: table.ONE_TO_ONE, FolderName: "inbox"},
-		},
-		LSAddParticipantIdToGroupThread: []*table.LSAddParticipantIdToGroupThread{{ThreadKey: 500, ContactId: 5}},
-		LSInsertMessage: []*table.LSInsertMessage{
-			{ThreadKey: 500, MessageId: "mid.R1", SenderId: 5, Text: "hi", TimestampMs: 1},
-			{ThreadKey: 600, MessageId: "mid.I1", SenderId: 6, Text: "hello", TimestampMs: 2},
-		},
+		LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, FolderName: "pending"}},
+		LSInsertMessage:          []*table.LSInsertMessage{{ThreadKey: 500, MessageId: "mid.R1", SenderId: 5, Text: "hi", TimestampMs: 1}},
+		LSEditMessage:            []*table.LSEditMessage{{MessageID: "mid.R1", Text: "hi!"}},
+		LSDeleteMessage:          []*table.LSDeleteMessage{{ThreadKey: 500, MessageId: "mid.R1"}},
 	})
-	threads, msgs := frameKinds(frames)
-	if threads["500"] != nil || threads["600"] == nil || msgs != 1 {
-		t.Fatalf("request must not be emitted: threads=%v messages=%d", threads, msgs)
+	var gotMsg, gotEdit, gotUnsend bool
+	for _, f := range frames {
+		switch f.T {
+		case TMessage:
+			gotMsg = f.Message.ID == "mid.R1" && f.Message.Thread == "500"
+		case TEdit:
+			gotEdit = true
+		case TUnsend:
+			gotUnsend = true
+		}
 	}
-	// A later live message in the known request thread is skipped too.
-	frames = s.handleTableFrames(&table.LSTable{LSInsertMessage: []*table.LSInsertMessage{
-		{ThreadKey: 500, MessageId: "mid.R2", SenderId: 5, Text: "again", TimestampMs: 3},
-	}})
-	if len(frames) != 0 {
-		t.Fatalf("a live message in a request thread must produce no frame: %+v", frames)
+	th, _ := frameKinds(frames)
+	if !gotMsg || !gotEdit || !gotUnsend || th["500"] == nil || !th["500"].Request {
+		t.Fatalf("message=%v edit=%v unsend=%v thread=%+v", gotMsg, gotEdit, gotUnsend, th["500"])
 	}
-	// A request status row marks a thread with no pending folder row.
-	frames = s.handleTableFrames(&table.LSTable{
-		LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 700, MessageRequestStatus: 1}},
-		LSUpdateOrInsertThread:           []*table.LSUpdateOrInsertThread{{ThreadKey: 700, ThreadType: table.ONE_TO_ONE}},
-	})
-	if len(frames) != 0 {
-		t.Fatalf("a status-1 request must produce no frame: %+v", frames)
+	// A later live message in the flagged thread is emitted too.
+	if _, n := frameKinds(s.handleTableFrames(liveMessage(500, "mid.R2"))); n != 1 {
+		t.Fatalf("live message in a flagged thread: %d message frames", n)
 	}
-	stats := s.listingStats(0, 0, 0)
-	if stats["request_rows_skipped"] != 4 { // thread row 500, message R1, message R2, thread row 700
-		t.Fatalf("request_rows_skipped = %d, want 4: %v", stats["request_rows_skipped"], stats)
+}
+
+// An encrypted chat mapped from a flagged facebook thread is flagged too and flips with it.
+func TestEncryptedChatFollowsItsFacebookThreadsRequestFlag(t *testing.T) {
+	s := newTestSession()
+	s.fbToWA[400] = 1400
+	s.threads["e:1400"] = &threadInfo{Key: 1400, Enc: true, Kind: "user", Typed: true, Participants: []int64{1400}}
+	s.threads["400"] = &threadInfo{Key: 400, Kind: "user", Typed: true, Participants: []int64{400}}
+	row := func(folder string) *table.LSTable {
+		return &table.LSTable{LSVerifyThreadExists: []*table.LSVerifyThreadExists{{ThreadKey: 400, ThreadType: table.ONE_TO_ONE, FolderName: folder}}}
 	}
-	if stats["group1_threads"] != 1 {
-		t.Fatalf("request rows must not count as group-1 threads: %v", stats)
+	th, _ := frameKinds(s.handleTableFrames(row("pending")))
+	if th["e:1400"] == nil || !th["e:1400"].Request || th["400"] == nil || !th["400"].Request {
+		t.Fatalf("flagged facebook thread and its encrypted chat: %+v %+v", th["400"], th["e:1400"])
 	}
-	// The user accepts it: the inbox row lists it from then on.
-	frames = s.handleTableFrames(&table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{
-		{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, FolderName: "inbox"},
-	}})
-	if th, _ := frameKinds(frames); th["500"] == nil || th["500"].Kind != "user" {
-		t.Fatalf("an accepted request must be listed: %+v", th)
+	for _, f := range s.sortedThreadFrames() {
+		if f.ThreadEvt.ID == "e:1400" && !f.ThreadEvt.Request {
+			t.Fatal("a later listing must carry the flag on the encrypted thread")
+		}
+	}
+	th, _ = frameKinds(s.handleTableFrames(row("inbox")))
+	if th["e:1400"] == nil || th["e:1400"].Request {
+		t.Fatalf("acceptance must flip the encrypted chat and re-emit it: %+v", th["e:1400"])
 	}
 }
 
@@ -347,8 +398,8 @@ func TestUntypedAsksAreBoundedPerMinute(t *testing.T) {
 	}
 }
 
-// If the asked thread is a message request, its folder row marks it and it is skipped from then on.
-func TestUntypedLiveThreadThatIsARequestIsSkippedAfterwards(t *testing.T) {
+// If the asked thread is a message request, the reply's folder row flags the thread frame.
+func TestUntypedLiveThreadThatIsARequestIsFlaggedByTheReply(t *testing.T) {
 	s := newTestSession()
 	s.ctx = context.Background()
 	var mu sync.Mutex
@@ -359,19 +410,49 @@ func TestUntypedLiveThreadThatIsARequestIsSkippedAfterwards(t *testing.T) {
 	}}
 	s.typeFn = rec.ask
 	s.handleTableFrames(liveMessage(950, "mid.Q1"))
-	waitFor(t, "the request mark", func() bool {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		return s.requestKeys[950]
+	waitFor(t, "the flagged thread frame", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		th, _ := frameKinds(emitted)
+		return th["950"] != nil && th["950"].Request && th["950"].Kind == "user"
 	})
-	mu.Lock()
-	n := len(emitted)
-	mu.Unlock()
-	if n != 0 {
-		t.Fatalf("the typed reply must emit no frame for a request: %+v", emitted)
+}
+
+// A reply to an ask that went out before a newer classifying row arrived must not re-flag an accepted chat.
+func TestStaleAskReplyDoesNotReflagAnAcceptedChat(t *testing.T) {
+	s := newTestSession()
+	s.ctx = context.Background()
+	release := make(chan struct{})
+	s.typeFn = func(ctx context.Context, key int64) (*table.LSTable, error) {
+		<-release
+		return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: key, ThreadType: table.ONE_TO_ONE, FolderName: "pending"}}}, nil
 	}
-	if frames := s.handleTableFrames(liveMessage(950, "mid.Q2")); len(frames) != 0 {
-		t.Fatalf("later messages in the request are skipped: %+v", frames)
+	var mu sync.Mutex
+	var emitted []Frame
+	s.emit = func(f Frame) int64 { mu.Lock(); emitted = append(emitted, f); mu.Unlock(); return 0 }
+	s.handleTableFrames(liveMessage(960, "mid.S1")) // the ask goes out here
+	// The user accepts the chat before the reply lands.
+	s.handleTableFrames(&table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 960, ThreadType: table.ONE_TO_ONE, FolderName: "inbox"}}})
+	close(release)
+	// The reply types the thread (kind from its own row) but must not classify it.
+	waitFor(t, "the reply to be applied", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(emitted) > 0
+	})
+	time.Sleep(50 * time.Millisecond)
+	s.mu.Lock()
+	flagged := s.requestKeys[960]
+	s.mu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
+	if flagged {
+		t.Fatal("a stale reply must not re-flag an accepted chat")
+	}
+	for _, f := range emitted {
+		if f.T == TThread && f.ThreadEvt.ID == "960" && f.ThreadEvt.Request {
+			t.Fatalf("a stale reply emitted a flagged frame: %+v", f.ThreadEvt)
+		}
 	}
 }
 
@@ -388,5 +469,13 @@ func TestAnUnansweredThreadIsAskedOnlyOnce(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if rec.count() != 1 {
 		t.Fatalf("asked %d times for one thread, want once", rec.count())
+	}
+}
+
+func TestThreadRequestWireKey(t *testing.T) {
+	on, _ := json.Marshal(Thread{ID: "5", Kind: "user", Request: true})
+	off, _ := json.Marshal(Thread{ID: "5", Kind: "user"})
+	if string(on) != `{"id":"5","kind":"user","request":true}` || string(off) != `{"id":"5","kind":"user"}` {
+		t.Fatalf("wire = %s / %s", on, off)
 	}
 }
