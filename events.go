@@ -279,7 +279,14 @@ func threadFrame(t Thread) Frame { return Frame{T: TThread, ThreadEvt: &t} }
 // wireThreadLocked builds the protocol thread. A one-to-one thread names the
 // other person; an encrypted thread names the open thread it continues.
 func (s *messagixSession) wireThreadLocked(t *threadInfo) Thread {
-	out := Thread{ID: wireID(t.Enc, t.Key), Kind: t.Kind, Typed: t.Typed && (t.Enc || !s.unaccepted[t.Key]), Title: t.Title, Encrypted: t.Enc, LastActivity: t.LastActivity}
+	if !t.Enc && s.unaccepted[t.Key] {
+		// A message request qualifies for nothing: the connector imports any
+		// one-to-one thread that names another person, typed or not, so the frame
+		// carries no kind, no type and no participants. The real ones stay in
+		// memory and go out when a later row accepts the thread.
+		return Thread{ID: wireID(false, t.Key), Title: t.Title, LastActivity: t.LastActivity}
+	}
+	out := Thread{ID: wireID(t.Enc, t.Key), Kind: t.Kind, Typed: t.Typed, Title: t.Title, Encrypted: t.Enc, LastActivity: t.LastActivity}
 	if t.Enc {
 		if open, ok := s.cutover[t.Key]; ok {
 			out.Predecessor = wireID(false, open)

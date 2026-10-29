@@ -196,6 +196,23 @@ func TestListingCancelStillReportsTheCancel(t *testing.T) {
 	}
 }
 
+// connectorWouldQualify mirrors the connector's threadQualified (messenger_runner.go on main):
+// a one-to-one thread qualifies when it names another person, typed or not; a group needs Typed.
+func connectorWouldQualify(th *Thread) bool {
+	switch th.Kind {
+	case "user":
+		for _, p := range th.Participants {
+			if !p.Self {
+				return true
+			}
+		}
+		return false
+	case "group":
+		return th.Typed
+	}
+	return false
+}
+
 func typedOf(frames []Frame, id string) (typed, found bool) {
 	for i := len(frames) - 1; i >= 0; i-- {
 		if f := frames[i]; f.T == TThread && f.ThreadEvt.ID == id {
@@ -226,18 +243,32 @@ func TestUnacceptedThreadsAreNeverTyped(t *testing.T) {
 			if typed, found := typedOf(frames, "500"); !found || typed {
 				t.Fatalf("a request thread must be emitted untyped: typed=%v found=%v", typed, found)
 			}
-			if th := s.threads["500"]; th == nil || th.Kind != "user" {
-				t.Fatalf("the kind may still be set: %+v", th)
+			// the real kind and participants stay in memory for when it is accepted
+			if th := s.threads["500"]; th == nil || th.Kind != "user" || len(th.Participants) == 0 {
+				t.Fatalf("the real kind and participants are kept in memory: %+v", th)
 			}
-			// every later frame of it, including a listing, stays untyped
+			// the wire frame qualifies for nothing: no kind, no type, no participants
+			check := func(where string, th *Thread) {
+				t.Helper()
+				if th == nil || th.Kind != "" || th.Typed || len(th.Participants) != 0 || connectorWouldQualify(th) {
+					t.Fatalf("%s: a request thread must be emitted with no kind, type or participants: %+v", where, th)
+				}
+			}
+			for _, f := range frames {
+				if f.T == TThread && f.ThreadEvt.ID == "500" {
+					check("row", f.ThreadEvt)
+				}
+			}
 			for _, f := range s.sortedThreadFrames() {
-				if f.ThreadEvt.ID == "500" && f.ThreadEvt.Typed {
-					t.Fatal("a listing must carry the request thread untyped")
+				if f.ThreadEvt.ID == "500" {
+					check("listing", f.ThreadEvt)
 				}
 			}
 			later := s.handleTableFrames(&table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, ThreadName: "N"}}})
-			if typed, found := typedOf(later, "500"); !found || typed {
-				t.Fatalf("a later folderless row must not type it: typed=%v found=%v", typed, found)
+			for _, f := range later {
+				if f.T == TThread && f.ThreadEvt.ID == "500" {
+					check("later folderless row", f.ThreadEvt)
+				}
 			}
 		})
 	}
@@ -257,6 +288,11 @@ func TestAcceptingARequestTypesAndReemitsTheThread(t *testing.T) {
 	frames = s.handleTableFrames(threadRow(500, "inbox"))
 	if typed, found := typedOf(frames, "500"); !found || !typed {
 		t.Fatalf("an inbox row must type and re-emit: typed=%v found=%v", typed, found)
+	}
+	for _, f := range frames {
+		if f.T == TThread && f.ThreadEvt.ID == "500" && (f.ThreadEvt.Kind != "user" || !connectorWouldQualify(f.ThreadEvt)) {
+			t.Fatalf("acceptance must re-emit the real kind and participants: %+v", f.ThreadEvt)
+		}
 	}
 	// an empty folder does not set it either
 	frames = s.handleTableFrames(threadRow(500, ""))
