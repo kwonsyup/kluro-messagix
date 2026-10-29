@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
+	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/graphql"
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
@@ -16,26 +18,48 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 )
 
-// pager is a group-1 thread pager that records which sync groups were asked for.
+// pager is the thread listing's client: ExecuteTasks answers a group-1 page from a script and records the request.
+// With no script it answers one page, from group1 if set, whose range row says there is nothing more.
 type pager struct {
 	group1 *table.LSTable
-	groups []int64
+	pages  []*table.LSTable
+	cursor string
+	err    error
+	tasks  []socket.FetchThreadsTask
 }
 
-func (r *pager) FetchMoreThreads(_ context.Context, group int64) (*socket.KeyStoreData, *table.LSTable, error) {
-	r.groups = append(r.groups, group)
+func (r *pager) GetCursor(int64) string { return r.cursor }
+
+func (r *pager) ExecuteTasks(_ context.Context, tasks ...socket.Task) (*table.LSTable, error) {
+	task := tasks[0].(*socket.FetchThreadsTask)
+	r.tasks = append(r.tasks, *task)
+	if r.err != nil {
+		return nil, r.err
+	}
+	if r.pages != nil {
+		if len(r.tasks) > len(r.pages) {
+			return nil, errors.New("walked past the scripted pages")
+		}
+		return r.pages[len(r.tasks)-1], nil
+	}
 	tbl := &table.LSTable{}
-	if group == 1 && r.group1 != nil {
+	if r.group1 != nil {
 		tbl = r.group1
 	}
-	return &socket.KeyStoreData{MinThreadKey: 7}, tbl, nil
+	tbl.LSUpsertSyncGroupThreadsRange = append(tbl.LSUpsertSyncGroupThreadsRange, &table.LSUpsertSyncGroupThreadsRange{SyncGroup: 1, ParentThreadKey: -1, HasMoreBefore: false})
+	return tbl, nil
 }
 
 func listWithin(t *testing.T, s *messagixSession, r threadPager, ctx context.Context, bound time.Duration) (frames []Frame, stats map[string]int, err error, done bool) {
+	frames, res, err, done := listGap(t, s, r, ctx, bound)
+	return frames, res.Stats, err, done
+}
+
+func listGap(t *testing.T, s *messagixSession, r threadPager, ctx context.Context, bound time.Duration) (frames []Frame, res listingDone, err error, done bool) {
 	t.Helper()
 	type result struct {
-		stats map[string]int
-		err   error
+		res listingDone
+		err error
 	}
 	ch := make(chan result, 1)
 	go func() {
@@ -44,9 +68,9 @@ func listWithin(t *testing.T, s *messagixSession, r threadPager, ctx context.Con
 	}()
 	select {
 	case v := <-ch:
-		return frames, v.stats, v.err, true
+		return frames, v.res, v.err, true
 	case <-time.After(bound):
-		return nil, nil, nil, false
+		return nil, listingDone{}, nil, false
 	}
 }
 
@@ -175,20 +199,214 @@ func TestStateWithHybridKindStillLoads(t *testing.T) {
 	}
 }
 
-// Message requests (sync group 95) are never listed: the listing pages group 1 only.
+// The listing talks to the library only through ExecuteTasks (a plain request and response) and GetCursor: it
+// cannot call FetchMoreThreads, WaitForInitialThreadRange or PostHandlePublishResponse, so it never reads or
+// writes the library's keystore or sync state. The real client satisfies it.
+var _ threadPager = (*messagix.Client)(nil)
+
+func TestListingTalksToTheLibraryOnlyThroughPlainRequests(t *testing.T) {
+	typ := reflect.TypeOf((*threadPager)(nil)).Elem()
+	var names []string
+	for i := 0; i < typ.NumMethod(); i++ {
+		names = append(names, typ.Method(i).Name)
+	}
+	if len(names) != 2 || names[0] != "ExecuteTasks" || names[1] != "GetCursor" {
+		t.Fatalf("threadPager methods = %v", names)
+	}
+}
+
+// Message requests (sync group 95) are never listed: every request is for sync group 1, with the group-1 cursor.
 func TestListingNeverTouchesGroup95(t *testing.T) {
-	r := &pager{}
-	_, stats, err, done := listWithin(t, newTestSession(), r, context.Background(), 3*time.Second)
-	if !done || err != nil || stats == nil {
-		t.Fatalf("done=%v err=%v stats=%v", done, err, stats)
+	r := &pager{cursor: "cur-1"}
+	_, res, err, done := listGap(t, newTestSession(), r, context.Background(), 3*time.Second)
+	if !done || err != nil || res.Stats == nil || res.Gap != "" {
+		t.Fatalf("done=%v err=%v res=%+v", done, err, res)
 	}
-	if len(r.groups) == 0 {
-		t.Fatal("group 1 was never paged")
+	if len(r.tasks) != 1 {
+		t.Fatalf("walk made %d requests, want 1", len(r.tasks))
 	}
-	for _, g := range r.groups {
-		if g != 1 {
-			t.Fatalf("listing asked for sync group %d", g)
+	for _, task := range r.tasks {
+		if task.SyncGroup != 1 || task.Cursor != "cur-1" {
+			t.Fatalf("listing asked %+v", task)
 		}
+	}
+}
+
+func rangeRow(more bool, parent, minKey, minTS int64) *table.LSUpsertSyncGroupThreadsRange {
+	return &table.LSUpsertSyncGroupThreadsRange{SyncGroup: 1, ParentThreadKey: parent, HasMoreBefore: more, MinThreadKey: minKey, MinLastActivityTimestampMS: minTS}
+}
+
+func page(thread int64, rows ...*table.LSUpsertSyncGroupThreadsRange) *table.LSTable {
+	return &table.LSTable{
+		LSDeleteThenInsertThread:      []*table.LSDeleteThenInsertThread{{ThreadKey: thread, ThreadType: table.ONE_TO_ONE, FolderName: "inbox", ThreadName: "T"}},
+		LSUpsertSyncGroupThreadsRange: rows,
+	}
+}
+
+// The walk starts at the first page, addresses each next page by the previous reply's group-1 range row, and ends
+// complete when a reply says there is nothing more: every thread is emitted.
+func TestWalkFollowsEachRepliesRangeRowToTheEnd(t *testing.T) {
+	r := &pager{pages: []*table.LSTable{
+		page(101, rangeRow(true, -1, 90, 5000)),
+		page(102, rangeRow(true, -1, 80, 4000)),
+		page(103, rangeRow(false, -1, 70, 3000)),
+	}}
+	frames, res, err, done := listGap(t, newTestSession(), r, context.Background(), 10*time.Second)
+	if !done || err != nil || res.Gap != "" {
+		t.Fatalf("done=%v err=%v gap=%q", done, err, res.Gap)
+	}
+	want := []socket.FetchThreadsTask{
+		{ParentThreadKey: -1, ReferenceThreadKey: 0, ReferenceActivityTimestamp: 9999999999999, Cursor: "", SyncGroup: 1},
+		{ParentThreadKey: -1, ReferenceThreadKey: 90, ReferenceActivityTimestamp: 5000, Cursor: "", SyncGroup: 1},
+		{ParentThreadKey: -1, ReferenceThreadKey: 80, ReferenceActivityTimestamp: 4000, Cursor: "", SyncGroup: 1},
+	}
+	if len(r.tasks) != 3 {
+		t.Fatalf("requests = %+v", r.tasks)
+	}
+	for i := range want {
+		if r.tasks[i] != want[i] {
+			t.Fatalf("request %d = %+v, want %+v", i, r.tasks[i], want[i])
+		}
+	}
+	got := threadsByID(frames)
+	for _, id := range []string{"101", "102", "103"} {
+		if got[id] == nil || got[id].Kind != "user" {
+			t.Fatalf("thread %s not emitted: %v", id, got)
+		}
+	}
+}
+
+// A reply with no group-1 range row, or one that does not move, ends the walk incomplete; so does the page bound.
+func TestWalkEndsIncompleteWithoutAProgressingRange(t *testing.T) {
+	for name, pages := range map[string][]*table.LSTable{
+		"no range row":        {page(101, rangeRow(true, -1, 90, 5000)), page(102)},
+		"only another group":  {page(101, &table.LSUpsertSyncGroupThreadsRange{SyncGroup: 95, HasMoreBefore: true, MinThreadKey: 1})},
+		"range does not move": {page(101, rangeRow(true, -1, 90, 5000)), page(102, rangeRow(true, -1, 90, 5000))},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := &pager{pages: pages}
+			_, res, err, done := listGap(t, newTestSession(), r, context.Background(), 10*time.Second)
+			if !done || err != nil || res.Gap != "inbox_incomplete" || res.Stats == nil {
+				t.Fatalf("done=%v err=%v res=%+v", done, err, res)
+			}
+		})
+	}
+	t.Run("page bound", func(t *testing.T) {
+		const bound = 3
+		old := threadBatchLimit
+		threadBatchLimit = bound
+		defer func() { threadBatchLimit = old }()
+		oldDelay := threadBatchDelay
+		threadBatchDelay = time.Millisecond
+		defer func() { threadBatchDelay = oldDelay }()
+		var pages []*table.LSTable
+		for i := int64(1); i <= bound+2; i++ {
+			pages = append(pages, page(100+i, rangeRow(true, -1, 100-i, 9000-i)))
+		}
+		r := &pager{pages: pages}
+		_, res, err, done := listGap(t, newTestSession(), r, context.Background(), 10*time.Second)
+		if !done || err != nil || res.Gap != "inbox_incomplete" || len(r.tasks) != bound {
+			t.Fatalf("done=%v err=%v gap=%q requests=%d, want %d", done, err, res.Gap, len(r.tasks), bound)
+		}
+	})
+}
+
+// Only the inbox parent's own row continues or completes the walk. A competing group-1 row for another parent, before
+// or after it, neither completes the inbox early nor redirects the next request into that folder; with several rows for
+// the inbox parent the last one wins.
+func TestWalkUsesOnlyTheRequestedParentsRangeRow(t *testing.T) {
+	other := func(more bool) *table.LSUpsertSyncGroupThreadsRange { return rangeRow(more, 7, 55, 1) }
+	for name, tc := range map[string]struct {
+		pages    []*table.LSTable
+		wantGap  string
+		requests int
+	}{
+		"inbox more, then other done":  {[]*table.LSTable{page(101, rangeRow(true, -1, 90, 5000), other(false)), page(102, rangeRow(false, -1, 80, 4000))}, "", 2},
+		"other done, then inbox more":  {[]*table.LSTable{page(101, other(false), rangeRow(true, -1, 90, 5000)), page(102, rangeRow(false, -1, 80, 4000))}, "", 2},
+		"other more does not redirect": {[]*table.LSTable{page(101, rangeRow(true, -1, 90, 5000), other(true)), page(102, rangeRow(false, -1, 80, 4000))}, "", 2},
+		"inbox done, other more":       {[]*table.LSTable{page(101, rangeRow(false, -1, 90, 5000), other(true))}, "", 1},
+		"only another parent":          {[]*table.LSTable{page(101, other(false))}, "inbox_incomplete", 1},
+		"only another parent, more":    {[]*table.LSTable{page(101, other(true))}, "inbox_incomplete", 1},
+		"several inbox rows, last":     {[]*table.LSTable{page(101, rangeRow(true, -1, 90, 5000), rangeRow(false, -1, 80, 4000))}, "", 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := &pager{pages: tc.pages}
+			frames, res, err, done := listGap(t, newTestSession(), r, context.Background(), 10*time.Second)
+			if !done || err != nil || res.Gap != tc.wantGap || len(r.tasks) != tc.requests {
+				t.Fatalf("done=%v err=%v gap=%q requests=%d, want gap %q and %d requests", done, err, res.Gap, len(r.tasks), tc.wantGap, tc.requests)
+			}
+			for _, task := range r.tasks {
+				if task.ParentThreadKey != -1 {
+					t.Fatalf("a request was redirected to parent %d", task.ParentThreadKey)
+				}
+			}
+			if tc.requests == 2 && (r.tasks[1].ReferenceThreadKey != 90 || r.tasks[1].ReferenceActivityTimestamp != 5000) {
+				t.Fatalf("second request = %+v, want the inbox row's reference", r.tasks[1])
+			}
+			if threadsByID(frames)["101"] == nil {
+				t.Fatal("the page's threads are still emitted")
+			}
+		})
+	}
+}
+
+// A HasMoreBefore=false row for parent 0 ends the group (the library's own convention), whether or not the inbox
+// parent's row is also there; parent 0 saying "more" decides nothing. Rows are read in order and the last deciding
+// row wins, as the library's keystore updates do.
+func TestWalkCompletesOnAParentZeroEndRow(t *testing.T) {
+	zero := func(more bool) *table.LSUpsertSyncGroupThreadsRange { return rangeRow(more, 0, 0, 0) }
+	for name, tc := range map[string]struct {
+		pages    []*table.LSTable
+		wantGap  string
+		requests int
+	}{
+		"parent 0 end completes":              {[]*table.LSTable{page(101, zero(false))}, "", 1},
+		"parent 0 more is not a decision":     {[]*table.LSTable{page(101, zero(true))}, "inbox_incomplete", 1},
+		"inbox more, then parent 0 end":       {[]*table.LSTable{page(101, rangeRow(true, -1, 90, 5000), zero(false))}, "", 1},
+		"parent 0 end, then inbox more":       {[]*table.LSTable{page(101, zero(false), rangeRow(true, -1, 90, 5000)), page(102, zero(false))}, "", 2},
+		"parent 0 more does not redirect":     {[]*table.LSTable{page(101, rangeRow(true, -1, 90, 5000), zero(true)), page(102, rangeRow(false, -1, 80, 4000))}, "", 2},
+		"inbox end, then another parent more": {[]*table.LSTable{page(101, rangeRow(false, -1, 90, 5000), rangeRow(true, 7, 55, 1))}, "", 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := &pager{pages: tc.pages}
+			_, res, err, done := listGap(t, newTestSession(), r, context.Background(), 10*time.Second)
+			if !done || err != nil || res.Gap != tc.wantGap || len(r.tasks) != tc.requests {
+				t.Fatalf("done=%v err=%v gap=%q requests=%d, want gap %q and %d requests", done, err, res.Gap, len(r.tasks), tc.wantGap, tc.requests)
+			}
+			for _, task := range r.tasks {
+				if task.ParentThreadKey != -1 {
+					t.Fatalf("a request was redirected to parent %d", task.ParentThreadKey)
+				}
+			}
+		})
+	}
+}
+
+// A failed request is the listing's error, as before.
+func TestWalkRequestErrorFailsTheListing(t *testing.T) {
+	r := &pager{err: errors.New("boom")}
+	_, res, err, done := listGap(t, newTestSession(), r, context.Background(), 3*time.Second)
+	if !done || err == nil || res.Stats != nil {
+		t.Fatalf("done=%v err=%v res=%+v", done, err, res)
+	}
+}
+
+// threads_done carries the gap through the loop, and no gap key when complete.
+func TestThreadsDoneCarriesTheInboxGap(t *testing.T) {
+	const startAndList = `{"t":"start","id":1,"cookies":{"c_user":"1","xs":"x","datr":"d"}}`
+	frames := runLoop(t, &fakeBackend{threadGap: "inbox_incomplete"}, startAndList, `{"t":"threads","id":2}`)
+	var done *Frame
+	for i, f := range frames {
+		if f.ID == 2 {
+			done = &frames[i]
+		}
+	}
+	if done == nil || done.T != TThreadsDone || done.Gap != "inbox_incomplete" || done.Err != "" {
+		t.Fatalf("gap answer = %+v", done)
+	}
+	b, _ := json.Marshal(Frame{T: TThreadsDone, ID: 2, Gap: "inbox_incomplete"})
+	if string(b) != `{"t":"threads_done","id":2,"gap":"inbox_incomplete"}` {
+		t.Fatalf("wire = %s", b)
 	}
 }
 
@@ -486,10 +704,10 @@ type lsCall struct {
 	epoch   int64
 }
 
-// A resumed start makes one GraphQL sync of databases 1, 2 and 95 with the saved version and sync
-// params, adds database 95's cutover links to database 1's table, and the rows flow through the
-// normal path: a typed encrypted one-to-one is emitted as an e: thread, a pending row is minimal.
-func TestResumeSyncAsksOnceForDatabases1_2_95AndFeedsTheNormalPath(t *testing.T) {
+// A resumed start makes one GraphQL sync of exactly databases 1 and 2 (never 95, the message-requests inbox)
+// with the saved version and sync params, and the rows flow through the normal path: a typed encrypted
+// one-to-one is emitted as an e: thread, a pending row is minimal.
+func TestResumeSyncAsksOnceForDatabases1And2AndFeedsTheNormalPath(t *testing.T) {
 	s := newTestSession()
 	var calls []lsCall
 	s.lsRequest = func(ctx context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
@@ -502,23 +720,22 @@ func TestResumeSyncAsksOnceForDatabases1_2_95AndFeedsTheNormalPath(t *testing.T)
 					{ThreadKey: 4242, ThreadType: table.ENCRYPTED_OVER_WA_ONE_TO_ONE, ThreadName: "Enc", LastActivityTimestampMs: 5},
 					{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, FolderName: "pending", ThreadName: "Stranger", LastActivityTimestampMs: 9},
 				},
-				LSVerifyHybridThreadExists: []*table.LSVerifyHybridThreadExists{{ThreadKey: 77, ThreadJID: 7777, ThreadType: table.ONE_TO_ONE}},
+				LSVerifyHybridThreadExists:   []*table.LSVerifyHybridThreadExists{{ThreadKey: 77, ThreadJID: 7777, ThreadType: table.ONE_TO_ONE}},
+				LSCreateOpenToE2EEThreadLink: []*table.LSCreateOpenToE2EEThreadLink{{OpenThreadID: 42, ArmadilloThreadID: 4242}},
 			}, nil
-		case 95:
-			return &table.LSTable{LSCreateOpenToE2EEThreadLink: []*table.LSCreateOpenToE2EEThreadLink{{OpenThreadID: 42, ArmadilloThreadID: 4242}}}, nil
 		}
 		return &table.LSTable{}, nil
 	}
-	tbl := s.resumeSync(context.Background(), savedConfig(t, 123))
-	want := []lsCall{{1, 123, "mb-params", nil, 0}, {2, 123, "ct-params", nil, 0}, {95, 123, "ct-params", nil, 0}}
-	if len(calls) != 3 || calls[0] != want[0] || calls[1] != want[1] || calls[2] != want[2] {
+	frames := s.resumeSync(context.Background(), savedConfig(t, 123))
+	want := []lsCall{{1, 123, "mb-params", nil, 0}, {2, 123, "ct-params", nil, 0}}
+	if len(calls) != 2 || calls[0] != want[0] || calls[1] != want[1] {
 		t.Fatalf("sync calls = %+v, want %+v", calls, want)
 	}
-	if tbl == nil || len(tbl.LSCreateOpenToE2EEThreadLink) != 1 {
-		t.Fatalf("database 95's cutover links must be added to database 1's table: %+v", tbl)
+	if s.cutover[4242] != 42 {
+		t.Fatalf("the cutover link must be applied: %v", s.cutover)
 	}
 	var got []Frame
-	s.initialEmitter(s.handleTableFrames(tbl))(func(f Frame) int64 { got = append(got, f); return 0 })
+	s.initialEmitter(frames)(func(f Frame) int64 { got = append(got, f); return 0 })
 	enc := lastThread(got, "e:4242")
 	if enc == nil || enc.Kind != "user" || !enc.Encrypted || !enc.Typed || enc.Predecessor != "42" {
 		t.Fatalf("a typed encrypted one-to-one must be emitted as an e: thread: %+v", enc)
@@ -530,8 +747,9 @@ func TestResumeSyncAsksOnceForDatabases1_2_95AndFeedsTheNormalPath(t *testing.T)
 	if s.fbToWA[77] != 7777 {
 		t.Fatalf("the hybrid mapping must be recorded: %v", s.fbToWA)
 	}
-	if got := s.listingStats(0, 0, 0)["resume_sync_rows"]; got != countRows(tbl) || got == 0 {
-		t.Fatalf("resume_sync_rows = %d, want %d", got, countRows(tbl))
+	// rows: db 1 has 2 threads + 1 hybrid + 1 cutover link, db 2 none
+	if got := s.listingStats(0, 0, 0)["resume_sync_rows"]; got != 4 {
+		t.Fatalf("resume_sync_rows = %d, want 4", got)
 	}
 }
 
@@ -544,9 +762,9 @@ func TestResumeSyncFailureNeverBlocksTheListing(t *testing.T) {
 		wantNil bool
 		calls   int
 	}{
-		"database 1 fails":  {1, 123, true, 1},
-		"database 95 fails": {95, 123, false, 3},
-		"no saved version":  {0, 0, true, 0},
+		"database 1 fails": {1, 123, true, 1},
+		"database 2 fails": {2, 123, false, 2},
+		"no saved version": {0, 0, true, 0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := newTestSession()
@@ -558,9 +776,9 @@ func TestResumeSyncFailureNeverBlocksTheListing(t *testing.T) {
 				}
 				return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 600, ThreadType: table.ONE_TO_ONE}}}, nil
 			}
-			tbl := s.resumeSync(context.Background(), savedConfig(t, tc.version))
-			if (tbl == nil) != tc.wantNil || n != tc.calls {
-				t.Fatalf("table nil=%v calls=%d, want nil=%v calls=%d", tbl == nil, n, tc.wantNil, tc.calls)
+			frames := s.resumeSync(context.Background(), savedConfig(t, tc.version))
+			if (frames == nil) != tc.wantNil || n != tc.calls {
+				t.Fatalf("frames nil=%v calls=%d, want nil=%v calls=%d", frames == nil, n, tc.wantNil, tc.calls)
 			}
 			_, stats, err, done := listWithin(t, s, &pager{}, context.Background(), 3*time.Second)
 			if !done || err != nil || stats == nil {
@@ -578,7 +796,7 @@ func TestResumeSyncHonoursCancel(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
-	done := make(chan *table.LSTable, 1)
+	done := make(chan []Frame, 1)
 	go func() { done <- s.resumeSync(ctx, savedConfig(t, 123)) }()
 	select {
 	case tbl := <-done:

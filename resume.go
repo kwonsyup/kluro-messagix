@@ -15,19 +15,25 @@ import (
 // resumeSyncTimeout bounds the whole resumed-start sync.
 var resumeSyncTimeout = 20 * time.Second
 
-// resumeSyncDatabases are the sync databases the page load's GraphQL sync asks for.
-var resumeSyncDatabases = []int64{1, 2, 95}
+// resumeSyncDatabases are the sync databases the resume sync asks for: the inbox (1)
+// and the contacts (2). The page load also asks for 95, the message-requests inbox;
+// requests are not imported, and 95's cursor is left to the library's own socket sync.
+var resumeSyncDatabases = []int64{1, 2}
 
-// resumeSync is the GraphQL sync a page load runs for databases 1, 2 and 95 (the
-// library's setupConfigs and SyncDataGraphQL), for a session resumed from saved
-// state, which skipped the page load. Database 1's table is the result and database
-// 95's cutover links are added to it, as the library does. The version and the sync
-// params come from the saved state's own copy of the page config, so nothing needs
-// the page. One attempt, bounded by resumeSyncTimeout, cancel honoured: a failure
-// logs a fixed code and returns whatever database 1 gave (nothing if it failed).
-// The library's own bookkeeping (cursors, thread ranges) is not touched: its sync
-// manager is not reachable from here, and the socket sync that follows does it.
-func (s *messagixSession) resumeSync(ctx context.Context, saved json.RawMessage) *table.LSTable {
+// resumeSync is the GraphQL sync a page load runs, for the inbox (1) and the contacts
+// (2), for a session resumed from saved state, which skipped the page load. The
+// version and the sync params come from the saved state's own copy of the page
+// config, so nothing needs the page. One attempt, bounded by resumeSyncTimeout, cancel
+// honoured: a failure logs a fixed code and returns what was applied (nothing if
+// database 1 failed).
+//
+// Each table is only applied to the session (frames for the initial emitter); the
+// helper never writes the library's sync state. The cursors therefore stay where the
+// saved state left them and the library's own socket sync replays the same rows. A
+// replay is harmless: thread frames merge into the same thread record and are upserts
+// downstream, and the helper's messages carry their ids, which the connector's
+// import dedupes. The fail-closed rule for message requests applies to every row.
+func (s *messagixSession) resumeSync(ctx context.Context, saved json.RawMessage) []Frame {
 	var cfg struct {
 		Configs struct {
 			VersionID          int64
@@ -55,7 +61,8 @@ func (s *messagixSession) resumeSync(ctx context.Context, saved json.RawMessage)
 	}
 	wctx, cancel := context.WithTimeout(ctx, resumeSyncTimeout)
 	defer cancel()
-	var out *table.LSTable
+	var frames []Frame
+	rows := 0
 	for _, db := range resumeSyncDatabases {
 		syncParams := params.Contact
 		if db == 1 {
@@ -77,17 +84,13 @@ func (s *messagixSession) resumeSync(ctx context.Context, saved json.RawMessage)
 			}
 			continue
 		}
-		switch db {
-		case 1:
-			out = tbl
-		case 95:
-			out.LSCreateOpenToE2EEThreadLink = append(out.LSCreateOpenToE2EEThreadLink, tbl.LSCreateOpenToE2EEThreadLink...)
-		}
+		frames = append(frames, s.handleTableFrames(tbl)...)
+		rows += countRows(tbl)
 	}
 	s.mu.Lock()
-	s.resumeRows = countRows(out)
+	s.resumeRows = rows
 	s.mu.Unlock()
-	return out
+	return frames
 }
 
 // countRows is the number of rows in a table, over every row-list field.

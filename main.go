@@ -35,7 +35,7 @@ type backend interface {
 	// history state, or an error: *authErr for a wrong/locked PIN.
 	HistoryPIN(ctx context.Context, pin []byte) (HistoryState, error)
 	// Threads pages the full inbox; thread events go to emit as found.
-	Threads(ctx context.Context, emit emitFunc) (map[string]int, error)
+	Threads(ctx context.Context, emit emitFunc) (listingDone, error)
 	// History returns one page of a thread, newest first.
 	History(ctx context.Context, thread, cursor string, count int) (*Page, error)
 	// Send sends one text; it never retries internally.
@@ -249,7 +249,7 @@ func run(r io.Reader, w io.Writer, mkBackend func() backend) int {
 				cancelList()
 			}
 			commandMu.Unlock()
-			stats, err := b.Threads(listCtx, em.emit)
+			done, err := b.Threads(listCtx, em.emit)
 			if listCtx.Err() != nil {
 				err = listCtx.Err()
 			}
@@ -261,7 +261,7 @@ func run(r io.Reader, w io.Writer, mkBackend func() backend) int {
 				em.emit(Frame{T: TError, ID: f.ID, Err: codeOf(err)})
 				return -1
 			}
-			em.emit(Frame{T: TThreadsDone, ID: f.ID, Stats: stats})
+			em.emit(Frame{T: TThreadsDone, ID: f.ID, Stats: done.Stats, Gap: done.Gap})
 		case THistory:
 			if !started {
 				em.emit(Frame{T: TError, ID: f.ID, Err: "not_started"})
