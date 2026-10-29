@@ -72,18 +72,11 @@ type messagixSession struct {
 	threads      map[string]*threadInfo // by wire id
 	participants map[int64][]int64      // participant rows waiting for their thread
 	names        map[int64]string
-	cutover      map[int64]int64                                              // encrypted chat id -> its pre-encryption (open) thread key
-	fbToWA       map[int64]int64                                              // facebook thread key -> encrypted chat id (hybrid threads)
-	requestKeys  map[int64]bool                                               // facebook thread keys whose latest classifying row says message request
-	classSeq     map[int64]uint64                                             // facebook thread key -> sequence of its latest classifying row
-	classCount   uint64                                                       // classifying rows seen
-	typeAsked    map[int64]bool                                               // untyped live threads already asked about this run
-	typeSent     []time.Time                                                  // when those asks went out, for the per-minute cap
-	typeAsks     int                                                          // how many asks went out this run (count only)
-	typeFn       func(ctx context.Context, key int64) (*table.LSTable, error) // test seam; nil means the client
-	rowKeys      map[int64]bool                                               // thread rows seen this run (counts only)
-	encRowKeys   map[int64]bool                                               // ... of an encrypted-over-WA type
-	msgIndex     map[string]string                                            // message id -> wire thread id
+	cutover      map[int64]int64   // encrypted chat id -> its pre-encryption (open) thread key
+	fbToWA       map[int64]int64   // facebook thread key -> encrypted chat id (hybrid threads)
+	rowKeys      map[int64]bool    // thread rows seen this run (counts only)
+	encRowKeys   map[int64]bool    // ... of an encrypted-over-WA type
+	msgIndex     map[string]string // message id -> wire thread id
 	msgOrder     []string
 	collectors   map[int64]*pageCollector
 	lastFullRec  time.Time
@@ -134,9 +127,6 @@ func newSession() *messagixSession {
 		names:        map[int64]string{},
 		cutover:      map[int64]int64{},
 		fbToWA:       map[int64]int64{},
-		requestKeys:  map[int64]bool{},
-		classSeq:     map[int64]uint64{},
-		typeAsked:    map[int64]bool{},
 		rowKeys:      map[int64]bool{},
 		encRowKeys:   map[int64]bool{},
 		msgIndex:     map[string]string{},

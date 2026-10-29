@@ -2,23 +2,14 @@
 package main
 
 import (
-	"context"
 	"strconv"
 	"sync"
-	"time"
 
 	"go.mau.fi/whatsmeow/proto/waConsumerApplication"
 	waTypes "go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 
-	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
-)
-
-// Thread folders that mean "not an accepted chat": a message request, or spam.
-const (
-	folderPending = "pending"
-	folderSpam    = "spam"
 )
 
 const msgIndexCap = 50000
@@ -44,22 +35,9 @@ func (s *messagixSession) handleTable(tbl *table.LSTable) {
 }
 
 func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame) {
-	return s.handleTableFramesFor(tbl, nil)
-}
-
-// askReply names the thread an open-thread request was sent for and the
-// classification sequence that thread had when it was sent. A reply only
-// classifies its thread if no newer classifying row arrived since.
-type askReply struct {
-	key int64
-	seq uint64
-}
-
-func (s *messagixSession) handleTableFramesFor(tbl *table.LSTable, reply *askReply) (frames []Frame) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	dirty := false
-	touched := map[string]bool{}
 	for _, c := range tbl.LSCreateOpenToE2EEThreadLink {
 		if s.cutover[c.ArmadilloThreadID] != c.OpenThreadID {
 			s.cutover[c.ArmadilloThreadID] = c.OpenThreadID
@@ -69,18 +47,12 @@ func (s *messagixSession) handleTableFramesFor(tbl *table.LSTable, reply *askRep
 	for _, j := range tbl.LSUpdateThreadAuthorityAndMappingWithOTIDFromJID {
 		if s.fbToWA[j.ThreadKey] != j.ThreadJID {
 			s.fbToWA[j.ThreadKey] = j.ThreadJID
-			if s.requestKeys[j.ThreadKey] {
-				s.touchMappedLocked(touched, j.ThreadKey)
-			}
 			dirty = true
 		}
 	}
 	for _, j := range tbl.LSVerifyHybridThreadExists {
 		if s.fbToWA[j.ThreadKey] != j.ThreadJID {
 			s.fbToWA[j.ThreadKey] = j.ThreadJID
-			if s.requestKeys[j.ThreadKey] {
-				s.touchMappedLocked(touched, j.ThreadKey)
-			}
 			dirty = true
 		}
 	}
@@ -95,49 +67,7 @@ func (s *messagixSession) handleTableFramesFor(tbl *table.LSTable, reply *askRep
 		}
 	}
 
-	// A thread is a message request while its latest classifying row says so: a
-	// "pending" or "spam" folder (the library treats neither as an accepted chat,
-	// connector/events.go folderPending/folderSpam, chatinfo.go MessageRequest) or
-	// a request status row of 1. Any other folder or status clears it. The helper
-	// only labels the thread; a flip re-emits its thread frame.
-	classify := func(key int64, request bool) {
-		if reply != nil && reply.key == key && s.classSeq[key] != reply.seq {
-			return // a newer row arrived since the ask went out: the reply is stale
-		}
-		s.classCount++
-		s.classSeq[key] = s.classCount
-		if s.requestKeys[key] == request {
-			return
-		}
-		if request {
-			s.requestKeys[key] = true
-		} else {
-			delete(s.requestKeys, key)
-		}
-		if s.threads[wireID(false, key)] != nil {
-			touched[wireID(false, key)] = true
-		}
-		s.touchMappedLocked(touched, key)
-	}
-	classifyFolder := func(key int64, folder string) {
-		if folder != "" {
-			classify(key, folder == folderPending || folder == folderSpam)
-		}
-	}
-	for _, th := range tbl.LSDeleteThenInsertThread {
-		classifyFolder(th.ThreadKey, th.FolderName)
-	}
-	for _, th := range tbl.LSUpdateOrInsertThread {
-		classifyFolder(th.ThreadKey, th.FolderName)
-	}
-	for _, th := range tbl.LSVerifyThreadExists {
-		classifyFolder(th.ThreadKey, th.FolderName)
-	}
-	for _, r := range tbl.LSDeleteThenInsertMessageRequest {
-		// MessageRequestStatus 1 means the thread is in the pending folder.
-		classify(r.ThreadKey, r.MessageRequestStatus == 1)
-	}
-
+	touched := map[string]bool{}
 	upsertThread := func(key int64, typ table.ThreadType, name string, last int64) {
 		originalKey := key
 		s.rowKeys[originalKey] = true
@@ -302,7 +232,7 @@ func threadFrame(t Thread) Frame { return Frame{T: TThread, ThreadEvt: &t} }
 // wireThreadLocked builds the protocol thread. A one-to-one thread names the
 // other person; an encrypted thread names the open thread it continues.
 func (s *messagixSession) wireThreadLocked(t *threadInfo) Thread {
-	out := Thread{ID: wireID(t.Enc, t.Key), Kind: t.Kind, Typed: t.Typed, Title: t.Title, Encrypted: t.Enc, LastActivity: t.LastActivity, Request: s.requestLocked(t)}
+	out := Thread{ID: wireID(t.Enc, t.Key), Kind: t.Kind, Typed: t.Typed, Title: t.Title, Encrypted: t.Enc, LastActivity: t.LastActivity}
 	if t.Enc {
 		if open, ok := s.cutover[t.Key]; ok {
 			out.Predecessor = wireID(false, open)
@@ -351,9 +281,6 @@ func (s *messagixSession) messageFrameLocked(m *table.WrappedMessage) []Frame {
 	if s.threads[thread] == nil {
 		t := s.thread(enc, key)
 		frames = append(frames, threadFrame(s.wireThreadLocked(t)))
-	}
-	if t := s.threads[thread]; !enc && t != nil && !t.Typed {
-		s.askThreadTypeLocked(key)
 	}
 	return append(frames, Frame{T: TMessage, Message: &msg})
 }
@@ -578,113 +505,18 @@ func (s *messagixSession) encryptedCounts() (known, unlisted int) {
 func (s *messagixSession) listingStats(known, emitted, unlisted int) map[string]int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	requestThreads := 0
-	for _, t := range s.threads {
-		if s.requestLocked(t) {
-			requestThreads++
-		}
-	}
 	connected := 0
 	if s.e2ee != nil && s.e2ee.IsConnected() {
 		connected = 1
 	}
 	return map[string]int{
-		"group1_threads":         len(s.rowKeys),
-		"group1_encrypted_rows":  len(s.encRowKeys),
-		"hybrid_mappings":        len(s.fbToWA),
-		"cutover_links":          len(s.cutover),
-		"encrypted_known":        known,
-		"encrypted_emitted":      emitted,
-		"e2ee_connected":         connected,
-		"request_threads":        requestThreads,
-		"untyped_typed_requests": s.typeAsks,
-		"encrypted_unlisted":     unlisted,
-	}
-}
-
-// untypedAsksPerMinute caps how many open-thread requests go out per minute.
-const untypedAsksPerMinute = 10
-
-// askThreadTypeLocked asks the server for a live message's thread, whose kind is
-// unknown (the thread was created by the message, not by a thread row). It sends
-// the open-thread request history uses, at most once per thread per run and at
-// most untypedAsksPerMinute per minute, and feeds the thread rows of the reply
-// through the normal typed path: the helper never guesses a kind. If the thread
-// is a message request, the reply's folder row flags it, unless a newer
-// classifying row arrived since the ask went out. The caller holds s.mu.
-func (s *messagixSession) askThreadTypeLocked(key int64) {
-	if s.typeAsked[key] || s.stopping || s.ctx == nil || s.ctx.Err() != nil {
-		return
-	}
-	now := time.Now()
-	recent := s.typeSent[:0]
-	for _, at := range s.typeSent {
-		if now.Sub(at) < time.Minute {
-			recent = append(recent, at)
-		}
-	}
-	s.typeSent = recent
-	if len(s.typeSent) >= untypedAsksPerMinute {
-		return
-	}
-	ask := s.typeFn
-	if ask == nil {
-		cli := s.client
-		if cli == nil {
-			return
-		}
-		ask = func(ctx context.Context, k int64) (*table.LSTable, error) {
-			return cli.ExecuteTasks(ctx, &socket.CreateThreadTask{ThreadFBID: k, SyncGroup: 1})
-		}
-	}
-	s.typeAsked[key] = true
-	s.typeSent = append(s.typeSent, now)
-	s.typeAsks++
-	tok := &askReply{key: key, seq: s.classSeq[key]}
-	ctx := s.ctx
-	s.workWG.Add(1)
-	go func() {
-		defer s.workWG.Done()
-		cctx, cancel := context.WithTimeout(ctx, historyWait)
-		defer cancel()
-		tbl, err := ask(cctx, key)
-		if err != nil || tbl == nil {
-			logCode("warn", "thread_type_failed")
-			return
-		}
-		// Only the thread facts: the reply's messages reach the helper on the socket.
-		for _, f := range s.handleTableFramesFor(&table.LSTable{
-			LSDeleteThenInsertThread:         tbl.LSDeleteThenInsertThread,
-			LSUpdateOrInsertThread:           tbl.LSUpdateOrInsertThread,
-			LSVerifyThreadExists:             tbl.LSVerifyThreadExists,
-			LSDeleteThenInsertMessageRequest: tbl.LSDeleteThenInsertMessageRequest,
-			LSAddParticipantIdToGroupThread:  tbl.LSAddParticipantIdToGroupThread,
-			LSSyncUpdateThreadName:           tbl.LSSyncUpdateThreadName,
-		}, tok) {
-			s.emit(f)
-		}
-	}()
-}
-
-// requestLocked reports whether a thread is flagged a message request: a
-// facebook thread by its own latest classification, an encrypted one through the
-// facebook thread that maps to it. The caller holds s.mu.
-func (s *messagixSession) requestLocked(t *threadInfo) bool {
-	if !t.Enc {
-		return s.requestKeys[t.Key]
-	}
-	for fb, w := range s.fbToWA {
-		if w == t.Key && s.requestKeys[fb] {
-			return true
-		}
-	}
-	return false
-}
-
-// touchMappedLocked re-emits the encrypted thread a flagged-or-not facebook
-// thread maps to, so its request flag follows the facebook thread. Caller holds s.mu.
-func (s *messagixSession) touchMappedLocked(touched map[string]bool, fb int64) {
-	if w, ok := s.fbToWA[fb]; ok && s.threads[wireID(true, w)] != nil {
-		touched[wireID(true, w)] = true
+		"group1_threads":        len(s.rowKeys),
+		"group1_encrypted_rows": len(s.encRowKeys),
+		"hybrid_mappings":       len(s.fbToWA),
+		"cutover_links":         len(s.cutover),
+		"encrypted_known":       known,
+		"encrypted_emitted":     emitted,
+		"e2ee_connected":        connected,
+		"encrypted_unlisted":    unlisted,
 	}
 }
