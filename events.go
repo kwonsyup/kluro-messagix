@@ -45,38 +45,20 @@ func (s *messagixSession) handleTable(tbl *table.LSTable) {
 func (s *messagixSession) handleTableEmit(tbl *table.LSTable, emit emitFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if fromRequestsDatabase(tbl) {
-		s.markRequestRowsLocked(tbl)
-	}
-	for _, f := range s.buildTableFramesLocked(tbl) {
+	for _, f := range s.buildTableFramesLocked(tbl, fromRequestsDatabase(tbl)) {
 		emit(f)
 	}
 }
 
 // handleRequestTableFrames is handleTableFrames for a table known to come from the
-// message-requests database (95): see markRequestRowsLocked.
+// message-requests database (95): every thread row in it takes the request-source
+// mark before its frame is built, so it goes out minimal whether or not the row names
+// a folder. Only a later accepted signal clears the mark (a thread row in a folder
+// other than pending or spam, or a request row with a status other than 1).
 func (s *messagixSession) handleRequestTableFrames(tbl *table.LSTable) []Frame {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.markRequestRowsLocked(tbl)
-	return s.buildTableFramesLocked(tbl)
-}
-
-// markRequestRowsLocked marks every thread row of a table from the message-requests
-// database as unaccepted, before its frame is built, so it goes out minimal whether or
-// not the row names a folder. Only a later accepted signal clears the mark (a thread row
-// in a folder other than pending or spam, or a request row with a status other than 1).
-// The caller holds s.mu.
-func (s *messagixSession) markRequestRowsLocked(tbl *table.LSTable) {
-	for _, th := range tbl.LSDeleteThenInsertThread {
-		s.requestSource[th.ThreadKey] = true
-	}
-	for _, th := range tbl.LSUpdateOrInsertThread {
-		s.requestSource[th.ThreadKey] = true
-	}
-	for _, th := range tbl.LSVerifyThreadExists {
-		s.requestSource[th.ThreadKey] = true
-	}
+	return s.buildTableFramesLocked(tbl, true)
 }
 
 // requestsDatabaseID is the sync database of message requests.
@@ -103,12 +85,13 @@ func fromRequestsDatabase(tbl *table.LSTable) bool {
 func (s *messagixSession) handleTableFrames(tbl *table.LSTable) []Frame {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.buildTableFramesLocked(tbl)
+	return s.buildTableFramesLocked(tbl, false)
 }
 
 // buildTableFramesLocked applies a table to the session and returns its frames.
-// The caller holds s.mu.
-func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []Frame) {
+// fromRequests says the table is from the message-requests database. The caller
+// holds s.mu.
+func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, fromRequests bool) (frames []Frame) {
 	dirty := false
 	touched := map[string]bool{}
 	for _, c := range tbl.LSCreateOpenToE2EEThreadLink {
@@ -175,6 +158,17 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []F
 		}
 		if changed {
 			s.touchRelatedLocked(touched, key)
+		}
+	}
+	if fromRequests {
+		for _, th := range tbl.LSDeleteThenInsertThread {
+			set(s.requestSource, th.ThreadKey, true)
+		}
+		for _, th := range tbl.LSUpdateOrInsertThread {
+			set(s.requestSource, th.ThreadKey, true)
+		}
+		for _, th := range tbl.LSVerifyThreadExists {
+			set(s.requestSource, th.ThreadKey, true)
 		}
 	}
 	markFolder := func(key int64, folder string) {
@@ -410,33 +404,36 @@ func (s *messagixSession) unacceptedLocked(key int64) bool {
 	return false
 }
 
-// relatedKeysLocked is the keys of the same chat as key, key included: the number
-// itself (a plaintext thread and its encrypted form share it), the hybrid mapping
-// either way, and the cutover link either way. The caller holds s.mu.
+// relatedKeysLocked is the keys of the same chat as key, key included: the whole
+// connected set under the same number (a plaintext thread and its encrypted form
+// share it), the hybrid mapping either way and the cutover link either way, followed
+// to a fixed point (a visited set bounds it). The caller holds s.mu.
 func (s *messagixSession) relatedKeysLocked(key int64) []int64 {
 	out := []int64{key}
-	add := func(k int64) {
-		for _, have := range out {
-			if have == k {
-				return
+	seen := map[int64]bool{key: true}
+	for i := 0; i < len(out); i++ {
+		k := out[i]
+		add := func(n int64) {
+			if !seen[n] {
+				seen[n] = true
+				out = append(out, n)
 			}
 		}
-		out = append(out, k)
-	}
-	if w, ok := s.fbToWA[key]; ok {
-		add(w)
-	}
-	for fb, w := range s.fbToWA {
-		if w == key {
-			add(fb)
+		if w, ok := s.fbToWA[k]; ok {
+			add(w)
 		}
-	}
-	if open, ok := s.cutover[key]; ok {
-		add(open)
-	}
-	for armadillo, open := range s.cutover {
-		if open == key {
-			add(armadillo)
+		for fb, w := range s.fbToWA {
+			if w == k {
+				add(fb)
+			}
+		}
+		if open, ok := s.cutover[k]; ok {
+			add(open)
+		}
+		for armadillo, open := range s.cutover {
+			if open == k {
+				add(armadillo)
+			}
 		}
 	}
 	return out

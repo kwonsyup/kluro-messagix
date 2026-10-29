@@ -1095,3 +1095,64 @@ func TestSocketTablesFromDatabase95AreMarkedAsRequests(t *testing.T) {
 		})
 	}
 }
+
+func composedChat(t *testing.T) *messagixSession {
+	t.Helper()
+	s := newTestSession()
+	for _, th := range []*threadInfo{
+		{Key: 42, Kind: "user", Typed: true, Participants: []int64{42}},
+		{Key: 77, Kind: "user", Typed: true, Participants: []int64{77}},
+		{Key: 4242, Enc: true, Kind: "user", Typed: true, Participants: []int64{4242}},
+	} {
+		s.threads[wireID(th.Enc, th.Key)] = th
+	}
+	s.cutover[4242] = 42 // e:4242 continues thread 42
+	s.fbToWA[77] = 4242  // thread 77 is hybrid-mapped to chat 4242
+	return s
+}
+
+// The related keys are the whole connected set, not one hop: 42 - 4242 (cutover) - 77 (hybrid).
+func TestMarksFollowTheWholeConnectedChat(t *testing.T) {
+	row := func(key int64, folder string) *table.LSTable {
+		return &table.LSTable{LSVerifyThreadExists: []*table.LSVerifyThreadExists{{ThreadKey: key, ThreadType: table.ONE_TO_ONE, FolderName: folder}}}
+	}
+	held := func(th *Thread) bool { return th != nil && th.Kind == "" && !th.Typed }
+	free := func(th *Thread) bool { return th != nil && th.Kind != "" && th.Typed }
+
+	// a mark on 42 holds e:4242 and 77, and re-emits both
+	s := composedChat(t)
+	frames := s.handleTableFrames(row(42, "pending"))
+	for _, id := range []string{"42", "e:4242", "77"} {
+		if th := lastThread(frames, id); !held(th) {
+			t.Fatalf("a mark on 42 must hold %s and re-emit it: %+v", id, th)
+		}
+	}
+	// an accepted row on 77 releases all three
+	frames = s.handleTableFrames(row(77, "inbox"))
+	for _, id := range []string{"42", "e:4242", "77"} {
+		if th := lastThread(frames, id); !free(th) {
+			t.Fatalf("an accepted row on 77 must release %s: %+v", id, th)
+		}
+	}
+	// a mark on 77 holds 42, two hops away
+	frames = s.handleTableFrames(row(77, "spam"))
+	for _, id := range []string{"42", "e:4242", "77"} {
+		if th := lastThread(frames, id); !held(th) {
+			t.Fatalf("a mark on 77 must hold %s: %+v", id, th)
+		}
+	}
+}
+
+// A database-95 row goes through the same tracked setter: an already-emitted typed encrypted thread of the
+// same chat is re-emitted minimal.
+func TestDatabase95RowReemitsTheChatsOtherThreads(t *testing.T) {
+	s := composedChat(t)
+	frames := s.handleRequestTableFrames(&table.LSTable{
+		LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 42, ThreadType: table.ONE_TO_ONE}},
+	})
+	for _, id := range []string{"42", "e:4242", "77"} {
+		if th := lastThread(frames, id); th == nil || th.Kind != "" || th.Typed {
+			t.Fatalf("a database-95 row for 42 must re-emit %s minimal: %+v", id, th)
+		}
+	}
+}
