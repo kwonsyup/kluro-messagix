@@ -36,32 +36,42 @@ func (r *pager) FetchMoreThreads(_ context.Context, group int64) (*socket.KeySto
 
 func (r *pager) WaitForInitialThreadRange(context.Context, int64) error { return nil }
 
-// rangePager models the real client: until the initial group-1 range arrives the keystore says there
-// is nothing more to page, so a page fetched early is the only one.
+// rangePager models the real client: the keystore says there is nothing more to page until a table
+// carrying a thread range is applied through PostHandlePublishResponse, which also moves the
+// generation WaitForInitialThreadRange observes. Nothing else advances either.
 type rangePager struct {
-	mu       sync.Mutex
-	delay    time.Duration // when the range arrives; negative: never
-	arrived  bool
-	pages    int
-	waitedOn int
+	mu      sync.Mutex
+	gen     uint64
+	changed chan struct{}
+	pages   int
+}
+
+func newRangePager() *rangePager { return &rangePager{changed: make(chan struct{})} }
+
+func (r *rangePager) PostHandlePublishResponse(tbl *table.LSTable) {
+	if len(tbl.LSUpsertSyncGroupThreadsRange) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.gen++
+	close(r.changed)
+	r.changed = make(chan struct{})
 }
 
 func (r *rangePager) WaitForInitialThreadRange(ctx context.Context, _ int64) error {
-	r.mu.Lock()
-	r.waitedOn++
-	r.mu.Unlock()
-	if r.delay < 0 {
-		<-ctx.Done()
-		return ctx.Err()
-	}
-	select {
-	case <-time.After(r.delay):
+	for {
 		r.mu.Lock()
-		r.arrived = true
+		gen, changed := r.gen, r.changed
 		r.mu.Unlock()
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+		if gen > 0 {
+			return nil
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
@@ -69,7 +79,7 @@ func (r *rangePager) FetchMoreThreads(context.Context, int64) (*socket.KeyStoreD
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.pages++
-	if !r.arrived {
+	if r.gen == 0 {
 		return &socket.KeyStoreData{HasMoreBefore: false, MinThreadKey: 100}, &table.LSTable{}, nil
 	}
 	return &socket.KeyStoreData{HasMoreBefore: r.pages < 3, MinThreadKey: int64(100 - r.pages)}, &table.LSTable{}, nil
@@ -748,19 +758,37 @@ func withGroup1Wait(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { group1RangeWait = old })
 }
 
-// The initial group-1 range arrives after the socket is up; paging waits for it, so it goes past the first page.
-func TestPagingWaitsForTheInitialGroup1Range(t *testing.T) {
-	withGroup1Wait(t, 3*time.Second)
-	r := &rangePager{delay: 100 * time.Millisecond}
-	_, stats, err, done := listWithin(t, newTestSession(), r, context.Background(), 10*time.Second)
+// The initial group-1 range arrives on the live socket, through the handler path; the library's bookkeeping
+// moves the generation, the wait returns early and paging goes past the first page.
+func TestAGroup1RangeFromTheLiveSocketEndsTheWaitAndPagingContinues(t *testing.T) {
+	withGroup1Wait(t, 5*time.Second)
+	s := newTestSession()
+	r := newRangePager()
+	s.postHandle = r.PostHandlePublishResponse
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		s.handleMetaEvent(context.Background(), &table.LSTable{
+			LSUpsertSyncGroupThreadsRange: []*table.LSUpsertSyncGroupThreadsRange{{SyncGroup: 1, HasMoreBefore: true, MinThreadKey: 5}},
+		})
+	}()
+	start := time.Now()
+	_, stats, err, done := listWithin(t, s, r, context.Background(), 10*time.Second)
 	if !done || err != nil {
 		t.Fatalf("done=%v err=%v", done, err)
 	}
-	if r.pages < 2 {
-		t.Fatalf("paged %d time(s): the range had arrived, paging must continue past the first page", r.pages)
+	if time.Since(start) > 3*time.Second || stats["group1_range_wait_ms"] >= 3000 {
+		t.Fatalf("the range arrived at about 100 ms: the wait must end early, took %v (stat %d)", time.Since(start), stats["group1_range_wait_ms"])
 	}
-	if w := stats["group1_range_wait_ms"]; w < 90 || w > 2000 {
-		t.Fatalf("group1_range_wait_ms = %d, want about 100", w)
+	if r.pages < 2 {
+		t.Fatalf("paged %d time(s): paging must continue past the first page", r.pages)
+	}
+	// a table with no sync rows leaves the generation alone
+	other := newRangePager()
+	s2 := newTestSession()
+	s2.postHandle = other.PostHandlePublishResponse
+	s2.handleMetaEvent(context.Background(), &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 9, ThreadType: table.ONE_TO_ONE}}})
+	if other.gen != 0 {
+		t.Fatal("an ordinary table must not move the range generation")
 	}
 }
 
@@ -771,7 +799,7 @@ func TestPagingGoesAheadWhenTheGroup1RangeNeverArrives(t *testing.T) {
 	oldErr := stderr
 	stderr = &logged
 	defer func() { stderr = oldErr }()
-	r := &rangePager{delay: -1}
+	r := newRangePager()
 	_, stats, err, done := listWithin(t, newTestSession(), r, context.Background(), 5*time.Second)
 	if !done || err != nil || stats == nil {
 		t.Fatalf("a missing range must not fail the listing: done=%v err=%v", done, err)
@@ -789,7 +817,7 @@ func TestPagingGoesAheadWhenTheGroup1RangeNeverArrives(t *testing.T) {
 
 func TestCancelDuringTheGroup1RangeWait(t *testing.T) {
 	withGroup1Wait(t, time.Minute)
-	r := &rangePager{delay: -1}
+	r := newRangePager()
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
 	_, stats, err, done := listWithin(t, newTestSession(), r, ctx, 3*time.Second)

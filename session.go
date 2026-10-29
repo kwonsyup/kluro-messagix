@@ -77,6 +77,7 @@ type messagixSession struct {
 	fbToWA         map[int64]int64                                                                                    // facebook thread key -> encrypted chat id (hybrid threads)
 	folderMark     map[int64]bool                                                                                     // facebook thread keys whose latest non-empty folder is pending or spam (memory only)
 	statusMark     map[int64]bool                                                                                     // ... whose latest message request status row is 1 (memory only)
+	postHandle     func(tbl *table.LSTable)                                                                           // test seam; nil means the client's PostHandlePublishResponse
 	group1WaitMS   int                                                                                                // how long the listing waited for the initial group-1 range (the cap on a timeout), count only
 	e2eeOffline    int                                                                                                // queued E2EE messages the server said it would flush at connect (OfflineSyncPreview), count only
 	e2eeOfflineEnd bool                                                                                               // OfflineSyncCompleted seen
@@ -910,12 +911,30 @@ func (s *messagixSession) webLogout(ctx context.Context, cli *messagix.Client) {
 	logCode("info", "web_logout_attempted")
 }
 
+// postHandleTable feeds a received table to the library's sync bookkeeping.
+func (s *messagixSession) postHandleTable(tbl *table.LSTable) {
+	if s.postHandle != nil {
+		s.postHandle(tbl)
+		return
+	}
+	s.mu.Lock()
+	cli := s.client
+	s.mu.Unlock()
+	cli.PostHandlePublishResponse(tbl)
+}
+
 // handleMetaEvent forwards messagix connection events; message tables are
 // handled by handleTable in events.go.
 func (s *messagixSession) handleMetaEvent(ctx context.Context, rawEvt any) {
 	switch evt := rawEvt.(type) {
 	case *table.LSTable:
 		s.handleTable(evt)
+		// The library applies a table's sync cursors and thread ranges (and moves the
+		// range generation the listing waits on) only when told to; its own handler
+		// does the same for every table after queueing it. Not under s.mu: the call
+		// takes the library's own locks and never calls back here. It ignores a table
+		// with no sync rows, and applying one the library already applied is a no-op.
+		s.postHandleTable(evt)
 	case *messagix.ConnectedEvent, *messagix.ReconnectedEvent:
 		s.markStateDirty()
 		s.scheduleE2EE()
