@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"testing"
 	"time"
 
@@ -12,85 +11,38 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 )
 
-// silentRanges is a client for which no group-95 range update ever arrives:
-// the waits honour only their context, as the library's do.
-type silentRanges struct {
-	more          bool // the keystore reports more threads
-	initialReady  bool // the initial range wait returns at once
-	group1        *table.LSTable
-	explicit      *table.LSTable // the reply to the explicit group-95 fetch
-	explicitErr   error
-	explicitBlock bool // the explicit fetch honours only its context
-	rangeInReply  bool // the explicit reply carries the range update
-	tasks         []socket.Task
-	gen           uint64
+// pager is a group-1 thread pager that records which sync groups were asked for.
+type pager struct {
+	group1 *table.LSTable
+	groups []int64
 }
 
-func (r *silentRanges) WaitForInitialThreadRange(ctx context.Context, _ int64) error {
-	if r.initialReady {
-		return nil
-	}
-	<-ctx.Done()
-	return ctx.Err()
-}
-
-func (r *silentRanges) WaitForThreadRange(ctx context.Context, _ int64, _ uint64) error {
-	<-ctx.Done()
-	return ctx.Err()
-}
-
-func (r *silentRanges) ThreadRangeGeneration(int64) uint64 { return r.gen }
-
-func (r *silentRanges) ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error) {
-	r.tasks = append(r.tasks, tasks...)
-	if r.explicitBlock {
-		<-ctx.Done()
-		return nil, ctx.Err()
-	}
-	return r.explicit, r.explicitErr
-}
-
-func (r *silentRanges) PostHandlePublishResponse(*table.LSTable) {
-	if r.rangeInReply {
-		r.gen++
-	}
-}
-
-func (r *silentRanges) GetSyncGroupKeyStore(int64) *socket.KeyStoreData {
-	return &socket.KeyStoreData{HasMoreBefore: r.more}
-}
-
-func (r *silentRanges) FetchMoreThreads(_ context.Context, group int64) (*socket.KeyStoreData, *table.LSTable, error) {
+func (r *pager) FetchMoreThreads(_ context.Context, group int64) (*socket.KeyStoreData, *table.LSTable, error) {
+	r.groups = append(r.groups, group)
 	tbl := &table.LSTable{}
 	if group == 1 && r.group1 != nil {
 		tbl = r.group1
 	}
-	return &socket.KeyStoreData{HasMoreBefore: r.more, MinThreadKey: 7}, tbl, nil
+	return &socket.KeyStoreData{MinThreadKey: 7}, tbl, nil
 }
 
-func listWithin(t *testing.T, s *messagixSession, r threadRanges, ctx context.Context, bound time.Duration) (frames []Frame, res listingDone, err error, done bool) {
+func listWithin(t *testing.T, s *messagixSession, r threadPager, ctx context.Context, bound time.Duration) (frames []Frame, stats map[string]int, err error, done bool) {
 	t.Helper()
 	type result struct {
-		res listingDone
-		err error
+		stats map[string]int
+		err   error
 	}
 	ch := make(chan result, 1)
 	go func() {
-		d, err := s.listThreads(ctx, r, func(f Frame) int64 { frames = append(frames, f); return 0 })
-		ch <- result{d, err}
+		st, err := s.listThreads(ctx, r, func(f Frame) int64 { frames = append(frames, f); return 0 })
+		ch <- result{st, err}
 	}()
 	select {
 	case v := <-ch:
-		return frames, v.res, v.err, true
+		return frames, v.stats, v.err, true
 	case <-time.After(bound):
-		return nil, listingDone{}, nil, false
+		return nil, nil, nil, false
 	}
-}
-
-func shortWait(t *testing.T, d time.Duration) {
-	old := e2eeRangeWait
-	e2eeRangeWait = d
-	t.Cleanup(func() { e2eeRangeWait = old })
 }
 
 func threadsByID(frames []Frame) map[string]*Thread {
@@ -115,48 +67,6 @@ func wantStats(t *testing.T, got map[string]int, want map[string]int) {
 	}
 }
 
-// Group 95 is the message-requests inbox. An initial range that never arrives
-// means there are no requests: the listing is complete. A later batch that never
-// arrives, after the range said more exist, leaves known requests unread: a gap.
-func TestListingGroup95Timeouts(t *testing.T) {
-	shortWait(t, 100*time.Millisecond)
-	for name, tc := range map[string]struct {
-		r       *silentRanges
-		wantGap string
-	}{
-		"initial range absent": {&silentRanges{explicit: &table.LSTable{}}, ""},
-		"batch wait":           {&silentRanges{more: true, initialReady: true}, "requests_incomplete"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			s := newTestSession()
-			s.threads["100"] = &threadInfo{Key: 100, Kind: "user", Typed: true, Title: "Known", LastActivity: 5}
-			frames, res, err, done := listWithin(t, s, tc.r, context.Background(), 3*time.Second)
-			if !done {
-				t.Fatal("thread listing blocked on a group-95 range update that never arrives")
-			}
-			if err != nil || res.Stats == nil || res.Gap != tc.wantGap {
-				t.Fatalf("want stats and gap %q, got %+v err=%v", tc.wantGap, res, err)
-			}
-			if len(frames) == 0 || frames[0].T != TThread || frames[0].ThreadEvt.ID != "100" {
-				t.Fatalf("known thread not emitted first: %+v", frames)
-			}
-		})
-	}
-}
-
-func TestListingCancelStillWinsOverTheBound(t *testing.T) {
-	shortWait(t, time.Minute)
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() { time.Sleep(100 * time.Millisecond); cancel() }()
-	_, res, err, done := listWithin(t, newTestSession(), &silentRanges{}, ctx, 3*time.Second)
-	if !done {
-		t.Fatal("cancel did not free the listing")
-	}
-	if err == nil || res.Stats != nil || res.Gap != "" {
-		t.Fatalf("a cancelled listing must report the cancel, not stats: %+v err=%v", res, err)
-	}
-}
-
 // threads_done carries the stats object and no gap key.
 func TestThreadsDoneCarriesStats(t *testing.T) {
 	const startAndList = `{"t":"start","id":1,"cookies":{"c_user":"1","xs":"x","datr":"d"}}`
@@ -176,20 +86,6 @@ func TestThreadsDoneCarriesStats(t *testing.T) {
 	if string(b) != `{"t":"threads_done","id":2,"stats":{"a":1}}` {
 		t.Fatalf("wire = %s", b)
 	}
-	b, _ = json.Marshal(Frame{T: TThreadsDone, ID: 2, Gap: "requests_incomplete"})
-	if string(b) != `{"t":"threads_done","id":2,"gap":"requests_incomplete"}` {
-		t.Fatalf("wire = %s", b)
-	}
-	frames = runLoop(t, &fakeBackend{threadGap: "requests_incomplete"}, startAndList, `{"t":"threads","id":2}`)
-	done = nil
-	for i, f := range frames {
-		if f.ID == 2 {
-			done = &frames[i]
-		}
-	}
-	if done == nil || done.T != TThreadsDone || done.Gap != "requests_incomplete" || done.Err != "" {
-		t.Fatalf("gap answer = %+v", done)
-	}
 	b, _ = json.Marshal(Frame{T: TThreadsDone, ID: 2})
 	if string(b) != `{"t":"threads_done","id":2}` {
 		t.Fatalf("wire = %s", b)
@@ -198,8 +94,7 @@ func TestThreadsDoneCarriesStats(t *testing.T) {
 
 // A group-1 row of an encrypted-over-WA type becomes an e: thread of the right kind.
 func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
-	shortWait(t, 50*time.Millisecond)
-	r := &silentRanges{group1: &table.LSTable{
+	r := &pager{group1: &table.LSTable{
 		LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{
 			{ThreadKey: 4242, ThreadType: table.ENCRYPTED_OVER_WA_GROUP, ThreadName: "Group", LastActivityTimestampMs: 20},
 		},
@@ -212,7 +107,7 @@ func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
 		},
 		LSAddParticipantIdToGroupThread: []*table.LSAddParticipantIdToGroupThread{{ThreadKey: 4242, ContactId: 42}},
 	}}
-	frames, res, err, done := listWithin(t, newTestSession(), r, context.Background(), 3*time.Second)
+	frames, stats, err, done := listWithin(t, newTestSession(), r, context.Background(), 3*time.Second)
 	if !done || err != nil {
 		t.Fatalf("done=%v err=%v", done, err)
 	}
@@ -228,7 +123,7 @@ func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
 	if got["7171"] != nil || got["e:7171"] != nil {
 		t.Fatal("a plain existence row must not create a thread")
 	}
-	wantStats(t, res.Stats, map[string]int{
+	wantStats(t, stats, map[string]int{
 		"group1_threads": 3, "group1_encrypted_rows": 3, "hybrid_mappings": 0, "cutover_links": 0,
 		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_unlisted": 0,
 	})
@@ -237,7 +132,6 @@ func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
 // A cutover link or hybrid mapping whose chat no table named is counted in
 // encrypted_unlisted and not emitted: nothing is synthesized from the links.
 func TestKnownEncryptedKeyWithNoTableRowIsCountedNotEmitted(t *testing.T) {
-	shortWait(t, 50*time.Millisecond)
 	s := newTestSession()
 	s.threads["100"] = &threadInfo{Key: 100, Kind: "user", Typed: true, Participants: []int64{1, 100}}
 	s.cutover[1100] = 100                                                                                           // no row for e:1100
@@ -245,7 +139,7 @@ func TestKnownEncryptedKeyWithNoTableRowIsCountedNotEmitted(t *testing.T) {
 	s.threads["e:1600"] = &threadInfo{Key: 1600, Enc: true, Kind: "user", Typed: true, Participants: []int64{1600}} // listed
 	s.cutover[1600] = 600
 
-	frames, res, err, done := listWithin(t, s, &silentRanges{initialReady: true}, context.Background(), 3*time.Second)
+	frames, stats, err, done := listWithin(t, s, &pager{}, context.Background(), 3*time.Second)
 	if !done || err != nil {
 		t.Fatalf("done=%v err=%v", done, err)
 	}
@@ -256,7 +150,7 @@ func TestKnownEncryptedKeyWithNoTableRowIsCountedNotEmitted(t *testing.T) {
 	if got["e:1600"] == nil {
 		t.Fatal("the already-known encrypted thread must still be listed")
 	}
-	wantStats(t, res.Stats, map[string]int{
+	wantStats(t, stats, map[string]int{
 		"group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 1, "cutover_links": 2,
 		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "encrypted_unlisted": 2,
 	})
@@ -276,78 +170,291 @@ func TestStateWithHybridKindStillLoads(t *testing.T) {
 	}
 }
 
-func requestTable() *table.LSTable {
-	return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{
-		{ThreadKey: 8181, ThreadType: table.ONE_TO_ONE, LastActivityTimestampMs: 30},
-	}}
-}
-
-// A resumed session never sends the initial group-95 fetch, so when the initial
-// wait expires the helper asks once itself.
-func TestExplicitRequestsFetchWhenTheInitialWaitExpires(t *testing.T) {
-	shortWait(t, 100*time.Millisecond)
-
-	// One fetch with the library's initial-sync parameters; a request thread is emitted;
-	// the range says no more, so the listing is complete.
-	r := &silentRanges{explicit: requestTable(), rangeInReply: true}
-	frames, res, err, done := listWithin(t, newTestSession(), r, context.Background(), 3*time.Second)
-	if !done || err != nil || res.Gap != "" {
-		t.Fatalf("done=%v err=%v res=%+v", done, err, res)
+// Message requests (sync group 95) are never listed: the listing pages group 1 only.
+func TestListingNeverTouchesGroup95(t *testing.T) {
+	r := &pager{}
+	_, stats, err, done := listWithin(t, newTestSession(), r, context.Background(), 3*time.Second)
+	if !done || err != nil || stats == nil {
+		t.Fatalf("done=%v err=%v stats=%v", done, err, stats)
 	}
-	if u := threadsByID(frames)["8181"]; u == nil || u.Kind != "user" {
-		t.Fatalf("request thread = %+v", threadsByID(frames))
+	if len(r.groups) == 0 {
+		t.Fatal("group 1 was never paged")
 	}
-	if len(r.tasks) != 1 {
-		t.Fatalf("want exactly one explicit fetch, got %d", len(r.tasks))
-	}
-	task, ok := r.tasks[0].(*socket.FetchThreadsTask)
-	if !ok || *task != (socket.FetchThreadsTask{ParentThreadKey: -1, ReferenceActivityTimestamp: 9999999999999, SyncGroup: 95}) {
-		t.Fatalf("explicit task = %+v", r.tasks[0])
-	}
-
-	// A range that says more exist and a later batch that never arrives: known requests are unread.
-	r = &silentRanges{explicit: requestTable(), rangeInReply: true, more: true}
-	_, res, err, done = listWithin(t, newTestSession(), r, context.Background(), 3*time.Second)
-	if !done || err != nil || res.Gap != "requests_incomplete" || len(r.tasks) != 1 {
-		t.Fatalf("done=%v err=%v res=%+v fetches=%d", done, err, res, len(r.tasks))
-	}
-
-	// The initial range arrived on its own: no explicit fetch.
-	r = &silentRanges{initialReady: true}
-	if _, _, _, done = listWithin(t, newTestSession(), r, context.Background(), 3*time.Second); !done || len(r.tasks) != 0 {
-		t.Fatalf("done=%v fetches=%d, want none", done, len(r.tasks))
+	for _, g := range r.groups {
+		if g != 1 {
+			t.Fatalf("listing asked for sync group %d", g)
+		}
 	}
 }
 
-func TestExplicitRequestsFetchOutcomes(t *testing.T) {
-	shortWait(t, 100*time.Millisecond)
-	for name, tc := range map[string]struct {
-		r       *silentRanges
-		wantGap string
-	}{
-		"error":             {&silentRanges{explicitErr: errors.New("boom")}, "requests_incomplete"},
-		"timeout":           {&silentRanges{explicitBlock: true}, "requests_incomplete"},
-		"empty reply":       {&silentRanges{explicit: &table.LSTable{}}, ""},
-		"range, no rows":    {&silentRanges{explicit: &table.LSTable{}, rangeInReply: true}, ""},
-		"threads, no range": {&silentRanges{explicit: requestTable()}, ""},
+func TestListingCancelStillReportsTheCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, stats, err, done := listWithin(t, newTestSession(), &pager{}, ctx, 3*time.Second)
+	if !done || err == nil || stats != nil {
+		t.Fatalf("a cancelled listing must report the cancel, not stats: done=%v stats=%v err=%v", done, stats, err)
+	}
+}
+
+// connectorWouldQualify mirrors the connector's threadQualified (messenger_runner.go on main):
+// a one-to-one thread qualifies when it names another person, typed or not; a group needs Typed.
+func connectorWouldQualify(th *Thread) bool {
+	switch th.Kind {
+	case "user":
+		for _, p := range th.Participants {
+			if !p.Self {
+				return true
+			}
+		}
+		return false
+	case "group":
+		return th.Typed
+	}
+	return false
+}
+
+func typedOf(frames []Frame, id string) (typed, found bool) {
+	for i := len(frames) - 1; i >= 0; i-- {
+		if f := frames[i]; f.T == TThread && f.ThreadEvt.ID == id {
+			return f.ThreadEvt.Typed, true
+		}
+	}
+	return false, false
+}
+
+func threadRow(key int64, folder string) *table.LSTable {
+	return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: key, ThreadType: table.ONE_TO_ONE, FolderName: folder, ThreadName: "Stranger", LastActivityTimestampMs: 77}}}
+}
+
+// A thread row in the pending or spam folder, or a status-1 request row, leaves the
+// thread untyped whatever its type; the kind is still set.
+func TestUnacceptedThreadsAreNeverTyped(t *testing.T) {
+	for name, tbl := range map[string]*table.LSTable{
+		"pending": threadRow(500, "pending"),
+		"spam":    threadRow(500, "spam"),
+		"status 1": {
+			LSDeleteThenInsertThread:         []*table.LSDeleteThenInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, ThreadName: "Stranger", LastActivityTimestampMs: 77}},
+			LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 500, MessageRequestStatus: 1}},
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, res, err, done := listWithin(t, newTestSession(), tc.r, context.Background(), 3*time.Second)
-			if !done || err != nil || res.Gap != tc.wantGap || len(tc.r.tasks) != 1 {
-				t.Fatalf("done=%v err=%v res=%+v fetches=%d", done, err, res, len(tc.r.tasks))
+			s := newTestSession()
+			frames := s.handleTableFrames(tbl)
+			if typed, found := typedOf(frames, "500"); !found || typed {
+				t.Fatalf("a request thread must be emitted untyped: typed=%v found=%v", typed, found)
+			}
+			// the real kind and participants stay in memory for when it is accepted
+			if th := s.threads["500"]; th == nil || th.Kind != "user" || len(th.Participants) == 0 {
+				t.Fatalf("the real kind and participants are kept in memory: %+v", th)
+			}
+			// the wire frame qualifies for nothing: no kind, no type, no participants
+			check := func(where string, th *Thread) {
+				t.Helper()
+				if th == nil || th.Kind != "" || th.Typed || th.Title != "" || th.LastActivity != 77 || len(th.Participants) != 0 || connectorWouldQualify(th) {
+					t.Fatalf("%s: a request thread must be emitted with only its id and activity: %+v", where, th)
+				}
+			}
+			for _, f := range frames {
+				if f.T == TThread && f.ThreadEvt.ID == "500" {
+					check("row", f.ThreadEvt)
+				}
+			}
+			for _, f := range s.sortedThreadFrames() {
+				if f.ThreadEvt.ID == "500" {
+					check("listing", f.ThreadEvt)
+				}
+			}
+			later := s.handleTableFrames(&table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, ThreadName: "N"}}})
+			for _, f := range later {
+				if f.T == TThread && f.ThreadEvt.ID == "500" {
+					check("later folderless row", f.ThreadEvt)
+				}
 			}
 		})
 	}
 }
 
-func TestExplicitRequestsFetchHonoursCancel(t *testing.T) {
-	shortWait(t, 300*time.Millisecond)
-	// The initial wait expires at 300 ms; the cancel lands inside the blocked explicit fetch.
-	r := &silentRanges{explicitBlock: true}
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() { time.Sleep(450 * time.Millisecond); cancel() }()
-	_, res, err, done := listWithin(t, newTestSession(), r, ctx, 3*time.Second)
-	if !done || err == nil || res.Gap != "" || len(r.tasks) != 1 {
-		t.Fatalf("a cancelled listing must report the cancel after one fetch: done=%v err=%v res=%+v fetches=%d", done, err, res, len(r.tasks))
+// A different non-empty folder, or a request status other than 1, clears the mark and
+// re-emits the thread typed. An empty folder neither sets nor clears it.
+func TestAcceptingARequestTypesAndReemitsTheThread(t *testing.T) {
+	s := newTestSession()
+	s.handleTableFrames(threadRow(500, "pending"))
+	// an empty folder does not clear
+	frames := s.handleTableFrames(threadRow(500, ""))
+	if typed, _ := typedOf(frames, "500"); typed {
+		t.Fatal("an empty folder must not clear the mark")
+	}
+	// an inbox row clears and re-emits typed
+	frames = s.handleTableFrames(threadRow(500, "inbox"))
+	if typed, found := typedOf(frames, "500"); !found || !typed {
+		t.Fatalf("an inbox row must type and re-emit: typed=%v found=%v", typed, found)
+	}
+	for _, f := range frames {
+		if f.T == TThread && f.ThreadEvt.ID == "500" && (f.ThreadEvt.Kind != "user" || f.ThreadEvt.Title != "Stranger" || !connectorWouldQualify(f.ThreadEvt)) {
+			t.Fatalf("acceptance must re-emit the real kind and participants: %+v", f.ThreadEvt)
+		}
+	}
+	// an empty folder does not set it either
+	frames = s.handleTableFrames(threadRow(500, ""))
+	if typed, _ := typedOf(frames, "500"); !typed {
+		t.Fatal("an empty folder must not mark a thread")
+	}
+	// a status-1 row marks an existing typed thread and re-emits it untyped; status 0 clears it
+	frames = s.handleTableFrames(&table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 500, MessageRequestStatus: 1}}})
+	if typed, found := typedOf(frames, "500"); !found || typed {
+		t.Fatalf("a status-1 row must untype and re-emit: typed=%v found=%v", typed, found)
+	}
+	frames = s.handleTableFrames(&table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 500, MessageRequestStatus: 0}}})
+	if typed, found := typedOf(frames, "500"); !found || !typed {
+		t.Fatalf("status 0 must type and re-emit: typed=%v found=%v", typed, found)
+	}
+	// the mark is memory only: a new session knows nothing of it
+	if fresh := newTestSession(); len(fresh.folderMark)+len(fresh.statusMark) != 0 {
+		t.Fatal("the mark must not be persisted")
+	}
+}
+
+// Encrypted threads are unchanged by the mark.
+func TestEncryptedThreadsAreNotAffectedByTheMark(t *testing.T) {
+	s := newTestSession()
+	frames := s.handleTableFrames(&table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{
+		{ThreadKey: 4242, ThreadType: table.ENCRYPTED_OVER_WA_ONE_TO_ONE, FolderName: "pending"},
+	}})
+	if typed, found := typedOf(frames, "e:4242"); !found || !typed {
+		t.Fatalf("encrypted rows are not covered by the mark: typed=%v found=%v", typed, found)
+	}
+}
+
+// A spam or pending folder is only cleared by a folder, and a request status of 0 only clears what a
+// status row set: spam plus a status-0 row in one batch stays unaccepted, as in the library.
+func TestSpamFolderIsNotClearedByAStatusZeroRow(t *testing.T) {
+	s := newTestSession()
+	frames := s.handleTableFrames(&table.LSTable{
+		LSDeleteThenInsertThread:         []*table.LSDeleteThenInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, FolderName: "spam"}},
+		LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 500, MessageRequestStatus: 0}},
+	})
+	for _, f := range frames {
+		if f.T == TThread && f.ThreadEvt.ID == "500" && (f.ThreadEvt.Kind != "" || f.ThreadEvt.Typed || len(f.ThreadEvt.Participants) != 0) {
+			t.Fatalf("spam with a status-0 row must stay unaccepted: %+v", f.ThreadEvt)
+		}
+	}
+	// Each source clears only itself: a status-1 row then a folder row leaves it unaccepted until both clear.
+	s.handleTableFrames(&table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 500, MessageRequestStatus: 1}}})
+	frames = s.handleTableFrames(threadRow(500, "inbox"))
+	if th := lastThread(frames, "500"); th != nil && th.Kind != "" {
+		t.Fatalf("an inbox folder must not clear the status mark: %+v", th)
+	}
+	frames = s.handleTableFrames(&table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 500, MessageRequestStatus: 0}}})
+	if th := lastThread(frames, "500"); th == nil || th.Kind != "user" || !th.Typed {
+		t.Fatalf("both sources cleared: the thread is accepted again: %+v", th)
+	}
+}
+
+func lastThread(frames []Frame, id string) *Thread {
+	for i := len(frames) - 1; i >= 0; i-- {
+		if f := frames[i]; f.T == TThread && f.ThreadEvt.ID == id {
+			return f.ThreadEvt
+		}
+	}
+	return nil
+}
+
+// A live rejection that lands between the listing's snapshot of ids and its emit of a thread
+// must not be undone by a stale typed frame.
+func TestListingNeverEmitsAnOlderMarkThanALiveFrame(t *testing.T) {
+	s := newTestSession()
+	s.handleTableFrames(threadRow(500, "inbox"))
+	var live []Frame
+	s.beforeListEmit = func(id string) {
+		if id == "500" {
+			live = s.handleTableFrames(threadRow(500, "pending")) // the rejection, after the snapshot
+		}
+	}
+	var listed []Frame
+	if err := s.emitKnownThreads(context.Background(), func(f Frame) int64 { listed = append(listed, f); return 0 }); err != nil {
+		t.Fatal(err)
+	}
+	if th := lastThread(live, "500"); th == nil || th.Kind != "" {
+		t.Fatalf("the live frame is the rejected shape: %+v", th)
+	}
+	th := lastThread(listed, "500")
+	if th == nil || th.Kind != "" || th.Typed || len(th.Participants) != 0 {
+		t.Fatalf("the listing must emit the unaccepted shape, not a stale typed frame: %+v", th)
+	}
+}
+
+// Live tables and listing pages are built and emitted inside one hold of the session lock, so a later
+// row cannot land between a frame's build and its emit; thread frames stay ahead of their messages.
+func TestTablesAreEmittedUnderTheSameLockAsTheirBuild(t *testing.T) {
+	tbl := func() *table.LSTable {
+		return &table.LSTable{
+			LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, FolderName: "inbox"}},
+			LSInsertMessage:          []*table.LSInsertMessage{{ThreadKey: 500, MessageId: "mid.1", SenderId: 500, Text: "hi", TimestampMs: 1}},
+		}
+	}
+	for name, run := range map[string]func(s *messagixSession, emit emitFunc){
+		"live table": func(s *messagixSession, emit emitFunc) { s.emit = emit; s.handleTable(tbl()) },
+		"listing page": func(s *messagixSession, emit emitFunc) {
+			if _, err := s.listThreads(context.Background(), &pager{group1: tbl()}, emit); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newTestSession()
+			var order []string
+			emit := func(f Frame) int64 {
+				if s.mu.TryLock() {
+					s.mu.Unlock()
+					t.Errorf("a %s frame was emitted outside the lock that built it", f.T)
+				}
+				order = append(order, f.T)
+				return 0
+			}
+			run(s, emit)
+			var types []string
+			for _, o := range order {
+				if o == TThread || o == TMessage {
+					types = append(types, o)
+				}
+			}
+			if len(types) < 2 || types[0] != TThread || types[1] != TMessage {
+				t.Fatalf("the thread frame must come ahead of its message: %v", order)
+			}
+		})
+	}
+}
+
+// Start's initial table is applied before the connection opens but its thread frames are emitted
+// after ready; a live pending row in between must not be undone by the older frame.
+func TestInitialThreadFramesAreBuiltAtEmitTime(t *testing.T) {
+	s := newTestSession()
+	snapshot := s.handleTableFrames(&table.LSTable{
+		LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, FolderName: "inbox", ThreadName: "Stranger", LastActivityTimestampMs: 77}},
+		LSInsertMessage:          []*table.LSInsertMessage{{ThreadKey: 500, MessageId: "mid.1", SenderId: 500, Text: "hi", TimestampMs: 1}},
+	})
+	emitInitial := s.initialEmitter(snapshot)
+	if emitInitial == nil {
+		t.Fatal("an initial table with threads must yield an emitter")
+	}
+	// the rejection arrives after Start's snapshot, before main emits the initial frames
+	s.handleTableFrames(threadRow(500, "pending"))
+	var got []Frame
+	emitInitial(func(f Frame) int64 { got = append(got, f); return 0 })
+	th := lastThread(got, "500")
+	if th == nil || th.Kind != "" || th.Typed || th.Title != "" || len(th.Participants) != 0 || th.LastActivity != 77 {
+		t.Fatalf("the initial frame must carry the unaccepted shape, not the Start-time snapshot: %+v", th)
+	}
+	// the thread frame is still ahead of the message, and the message is emitted once
+	var order []string
+	for _, f := range got {
+		order = append(order, f.T)
+	}
+	if len(order) != 2 || order[0] != TThread || order[1] != TMessage {
+		t.Fatalf("order = %v, want thread then message", order)
+	}
+	// a table with nothing to emit yields no emitter
+	if s.initialEmitter(nil) != nil {
+		t.Fatal("no frames, no emitter")
 	}
 }

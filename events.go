@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"strconv"
 	"sync"
 
@@ -10,6 +11,12 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
+)
+
+// Thread folders that mean "not an accepted chat": a message request, or spam.
+const (
+	folderPending = "pending"
+	folderSpam    = "spam"
 )
 
 const msgIndexCap = 50000
@@ -29,14 +36,31 @@ func (c *pageCollector) finish() { c.once.Do(func() { close(c.done) }) }
 // messages, edits and unsends. History pages requested through a collector are
 // routed to it instead.
 func (s *messagixSession) handleTable(tbl *table.LSTable) {
-	for _, f := range s.handleTableFrames(tbl) {
-		s.emit(f)
+	s.handleTableEmit(tbl, s.emit)
+}
+
+// handleTableEmit builds the frames of a table and emits them inside one hold of
+// s.mu, thread frames ahead of their messages as built, so a later row (a live
+// rejection, say) cannot land between a frame's build and its emit.
+func (s *messagixSession) handleTableEmit(tbl *table.LSTable, emit emitFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, f := range s.buildTableFramesLocked(tbl) {
+		emit(f)
 	}
 }
 
-func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame) {
+// handleTableFrames builds the frames of a table and returns them for the caller
+// to emit; use handleTableEmit where emit order against later rows matters.
+func (s *messagixSession) handleTableFrames(tbl *table.LSTable) []Frame {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.buildTableFramesLocked(tbl)
+}
+
+// buildTableFramesLocked applies a table to the session and returns its frames.
+// The caller holds s.mu.
+func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []Frame) {
 	dirty := false
 	for _, c := range tbl.LSCreateOpenToE2EEThreadLink {
 		if s.cutover[c.ArmadilloThreadID] != c.OpenThreadID {
@@ -68,6 +92,49 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame)
 	}
 
 	touched := map[string]bool{}
+	// A thread row in the "pending" or "spam" folder, or a message request row with
+	// status 1, marks the thread unaccepted: it is emitted with Typed=false whatever
+	// its type, so the connector qualifies nothing from it. Any other non-empty
+	// folder, or a request status other than 1, clears the mark and re-emits the
+	// thread typed; an empty folder does neither. The mark is memory only: after a
+	// restart a request the listing does not type stays untyped.
+	// Two sources are tracked apart: the latest non-empty folder (pending or spam)
+	// and the latest request status row. A status row only clears what a status row
+	// set, and a folder only clears what a folder set, so a spam folder stays
+	// unaccepted next to a status-0 row, as in the library.
+	set := func(marks map[int64]bool, key int64, on bool) {
+		before := s.unacceptedLocked(key)
+		if on {
+			marks[key] = true
+		} else {
+			delete(marks, key)
+		}
+		if s.unacceptedLocked(key) != before && s.threads[wireID(false, key)] != nil {
+			touched[wireID(false, key)] = true
+		}
+	}
+	markFolder := func(key int64, folder string) {
+		switch folder {
+		case "":
+		case folderPending, folderSpam:
+			set(s.folderMark, key, true)
+		default:
+			set(s.folderMark, key, false)
+		}
+	}
+	for _, th := range tbl.LSDeleteThenInsertThread {
+		markFolder(th.ThreadKey, th.FolderName)
+	}
+	for _, th := range tbl.LSUpdateOrInsertThread {
+		markFolder(th.ThreadKey, th.FolderName)
+	}
+	for _, th := range tbl.LSVerifyThreadExists {
+		markFolder(th.ThreadKey, th.FolderName)
+	}
+	for _, r := range tbl.LSDeleteThenInsertMessageRequest {
+		// MessageRequestStatus 1 means the thread is in the pending folder.
+		set(s.statusMark, r.ThreadKey, r.MessageRequestStatus == 1)
+	}
 	upsertThread := func(key int64, typ table.ThreadType, name string, last int64) {
 		originalKey := key
 		s.rowKeys[originalKey] = true
@@ -232,6 +299,14 @@ func threadFrame(t Thread) Frame { return Frame{T: TThread, ThreadEvt: &t} }
 // wireThreadLocked builds the protocol thread. A one-to-one thread names the
 // other person; an encrypted thread names the open thread it continues.
 func (s *messagixSession) wireThreadLocked(t *threadInfo) Thread {
+	if !t.Enc && s.unacceptedLocked(t.Key) {
+		// A message request qualifies for nothing: the connector imports any
+		// one-to-one thread that names another person, typed or not, so the frame
+		// carries no kind, no type, no participants and no title (usually the
+		// stranger's name). The real ones stay in
+		// memory and go out when a later row accepts the thread.
+		return Thread{ID: wireID(false, t.Key), LastActivity: t.LastActivity}
+	}
 	out := Thread{ID: wireID(t.Enc, t.Key), Kind: t.Kind, Typed: t.Typed, Title: t.Title, Encrypted: t.Enc, LastActivity: t.LastActivity}
 	if t.Enc {
 		if open, ok := s.cutover[t.Key]; ok {
@@ -253,6 +328,75 @@ func (s *messagixSession) wireThread(t *threadInfo) Thread {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.wireThreadLocked(t)
+}
+
+// unacceptedLocked reports whether a facebook thread is a message request or
+// spam by either source. The caller holds s.mu.
+func (s *messagixSession) unacceptedLocked(key int64) bool {
+	return s.folderMark[key] || s.statusMark[key]
+}
+
+// emitKnownThreads emits a thread frame for every thread the helper knows. Each
+// frame is built from the current state inside the lock that also covers its
+// emit, so a listing never emits an older mark than a live frame already did.
+func (s *messagixSession) emitKnownThreads(ctx context.Context, emit emitFunc) error {
+	s.mu.Lock()
+	ids := make([]string, 0, len(s.threads))
+	for id := range s.threads {
+		ids = append(ids, id)
+	}
+	s.mu.Unlock()
+	return s.emitThreadIDs(ctx, ids, emit)
+}
+
+// initialEmitter turns the frames Start built from the initial table into an
+// emitter that runs after ready: the thread frames are rebuilt from current state
+// at emit time (so a live rejection in between is not undone), then the other
+// frames follow in their built order.
+func (s *messagixSession) initialEmitter(frames []Frame) initialEmit {
+	var ids []string
+	var rest []Frame
+	seen := map[string]bool{}
+	for _, f := range frames {
+		if f.T != TThread {
+			rest = append(rest, f)
+		} else if !seen[f.ThreadEvt.ID] {
+			seen[f.ThreadEvt.ID] = true
+			ids = append(ids, f.ThreadEvt.ID)
+		}
+	}
+	if len(ids) == 0 && len(rest) == 0 {
+		return nil
+	}
+	return func(emit emitFunc) {
+		ctx := s.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		_ = s.emitThreadIDs(ctx, ids, emit)
+		for _, f := range rest {
+			emit(f)
+		}
+	}
+}
+
+// emitThreadIDs emits a thread frame for each id, built from the current state
+// inside the lock that covers its emit.
+func (s *messagixSession) emitThreadIDs(ctx context.Context, ids []string, emit emitFunc) error {
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if s.beforeListEmit != nil {
+			s.beforeListEmit(id)
+		}
+		s.mu.Lock()
+		if t := s.threads[id]; t != nil {
+			emit(threadFrame(s.wireThreadLocked(t)))
+		}
+		s.mu.Unlock()
+	}
+	return nil
 }
 
 func (s *messagixSession) sortedThreadFrames() []Frame {

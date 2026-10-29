@@ -145,8 +145,8 @@ func TestLogoutOnlyLoadsWebStateWithoutRegisteringOrConnecting(t *testing.T) {
 	}
 	ready, initial, err := s.Start(t.Context(), rec.emit, hub, map[string]string{"c_user": "1", "xs": "test-cookie", "datr": "test-device"}, state, "logout_only", "")
 	t.Cleanup(s.Stop)
-	if err != nil || ready.Self != "1" || len(initial) != 0 {
-		t.Fatalf("start: ready=%+v initial=%d err=%v", ready, len(initial), err)
+	if err != nil || ready.Self != "1" || initial != nil {
+		t.Fatalf("start: ready=%+v initial=%v err=%v", ready, initial != nil, err)
 	}
 	if s.client == nil || s.client.GetHTTP() == nil || s.client.IsConnected() {
 		t.Fatal("logout_only needs only a web HTTP client")
@@ -233,10 +233,10 @@ func TestLogoutWaitsForExistingWorkAndClosesAdmission(t *testing.T) {
 
 type cancellableListingBackend struct{ fakeBackend }
 
-func (b *cancellableListingBackend) Threads(ctx context.Context, emit emitFunc) (listingDone, error) {
+func (b *cancellableListingBackend) Threads(ctx context.Context, emit emitFunc) (map[string]int, error) {
 	emit(threadFrame(Thread{ID: "first-batch", Kind: "group"}))
 	<-ctx.Done()
-	return listingDone{}, ctx.Err()
+	return nil, ctx.Err()
 }
 
 func TestStopAndLogoutCancelListingAfterFirstBatch(t *testing.T) {

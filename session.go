@@ -69,21 +69,24 @@ type messagixSession struct {
 	selfID        int64
 	selfName      string
 
-	threads      map[string]*threadInfo // by wire id
-	participants map[int64][]int64      // participant rows waiting for their thread
-	names        map[int64]string
-	cutover      map[int64]int64   // encrypted chat id -> its pre-encryption (open) thread key
-	fbToWA       map[int64]int64   // facebook thread key -> encrypted chat id (hybrid threads)
-	rowKeys      map[int64]bool    // thread rows seen this run (counts only)
-	encRowKeys   map[int64]bool    // ... of an encrypted-over-WA type
-	msgIndex     map[string]string // message id -> wire thread id
-	msgOrder     []string
-	collectors   map[int64]*pageCollector
-	lastFullRec  time.Time
-	stopping     bool
-	stopped      bool
-	logoutOnly   bool
-	platform     string
+	threads        map[string]*threadInfo // by wire id
+	participants   map[int64][]int64      // participant rows waiting for their thread
+	names          map[int64]string
+	cutover        map[int64]int64   // encrypted chat id -> its pre-encryption (open) thread key
+	fbToWA         map[int64]int64   // facebook thread key -> encrypted chat id (hybrid threads)
+	folderMark     map[int64]bool    // facebook thread keys whose latest non-empty folder is pending or spam (memory only)
+	statusMark     map[int64]bool    // ... whose latest message request status row is 1 (memory only)
+	beforeListEmit func(id string)   // test seam: runs between the listing's snapshot of ids and its emit of one
+	rowKeys        map[int64]bool    // thread rows seen this run (counts only)
+	encRowKeys     map[int64]bool    // ... of an encrypted-over-WA type
+	msgIndex       map[string]string // message id -> wire thread id
+	msgOrder       []string
+	collectors     map[int64]*pageCollector
+	lastFullRec    time.Time
+	stopping       bool
+	stopped        bool
+	logoutOnly     bool
+	platform       string
 
 	lastState       time.Time
 	lastStateBlob   []byte
@@ -127,6 +130,8 @@ func newSession() *messagixSession {
 		names:        map[int64]string{},
 		cutover:      map[int64]int64{},
 		fbToWA:       map[int64]int64{},
+		folderMark:   map[int64]bool{},
+		statusMark:   map[int64]bool{},
 		rowKeys:      map[int64]bool{},
 		encRowKeys:   map[int64]bool{},
 		msgIndex:     map[string]string{},
@@ -148,7 +153,7 @@ type savedState struct {
 	FBToWA        map[int64]int64       `json:"fb_to_wa,omitempty"`
 }
 
-func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub, cookieMap map[string]string, state []byte, mode, platform string) (Ready, []Frame, error) {
+func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub, cookieMap map[string]string, state []byte, mode, platform string) (Ready, initialEmit, error) {
 	if mode != "" && mode != "logout_only" {
 		return Ready{}, nil, errCode("bad_request")
 	}
@@ -239,9 +244,9 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 
 	// The initial table's threads are returned with the ready answer; its
 	// messages are emitted as live (idempotent) once the loop is running.
-	var frames []Frame
+	var emitInitial initialEmit
 	if initial != nil {
-		frames = s.handleTableFrames(initial)
+		emitInitial = s.initialEmitter(s.handleTableFrames(initial))
 	}
 	if err := cli.Connect(s.ctx); err != nil {
 		logCode("warn", "connect_failed")
@@ -252,7 +257,7 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 	ready := Ready{Self: strconv.FormatInt(s.selfID, 10), Name: s.selfName, History: s.checkHistory(ctx)}
 	s.markStateDirty()
 	logCode("info", "session_started")
-	return ready, frames, nil
+	return ready, emitInitial, nil
 }
 
 // restore loads everything from a previous state blob except the messagix
