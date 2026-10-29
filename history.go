@@ -395,7 +395,7 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit
 // own page fetch does; nothing is written to the library.
 func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit emitFunc) (gap string, err error) {
 	const group = 1
-	ref := socket.FetchThreadsTask{ParentThreadKey: -1, ReferenceThreadKey: 0, ReferenceActivityTimestamp: 9999999999999}
+	ref := socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, ReferenceThreadKey: 0, ReferenceActivityTimestamp: 9999999999999}
 	for batch := 0; batch < threadBatchLimit; batch++ {
 		if err := ctx.Err(); err != nil {
 			return "", err
@@ -421,14 +421,14 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		rng := group1Range(tbl)
+		rng := group1Range(tbl, inboxParentKey)
 		if rng == nil {
 			return gapInboxIncomplete, nil
 		}
 		if !rng.HasMoreBefore {
 			return "", nil
 		}
-		next := socket.FetchThreadsTask{ParentThreadKey: rng.ParentThreadKey, ReferenceThreadKey: rng.MinThreadKey, ReferenceActivityTimestamp: rng.MinLastActivityTimestampMS}
+		next := socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, ReferenceThreadKey: rng.MinThreadKey, ReferenceActivityTimestamp: rng.MinLastActivityTimestampMS}
 		if next.ParentThreadKey == ref.ParentThreadKey && next.ReferenceThreadKey == ref.ReferenceThreadKey && next.ReferenceActivityTimestamp == ref.ReferenceActivityTimestamp {
 			return gapInboxIncomplete, nil
 		}
@@ -442,11 +442,18 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 	return gapInboxIncomplete, nil
 }
 
-// group1Range is the last sync-group-1 thread range row of a reply, or nil.
-func group1Range(tbl *table.LSTable) *table.LSUpsertSyncGroupThreadsRange {
+// inboxParentKey is the parent thread key of the main inbox: the only parent the walk
+// requests. Other parent keys of sync group 1 (configs.ParentThreadKeys) are not walked.
+const inboxParentKey = -1
+
+// group1Range is the sync-group-1 thread range row of a reply for the given parent
+// key, or nil. Rows for other parents say nothing about this walk: they neither
+// continue nor complete it (their threads are still emitted with the table). If a
+// reply carries several rows for the parent, the last one wins.
+func group1Range(tbl *table.LSTable, parent int64) *table.LSUpsertSyncGroupThreadsRange {
 	var out *table.LSUpsertSyncGroupThreadsRange
 	for _, r := range tbl.LSUpsertSyncGroupThreadsRange {
-		if r.SyncGroup == 1 {
+		if r.SyncGroup == 1 && r.ParentThreadKey == parent {
 			out = r
 		}
 	}

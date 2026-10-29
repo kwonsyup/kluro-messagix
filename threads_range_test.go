@@ -46,7 +46,7 @@ func (r *pager) ExecuteTasks(_ context.Context, tasks ...socket.Task) (*table.LS
 	if r.group1 != nil {
 		tbl = r.group1
 	}
-	tbl.LSUpsertSyncGroupThreadsRange = append(tbl.LSUpsertSyncGroupThreadsRange, &table.LSUpsertSyncGroupThreadsRange{SyncGroup: 1, HasMoreBefore: false})
+	tbl.LSUpsertSyncGroupThreadsRange = append(tbl.LSUpsertSyncGroupThreadsRange, &table.LSUpsertSyncGroupThreadsRange{SyncGroup: 1, ParentThreadKey: -1, HasMoreBefore: false})
 	return tbl, nil
 }
 
@@ -309,6 +309,45 @@ func TestWalkEndsIncompleteWithoutAProgressingRange(t *testing.T) {
 			t.Fatalf("done=%v err=%v gap=%q requests=%d, want %d", done, err, res.Gap, len(r.tasks), bound)
 		}
 	})
+}
+
+// Only the inbox parent's own row continues or completes the walk. A competing group-1 row for another parent, before
+// or after it, neither completes the inbox early nor redirects the next request into that folder; with several rows for
+// the inbox parent the last one wins.
+func TestWalkUsesOnlyTheRequestedParentsRangeRow(t *testing.T) {
+	other := func(more bool) *table.LSUpsertSyncGroupThreadsRange { return rangeRow(more, 7, 55, 1) }
+	for name, tc := range map[string]struct {
+		pages    []*table.LSTable
+		wantGap  string
+		requests int
+	}{
+		"inbox more, then other done":  {[]*table.LSTable{page(101, rangeRow(true, -1, 90, 5000), other(false)), page(102, rangeRow(false, -1, 80, 4000))}, "", 2},
+		"other done, then inbox more":  {[]*table.LSTable{page(101, other(false), rangeRow(true, -1, 90, 5000)), page(102, rangeRow(false, -1, 80, 4000))}, "", 2},
+		"other more does not redirect": {[]*table.LSTable{page(101, rangeRow(true, -1, 90, 5000), other(true)), page(102, rangeRow(false, -1, 80, 4000))}, "", 2},
+		"inbox done, other more":       {[]*table.LSTable{page(101, rangeRow(false, -1, 90, 5000), other(true))}, "", 1},
+		"only another parent":          {[]*table.LSTable{page(101, other(false))}, "inbox_incomplete", 1},
+		"only another parent, more":    {[]*table.LSTable{page(101, other(true))}, "inbox_incomplete", 1},
+		"several inbox rows, last":     {[]*table.LSTable{page(101, rangeRow(true, -1, 90, 5000), rangeRow(false, -1, 80, 4000))}, "", 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := &pager{pages: tc.pages}
+			frames, res, err, done := listGap(t, newTestSession(), r, context.Background(), 10*time.Second)
+			if !done || err != nil || res.Gap != tc.wantGap || len(r.tasks) != tc.requests {
+				t.Fatalf("done=%v err=%v gap=%q requests=%d, want gap %q and %d requests", done, err, res.Gap, len(r.tasks), tc.wantGap, tc.requests)
+			}
+			for _, task := range r.tasks {
+				if task.ParentThreadKey != -1 {
+					t.Fatalf("a request was redirected to parent %d", task.ParentThreadKey)
+				}
+			}
+			if tc.requests == 2 && (r.tasks[1].ReferenceThreadKey != 90 || r.tasks[1].ReferenceActivityTimestamp != 5000) {
+				t.Fatalf("second request = %+v, want the inbox row's reference", r.tasks[1])
+			}
+			if threadsByID(frames)["101"] == nil {
+				t.Fatal("the page's threads are still emitted")
+			}
+		})
+	}
 }
 
 // A failed request is the listing's error, as before.
