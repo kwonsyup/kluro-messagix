@@ -330,67 +330,28 @@ var _ = waTypes.MessengerServer
 const (
 	threadBatchLimit = 400
 	threadBatchDelay = 500 * time.Millisecond
-	e2eeSyncGroup    = 95
 )
 
-// e2eeRangeWait bounds each wait for a group-95 range update. Group 95 is the
-// message-requests inbox: an account with no pending requests never receives a
-// range row, and the library wait honours only its context. A timeout is the
-// normal "nothing there" answer, not an incomplete listing.
-var e2eeRangeWait = 20 * time.Second
-
-// listingDone is what a finished listing reports on threads_done: counts, and a
-// fixed gap code when known threads were left unread.
-type listingDone struct {
-	Stats map[string]int
-	Gap   string
-}
-
-// listingGap is pageThreads' report that the listing ended early for a fixed reason.
-type listingGap struct{ code string }
-
-func (g *listingGap) Error() string { return "messenger: listing gap " + g.code }
-
-const gapRequestsIncomplete = "requests_incomplete"
-
-// threadRanges is the part of the messagix client the thread listing uses.
-type threadRanges interface {
-	WaitForInitialThreadRange(ctx context.Context, syncGroup int64) error
-	WaitForThreadRange(ctx context.Context, syncGroup int64, generation uint64) error
-	ThreadRangeGeneration(syncGroup int64) uint64
-	GetSyncGroupKeyStore(syncGroup int64) *socket.KeyStoreData
+// threadPager is the part of the messagix client the thread listing uses.
+type threadPager interface {
 	FetchMoreThreads(ctx context.Context, syncGroup int64) (*socket.KeyStoreData, *table.LSTable, error)
-	ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error)
-	PostHandlePublishResponse(tbl *table.LSTable)
 }
 
-// waitE2EERange runs one encrypted-range wait for at most e2eeRangeWait. It
-// reports true when only the bound expired, with the caller's ctx still live.
-func waitE2EERange(ctx context.Context, wait func(context.Context) error) (bool, error) {
-	wctx, cancel := context.WithTimeout(ctx, e2eeRangeWait)
-	defer cancel()
-	err := wait(wctx)
-	if err != nil && ctx.Err() == nil && wctx.Err() != nil {
-		logCode("info", "e2ee_range_timeout")
-		return true, nil
-	}
-	return false, err
-}
-
-// Threads lists every thread: the ones already known, then the rest of the
-// inbox by paging the lightspeed thread ranges (the main inbox and the
-// message requests). The counts it returns go out on threads_done.
-func (s *messagixSession) Threads(ctx context.Context, emit emitFunc) (listingDone, error) {
+// Threads lists every thread: the ones already known, then the rest of the main
+// inbox (sync group 1) by paging it as the web client scrolls it in. Message
+// requests (sync group 95) are never listed: they are not imported until the
+// user accepts them in Messenger. The counts it returns go out on threads_done.
+func (s *messagixSession) Threads(ctx context.Context, emit emitFunc) (map[string]int, error) {
 	s.mu.Lock()
 	cli := s.client
 	s.mu.Unlock()
 	if cli == nil {
-		return listingDone{}, errCode("not_started")
+		return nil, errCode("not_started")
 	}
 	return s.listThreads(ctx, cli, emit)
 }
 
-func (s *messagixSession) listThreads(ctx context.Context, cli threadRanges, emit emitFunc) (listingDone, error) {
+func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit emitFunc) (map[string]int, error) {
 	emitted := map[string]bool{}
 	counted := func(f Frame) int64 {
 		if f.T == TThread && f.ThreadEvt != nil && f.ThreadEvt.Encrypted {
@@ -400,110 +361,24 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadRanges, emi
 	}
 	for _, f := range s.sortedThreadFrames() {
 		if err := ctx.Err(); err != nil {
-			return listingDone{}, err
+			return nil, err
 		}
 		counted(f)
 	}
-	if err := s.pageThreads(ctx, cli, 1, counted); err != nil {
-		return listingDone{}, err
-	}
-	var gap string
-	if err := s.pageThreads(ctx, cli, e2eeSyncGroup, counted); err != nil {
-		if ctx.Err() != nil {
-			return listingDone{}, ctx.Err()
-		}
-		var lg *listingGap
-		if errors.As(err, &lg) {
-			gap = lg.code
-		} else {
-			// The message-requests range is optional: a failure leaves those
-			// threads to arrive live.
-			logCode("warn", "e2ee_threads_failed")
-		}
+	if err := s.pageThreads(ctx, cli, counted); err != nil {
+		return nil, err
 	}
 	known, unlisted := s.encryptedCounts()
-	return listingDone{Stats: s.listingStats(known, len(emitted), unlisted), Gap: gap}, nil
+	return s.listingStats(known, len(emitted), unlisted), nil
 }
 
-// fetchRequests sends the group-95 FetchThreadsTask the first socket connect of
-// a fresh session sends (the library's initial-sync parameters), applies the
-// reply to the library's sync state, and emits the threads it returns. One
-// attempt, bounded by e2eeRangeWait, cancel honoured. A failed or timed-out
-// fetch leaves the requests unknown: a requests_incomplete gap. A reply with no
-// range or no threads is an empty request inbox. The caller then pages on from
-// the keystore the reply filled.
-func (s *messagixSession) fetchRequests(ctx context.Context, cli threadRanges, emit emitFunc) error {
-	logCode("info", "requests_fetch")
-	wctx, cancel := context.WithTimeout(ctx, e2eeRangeWait)
-	defer cancel()
-	tbl, err := cli.ExecuteTasks(wctx, &socket.FetchThreadsTask{
-		IsAfter:                    0,
-		ParentThreadKey:            -1,
-		ReferenceThreadKey:         0,
-		ReferenceActivityTimestamp: 9999999999999,
-		AdditionalPagesToFetch:     0,
-		SyncGroup:                  e2eeSyncGroup,
-	})
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	if err != nil {
-		logCode("warn", "requests_fetch_failed")
-		return &listingGap{gapRequestsIncomplete}
-	}
-	if tbl == nil {
-		logCode("info", "requests_fetch_empty")
-		return nil
-	}
-	cli.PostHandlePublishResponse(tbl)
-	threads := 0
-	for _, f := range s.handleTableFrames(tbl) {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if f.T == TThread {
-			threads++
-		}
-		emit(f)
-	}
-	if threads == 0 {
-		logCode("info", "requests_fetch_empty")
-	} else {
-		logCode("info", "requests_fetch_threads")
-	}
-	return nil
-}
-
-func (s *messagixSession) pageThreads(ctx context.Context, cli threadRanges, group int64, emit emitFunc) error {
-	if group == e2eeSyncGroup {
-		// Only the update itself fills the keystore, so the wait has to come
-		// before the "no more threads" test below.
-		timedOut, err := waitE2EERange(ctx, func(wctx context.Context) error {
-			return cli.WaitForInitialThreadRange(wctx, group)
-		})
-		if err != nil {
-			return err
-		}
-		if timedOut {
-			// A resumed session never sent the initial group-95 fetch, so the wait
-			// proves nothing about pending requests: ask once.
-			if err := s.fetchRequests(ctx, cli, emit); err != nil {
-				return err
-			}
-		}
-	}
+func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit emitFunc) error {
+	const group = 1
 	var prevMin int64
 	for batch := 0; batch < threadBatchLimit; batch++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if group == e2eeSyncGroup {
-			ks := cli.GetSyncGroupKeyStore(group)
-			if ks == nil || !ks.HasMoreBefore {
-				return nil
-			}
-		}
-		gen := cli.ThreadRangeGeneration(group)
 		ks, tbl, err := cli.FetchMoreThreads(ctx, group)
 		if err != nil {
 			return mapSendErr(err)
@@ -516,18 +391,6 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadRanges, gro
 				return err
 			}
 			emit(f)
-		}
-		if group == e2eeSyncGroup {
-			timedOut, err := waitE2EERange(ctx, func(wctx context.Context) error {
-				return cli.WaitForThreadRange(wctx, group, gen)
-			})
-			if err != nil {
-				return err
-			}
-			if timedOut {
-				// The range said more requests exist and the next one never came.
-				return &listingGap{gapRequestsIncomplete}
-			}
 		}
 		if !ks.HasMoreBefore || ks.MinThreadKey == prevMin {
 			return nil

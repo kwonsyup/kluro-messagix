@@ -82,7 +82,6 @@ type fakeBackend struct {
 	startMode     string
 	startPlatform string
 	threadStats   map[string]int // returned by Threads
-	threadGap     string
 }
 
 func (f *fakeBackend) Start(_ context.Context, emit emitFunc, acks *ackHub, cookies map[string]string, state []byte, mode, platform string) (Ready, []Frame, error) {
@@ -99,15 +98,15 @@ func (f *fakeBackend) HistoryPIN(_ context.Context, pin []byte) (HistoryState, e
 	}
 	return HistoryEnrolled, nil
 }
-func (f *fakeBackend) Threads(_ context.Context, emit emitFunc) (listingDone, error) {
+func (f *fakeBackend) Threads(_ context.Context, emit emitFunc) (map[string]int, error) {
 	if f.acks != nil && f.stopState {
 		seq := emit(Frame{T: TMessage, Message: &Message{ID: "wa:thread-event"}, waitAck: true})
 		if !f.acks.wait(seq) {
-			return listingDone{}, errCode("ack_failed")
+			return nil, errCode("ack_failed")
 		}
 	}
 	emit(threadFrame(Thread{ID: "42", Kind: "user"}))
-	return listingDone{Stats: f.threadStats, Gap: f.threadGap}, nil
+	return f.threadStats, nil
 }
 func (f *fakeBackend) History(_ context.Context, thread, cursor string, count int) (*Page, error) {
 	if p, ok := f.histories[thread+"|"+cursor]; ok {
