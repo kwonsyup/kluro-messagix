@@ -446,14 +446,22 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 // requests. Other parent keys of sync group 1 (configs.ParentThreadKeys) are not walked.
 const inboxParentKey = -1
 
-// group1Range is the sync-group-1 thread range row of a reply for the given parent
-// key, or nil. Rows for other parents say nothing about this walk: they neither
-// continue nor complete it (their threads are still emitted with the table). If a
-// reply carries several rows for the parent, the last one wins.
+// group1Range is the sync-group-1 thread range row of a reply that decides the walk,
+// or nil. A row for the inbox parent continues it (more) or completes it (no more); a
+// row for parent 0 completes it when it says no more, which is the library's own
+// end-of-group convention (syncManager.go updateThreadRanges: a HasMoreBefore=false row
+// ends the group only when its ParentThreadKey is 0). Any other row (another parent, or
+// parent 0 saying more) says nothing about this walk; its threads are still emitted with
+// the table. Rows are read in order and the last deciding row wins, as the library's
+// keystore updates do: a parent-0 end row after the inbox's continue row completes the
+// walk, and an inbox continue row after an end row continues it.
 func group1Range(tbl *table.LSTable, parent int64) *table.LSUpsertSyncGroupThreadsRange {
 	var out *table.LSUpsertSyncGroupThreadsRange
 	for _, r := range tbl.LSUpsertSyncGroupThreadsRange {
-		if r.SyncGroup == 1 && r.ParentThreadKey == parent {
+		if r.SyncGroup != 1 {
+			continue
+		}
+		if r.ParentThreadKey == parent || (r.ParentThreadKey == 0 && !r.HasMoreBefore) {
 			out = r
 		}
 	}

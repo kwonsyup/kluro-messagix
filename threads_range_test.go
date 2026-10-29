@@ -350,6 +350,38 @@ func TestWalkUsesOnlyTheRequestedParentsRangeRow(t *testing.T) {
 	}
 }
 
+// A HasMoreBefore=false row for parent 0 ends the group (the library's own convention), whether or not the inbox
+// parent's row is also there; parent 0 saying "more" decides nothing. Rows are read in order and the last deciding
+// row wins, as the library's keystore updates do.
+func TestWalkCompletesOnAParentZeroEndRow(t *testing.T) {
+	zero := func(more bool) *table.LSUpsertSyncGroupThreadsRange { return rangeRow(more, 0, 0, 0) }
+	for name, tc := range map[string]struct {
+		pages    []*table.LSTable
+		wantGap  string
+		requests int
+	}{
+		"parent 0 end completes":              {[]*table.LSTable{page(101, zero(false))}, "", 1},
+		"parent 0 more is not a decision":     {[]*table.LSTable{page(101, zero(true))}, "inbox_incomplete", 1},
+		"inbox more, then parent 0 end":       {[]*table.LSTable{page(101, rangeRow(true, -1, 90, 5000), zero(false))}, "", 1},
+		"parent 0 end, then inbox more":       {[]*table.LSTable{page(101, zero(false), rangeRow(true, -1, 90, 5000)), page(102, zero(false))}, "", 2},
+		"parent 0 more does not redirect":     {[]*table.LSTable{page(101, rangeRow(true, -1, 90, 5000), zero(true)), page(102, rangeRow(false, -1, 80, 4000))}, "", 2},
+		"inbox end, then another parent more": {[]*table.LSTable{page(101, rangeRow(false, -1, 90, 5000), rangeRow(true, 7, 55, 1))}, "", 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := &pager{pages: tc.pages}
+			_, res, err, done := listGap(t, newTestSession(), r, context.Background(), 10*time.Second)
+			if !done || err != nil || res.Gap != tc.wantGap || len(r.tasks) != tc.requests {
+				t.Fatalf("done=%v err=%v gap=%q requests=%d, want gap %q and %d requests", done, err, res.Gap, len(r.tasks), tc.wantGap, tc.requests)
+			}
+			for _, task := range r.tasks {
+				if task.ParentThreadKey != -1 {
+					t.Fatalf("a request was redirected to parent %d", task.ParentThreadKey)
+				}
+			}
+		})
+	}
+}
+
 // A failed request is the listing's error, as before.
 func TestWalkRequestErrorFailsTheListing(t *testing.T) {
 	r := &pager{err: errors.New("boom")}
