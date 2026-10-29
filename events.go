@@ -285,9 +285,10 @@ func (s *messagixSession) wireThreadLocked(t *threadInfo) Thread {
 	if !t.Enc && s.unacceptedLocked(t.Key) {
 		// A message request qualifies for nothing: the connector imports any
 		// one-to-one thread that names another person, typed or not, so the frame
-		// carries no kind, no type and no participants. The real ones stay in
+		// carries no kind, no type, no participants and no title (usually the
+		// stranger's name). The real ones stay in
 		// memory and go out when a later row accepts the thread.
-		return Thread{ID: wireID(false, t.Key), Title: t.Title, LastActivity: t.LastActivity}
+		return Thread{ID: wireID(false, t.Key), LastActivity: t.LastActivity}
 	}
 	out := Thread{ID: wireID(t.Enc, t.Key), Kind: t.Kind, Typed: t.Typed, Title: t.Title, Encrypted: t.Enc, LastActivity: t.LastActivity}
 	if t.Enc {

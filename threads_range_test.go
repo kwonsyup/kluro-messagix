@@ -223,7 +223,7 @@ func typedOf(frames []Frame, id string) (typed, found bool) {
 }
 
 func threadRow(key int64, folder string) *table.LSTable {
-	return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: key, ThreadType: table.ONE_TO_ONE, FolderName: folder}}}
+	return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: key, ThreadType: table.ONE_TO_ONE, FolderName: folder, ThreadName: "Stranger", LastActivityTimestampMs: 77}}}
 }
 
 // A thread row in the pending or spam folder, or a status-1 request row, leaves the
@@ -250,8 +250,8 @@ func TestUnacceptedThreadsAreNeverTyped(t *testing.T) {
 			// the wire frame qualifies for nothing: no kind, no type, no participants
 			check := func(where string, th *Thread) {
 				t.Helper()
-				if th == nil || th.Kind != "" || th.Typed || len(th.Participants) != 0 || connectorWouldQualify(th) {
-					t.Fatalf("%s: a request thread must be emitted with no kind, type or participants: %+v", where, th)
+				if th == nil || th.Kind != "" || th.Typed || th.Title != "" || th.LastActivity != 77 || len(th.Participants) != 0 || connectorWouldQualify(th) {
+					t.Fatalf("%s: a request thread must be emitted with only its id and activity: %+v", where, th)
 				}
 			}
 			for _, f := range frames {
@@ -290,7 +290,7 @@ func TestAcceptingARequestTypesAndReemitsTheThread(t *testing.T) {
 		t.Fatalf("an inbox row must type and re-emit: typed=%v found=%v", typed, found)
 	}
 	for _, f := range frames {
-		if f.T == TThread && f.ThreadEvt.ID == "500" && (f.ThreadEvt.Kind != "user" || !connectorWouldQualify(f.ThreadEvt)) {
+		if f.T == TThread && f.ThreadEvt.ID == "500" && (f.ThreadEvt.Kind != "user" || f.ThreadEvt.Title != "Stranger" || !connectorWouldQualify(f.ThreadEvt)) {
 			t.Fatalf("acceptance must re-emit the real kind and participants: %+v", f.ThreadEvt)
 		}
 	}
