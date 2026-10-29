@@ -379,6 +379,15 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit
 // not an error: the inbox list is still usable, so it logs a fixed code and pages
 // anyway. It records how long the wait took (the cap on a timeout).
 func (s *messagixSession) waitGroup1Range(ctx context.Context, cli threadPager) error {
+	s.mu.Lock()
+	filled := s.resumeRange
+	s.mu.Unlock()
+	if filled {
+		// The resume sync already wrote the group-1 range into the keystore before the
+		// socket opened. The library's initial-fetch mark is set at connect, after
+		// that, so its wait would only see a later bump: skip it.
+		return nil
+	}
 	wctx, cancel := context.WithTimeout(ctx, group1RangeWait)
 	defer cancel()
 	start := time.Now()
@@ -407,17 +416,7 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		// The fetch reads and rewrites the library's keystore and cursors, as the
-		// bookkeeping of live tables does: bookMu keeps the two apart. The wait above
-		// is not under it (the drainer must be free to move the generation).
-		s.bookMu.Lock()
-		liveKS, tbl, err := cli.FetchMoreThreads(ctx, group)
-		var ks *socket.KeyStoreData
-		if liveKS != nil {
-			copied := *liveKS // the library's own keystore: read it only while bookMu is held
-			ks = &copied
-		}
-		s.bookMu.Unlock()
+		ks, tbl, err := cli.FetchMoreThreads(ctx, group)
 		if err != nil {
 			return mapSendErr(err)
 		}

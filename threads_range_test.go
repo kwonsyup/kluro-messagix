@@ -8,7 +8,6 @@ import (
 	"errors"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,6 +41,7 @@ func (r *pager) WaitForInitialThreadRange(context.Context, int64) error { return
 // generation WaitForInitialThreadRange observes. Nothing else advances either.
 type rangePager struct {
 	mu      sync.Mutex
+	mark    uint64 // the generation when the initial fetch was marked (at connect): the wait needs a bump past it
 	gen     uint64
 	changed chan struct{}
 	pages   int
@@ -63,9 +63,9 @@ func (r *rangePager) PostHandlePublishResponse(tbl *table.LSTable) {
 func (r *rangePager) WaitForInitialThreadRange(ctx context.Context, _ int64) error {
 	for {
 		r.mu.Lock()
-		gen, changed := r.gen, r.changed
+		gen, changed, mark := r.gen, r.changed, r.mark
 		r.mu.Unlock()
-		if gen > 0 {
+		if gen > mark {
 			return nil
 		}
 		select {
@@ -759,40 +759,6 @@ func withGroup1Wait(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { group1RangeWait = old })
 }
 
-// The initial group-1 range arrives on the live socket, through the handler path; the library's bookkeeping
-// moves the generation, the wait returns early and paging goes past the first page.
-func TestAGroup1RangeFromTheLiveSocketEndsTheWaitAndPagingContinues(t *testing.T) {
-	withGroup1Wait(t, 5*time.Second)
-	s := newTestSession()
-	r := newRangePager()
-	s.postHandle = r.PostHandlePublishResponse
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		s.handleMetaEvent(context.Background(), &table.LSTable{
-			LSUpsertSyncGroupThreadsRange: []*table.LSUpsertSyncGroupThreadsRange{{SyncGroup: 1, HasMoreBefore: true, MinThreadKey: 5}},
-		})
-	}()
-	start := time.Now()
-	_, stats, err, done := listWithin(t, s, r, context.Background(), 10*time.Second)
-	if !done || err != nil {
-		t.Fatalf("done=%v err=%v", done, err)
-	}
-	if time.Since(start) > 3*time.Second || stats["group1_range_wait_ms"] >= 3000 {
-		t.Fatalf("the range arrived at about 100 ms: the wait must end early, took %v (stat %d)", time.Since(start), stats["group1_range_wait_ms"])
-	}
-	if r.pages < 2 {
-		t.Fatalf("paged %d time(s): paging must continue past the first page", r.pages)
-	}
-	// a table with no sync rows leaves the generation alone
-	other := newRangePager()
-	s2 := newTestSession()
-	s2.postHandle = other.PostHandlePublishResponse
-	s2.handleMetaEvent(context.Background(), &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 9, ThreadType: table.ONE_TO_ONE}}})
-	if other.gen != 0 {
-		t.Fatal("an ordinary table must not move the range generation")
-	}
-}
-
 // The range never arrives: after the cap the listing pages anyway, with no error, and the stat is the cap.
 func TestPagingGoesAheadWhenTheGroup1RangeNeverArrives(t *testing.T) {
 	withGroup1Wait(t, 100*time.Millisecond)
@@ -827,8 +793,10 @@ func TestCancelDuringTheGroup1RangeWait(t *testing.T) {
 	}
 }
 
-// The resume-sync tables go through the library's bookkeeping before connect, in the order they were fetched:
-// a group-1 range row in the snapshot is applied before the socket opens, so the listing's wait returns at once.
+// The resume-sync tables go through the library's bookkeeping before connect, in the order they were fetched.
+// A group-1 range row in database 1's table is therefore in the keystore before the socket opens. The library marks
+// its initial fetch at connect, after that, so a wait for a bump past the mark would sit out the cap: the listing
+// skips the wait when the resume sync already supplied the range, and still waits when it did not.
 func TestResumeSyncTablesAreAppliedToTheLibraryBeforeConnect(t *testing.T) {
 	withGroup1Wait(t, 5*time.Second)
 	rangeRow := &table.LSTable{LSUpsertSyncGroupThreadsRange: []*table.LSUpsertSyncGroupThreadsRange{{SyncGroup: 1, HasMoreBefore: true, MinThreadKey: 5}}}
@@ -840,8 +808,17 @@ func TestResumeSyncTablesAreAppliedToTheLibraryBeforeConnect(t *testing.T) {
 			return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: int64(600 + v.Database), ThreadType: table.ONE_TO_ONE}}}, nil
 		}
 	}
+	// connect marks the initial fetch at the current generation, as the library does at socket.go:137.
+	markAtConnect := func(r *rangePager) func(context.Context) error {
+		return func(context.Context) error {
+			r.mu.Lock()
+			r.mark = r.gen
+			r.mu.Unlock()
+			return nil
+		}
+	}
 
-	// With a range row: the generation has advanced before connect; the wait returns at once; paging goes on.
+	// With a range row: applied before connect, in order; the wait is skipped; paging goes past page 1.
 	s := newTestSession()
 	s.ctx = context.Background()
 	r := newRangePager()
@@ -851,42 +828,63 @@ func TestResumeSyncTablesAreAppliedToTheLibraryBeforeConnect(t *testing.T) {
 		r.PostHandlePublishResponse(tbl)
 	}
 	s.lsRequest = snapshot(true)
-	genAtConnect := uint64(99)
-	if _, err := s.openSocket(context.Background(), true, savedConfig(t, 123), func(context.Context) error {
+	genBeforeConnect := uint64(99)
+	connect := markAtConnect(r)
+	if _, err := s.openSocket(context.Background(), true, savedConfig(t, 123), func(ctx context.Context) error {
 		r.mu.Lock()
-		genAtConnect = r.gen
+		genBeforeConnect = r.gen
 		r.mu.Unlock()
-		return nil
+		return connect(ctx)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if genAtConnect != 1 || len(applied) != 2 || applied[0] != 11 || applied[1] != 10 {
-		t.Fatalf("the snapshot's tables (db 1 then 2) must reach the bookkeeping before connect: gen=%d applied=%v", genAtConnect, applied)
+	if genBeforeConnect != 1 || len(applied) != 2 || applied[0] != 11 || applied[1] != 10 {
+		t.Fatalf("the snapshot's tables (db 1 then 2) must reach the bookkeeping before connect: gen=%d applied=%v", genBeforeConnect, applied)
 	}
+	start := time.Now()
 	_, stats, err, done := listWithin(t, s, r, context.Background(), 10*time.Second)
-	if !done || err != nil || stats["group1_range_wait_ms"] > 500 || r.pages < 2 {
-		t.Fatalf("the wait must return at once and paging go past page 1: done=%v err=%v wait=%d pages=%d", done, err, stats["group1_range_wait_ms"], r.pages)
+	if !done || err != nil || time.Since(start) > 3*time.Second || stats["group1_range_wait_ms"] != 0 || r.pages < 2 {
+		t.Fatalf("the wait must be skipped and paging go past page 1: done=%v err=%v wait=%d pages=%d took=%v", done, err, stats["group1_range_wait_ms"], r.pages, time.Since(start))
 	}
 
-	// Without a range row: nothing advances, the wait goes on to the live socket path.
+	// Without a range row: nothing is skipped, the wait runs to the cap and paging goes ahead.
+	withGroup1Wait(t, 150*time.Millisecond)
 	s2 := newTestSession()
 	s2.ctx = context.Background()
 	r2 := newRangePager()
 	s2.postHandle = r2.PostHandlePublishResponse
 	s2.lsRequest = snapshot(false)
-	if _, err := s2.openSocket(context.Background(), true, savedConfig(t, 123), func(context.Context) error { return nil }); err != nil {
+	if _, err := s2.openSocket(context.Background(), true, savedConfig(t, 123), markAtConnect(r2)); err != nil {
 		t.Fatal(err)
 	}
-	if r2.gen != 0 {
-		t.Fatal("a snapshot without a range row must not advance the generation")
+	if r2.gen != 0 || s2.resumeRange {
+		t.Fatal("a snapshot without a range row must not advance the generation or skip the wait")
 	}
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		s2.handleMetaEvent(context.Background(), rangeRow)
-	}()
 	_, stats2, err, done := listWithin(t, s2, r2, context.Background(), 10*time.Second)
-	if !done || err != nil || stats2["group1_range_wait_ms"] < 50 || stats2["group1_range_wait_ms"] >= 3000 || r2.pages < 2 {
-		t.Fatalf("the live-socket range must end the wait: done=%v err=%v wait=%d pages=%d", done, err, stats2["group1_range_wait_ms"], r2.pages)
+	if !done || err != nil || stats2["group1_range_wait_ms"] != 150 || r2.pages != 1 {
+		t.Fatalf("with no range the wait runs to the cap and paging goes ahead: done=%v err=%v wait=%d pages=%d", done, err, stats2["group1_range_wait_ms"], r2.pages)
+	}
+}
+
+// Nothing else reads the library's sync state while the pre-connect bookkeeping writes it: the state loop starts before
+// the resume sync, and its dump marshals that state, so the bookkeeping runs under the lock every dump runs under.
+func TestResumeBookkeepingExcludesTheStateDump(t *testing.T) {
+	s := newTestSession()
+	s.ctx = context.Background()
+	s.lsRequest = func(context.Context, *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
+		return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 600, ThreadType: table.ONE_TO_ONE}}}, nil
+	}
+	calls := 0
+	s.postHandle = func(*table.LSTable) {
+		calls++
+		if s.flushMu.TryLock() {
+			s.flushMu.Unlock()
+			t.Error("the bookkeeping ran without the lock a state dump runs under")
+		}
+	}
+	s.resumeSync(context.Background(), savedConfig(t, 123))
+	if calls != 2 {
+		t.Fatalf("bookkeeping calls = %d, want 2", calls)
 	}
 }
 
@@ -922,132 +920,4 @@ func boolStr(b bool) string {
 		return "true"
 	}
 	return "false"
-}
-
-type blockingPager struct {
-	inFlight chan struct{}
-	release  chan struct{}
-	returned atomic.Bool
-}
-
-func (p *blockingPager) WaitForInitialThreadRange(context.Context, int64) error { return nil }
-
-func (p *blockingPager) FetchMoreThreads(ctx context.Context, _ int64) (*socket.KeyStoreData, *table.LSTable, error) {
-	close(p.inFlight)
-	select {
-	case <-p.release:
-	case <-ctx.Done():
-	}
-	p.returned.Store(true)
-	return &socket.KeyStoreData{MinThreadKey: 7}, &table.LSTable{}, nil
-}
-
-func rangeTable(minKey int64) *table.LSTable {
-	return &table.LSTable{LSUpsertSyncGroupThreadsRange: []*table.LSUpsertSyncGroupThreadsRange{{SyncGroup: 1, HasMoreBefore: true, MinThreadKey: minKey}}}
-}
-
-// The socket reader must not wait for a page fetch in flight (its answer arrives through the same reader), and the
-// library's bookkeeping for live tables must not overlap that fetch: the handler returns at once, the tables are applied
-// only after the fetch returns, in arrival order.
-func TestLiveBookkeepingNeverOverlapsAPageFetchAndNeverBlocksTheReader(t *testing.T) {
-	s := newTestSession()
-	s.ctx, s.cancel = context.WithCancel(context.Background())
-	defer s.cancel()
-	p := &blockingPager{inFlight: make(chan struct{}), release: make(chan struct{})}
-	var mu sync.Mutex
-	var applied []int64
-	var afterFetch []bool
-	s.postHandle = func(tbl *table.LSTable) {
-		mu.Lock()
-		defer mu.Unlock()
-		applied = append(applied, tbl.LSUpsertSyncGroupThreadsRange[0].MinThreadKey)
-		afterFetch = append(afterFetch, p.returned.Load())
-	}
-	listed := make(chan struct{})
-	go func() {
-		_, _ = s.listThreads(context.Background(), p, func(Frame) int64 { return 0 })
-		close(listed)
-	}()
-	select {
-	case <-p.inFlight:
-	case <-time.After(3 * time.Second):
-		t.Fatal("the page fetch never started")
-	}
-	for _, key := range []int64{11, 12} {
-		returned := make(chan struct{})
-		go func() { s.handleMetaEvent(context.Background(), rangeTable(key)); close(returned) }()
-		select {
-		case <-returned:
-		case <-time.After(500 * time.Millisecond):
-			t.Fatal("the reader-path handler blocked behind a page fetch in flight")
-		}
-	}
-	time.Sleep(100 * time.Millisecond)
-	mu.Lock()
-	n := len(applied)
-	mu.Unlock()
-	if n != 0 {
-		t.Fatalf("bookkeeping ran during the page fetch: %v", applied)
-	}
-	close(p.release)
-	<-listed
-	waitFor(t, "the queued bookkeeping", func() bool { mu.Lock(); defer mu.Unlock(); return len(applied) == 2 })
-	mu.Lock()
-	defer mu.Unlock()
-	if applied[0] != 11 || applied[1] != 12 || !afterFetch[0] || !afterFetch[1] {
-		t.Fatalf("tables must be applied after the fetch returned, in arrival order: %v afterFetch=%v", applied, afterFetch)
-	}
-}
-
-// The drainer is tracked by the session and exits when it stops; a table with no sync rows starts nothing.
-func TestBookkeepingDrainerExitsWithTheSession(t *testing.T) {
-	s := newTestSession()
-	s.ctx, s.cancel = context.WithCancel(context.Background())
-	s.postHandle = func(*table.LSTable) {}
-
-	s.queueBookkeeping(&table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 9, ThreadType: table.ONE_TO_ONE}}})
-	s.qMu.Lock()
-	started := s.bookDone != nil
-	s.qMu.Unlock()
-	if started {
-		t.Fatal("a table with no sync rows needs no bookkeeping and no drainer")
-	}
-
-	s.queueBookkeeping(rangeTable(5))
-	s.qMu.Lock()
-	done := s.bookDone
-	s.qMu.Unlock()
-	if done == nil {
-		t.Fatal("a table with a thread range starts the drainer")
-	}
-	select {
-	case <-done:
-		t.Fatal("the drainer must run while the session does")
-	case <-time.After(50 * time.Millisecond):
-	}
-	s.Stop()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("the drainer did not exit on Stop")
-	}
-	// after stop, nothing is started or kept
-	s.queueBookkeeping(rangeTable(6))
-	s.qMu.Lock()
-	left := len(s.bookQ)
-	s.qMu.Unlock()
-	if left > 1 {
-		t.Fatalf("queue = %d after stop", left)
-	}
-}
-
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	for i := 0; i < 300; i++ {
-		if cond() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", what)
 }

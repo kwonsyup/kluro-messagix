@@ -87,6 +87,11 @@ func (s *messagixSession) resumeSync(ctx context.Context, saved json.RawMessage)
 		}
 		frames = append(frames, s.handleTableFrames(tbl)...)
 		rows += countRows(tbl)
+		if db == 1 && hasGroup1Range(tbl) {
+			s.mu.Lock()
+			s.resumeRange = true
+			s.mu.Unlock()
+		}
 		// The library applies each database's cursors and thread ranges right after its
 		// request (SyncDataGraphQL); the snapshot's are fresher than the cached ones.
 		// Outside s.mu, before connect.
@@ -96,6 +101,17 @@ func (s *messagixSession) resumeSync(ctx context.Context, saved json.RawMessage)
 	s.resumeRows = rows
 	s.mu.Unlock()
 	return frames
+}
+
+// hasGroup1Range reports whether a table carries a thread range for sync group 1,
+// which the bookkeeping that follows writes into the library's keystore.
+func hasGroup1Range(tbl *table.LSTable) bool {
+	for _, r := range tbl.LSUpsertSyncGroupThreadsRange {
+		if r.SyncGroup == 1 {
+			return true
+		}
+	}
+	return false
 }
 
 // countRows is the number of rows in a table, over every row-list field.
