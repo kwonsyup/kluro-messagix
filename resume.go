@@ -13,7 +13,7 @@ import (
 )
 
 // resumeSyncTimeout bounds the whole resumed-start sync.
-const resumeSyncTimeout = 20 * time.Second
+var resumeSyncTimeout = 20 * time.Second
 
 // resumeSyncDatabases are the sync databases the page load's GraphQL sync asks for.
 var resumeSyncDatabases = []int64{1, 2, 95}

@@ -661,3 +661,39 @@ func TestResumeSnapshotIsAppliedBeforeTheSocketOpens(t *testing.T) {
 		t.Fatal("a connect failure must be returned")
 	}
 }
+
+// Cancelling Start during the resume sync stops it before the socket opens; the sync's own timeout
+// is not a cancel and still connects.
+func TestOpenSocketChecksTheCallersCancelBeforeConnecting(t *testing.T) {
+	blocked := func(ctx context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	// the caller cancels during the sync
+	s := newTestSession()
+	s.ctx = context.Background()
+	s.lsRequest = blocked
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+	connected := false
+	_, err := s.openSocket(ctx, true, savedConfig(t, 123), func(context.Context) error { connected = true; return nil })
+	if !errors.Is(err, context.Canceled) || connected {
+		t.Fatalf("a cancelled Start must not connect: err=%v connected=%v", err, connected)
+	}
+	if code := codeOf(classifyStartError("connect", err)); code != "connect_cancelled" {
+		t.Fatalf("Start reports %q", code)
+	}
+
+	// the sync's internal timeout still falls through to connect
+	old := resumeSyncTimeout
+	resumeSyncTimeout = 50 * time.Millisecond
+	defer func() { resumeSyncTimeout = old }()
+	s2 := newTestSession()
+	s2.ctx = context.Background()
+	s2.lsRequest = blocked
+	connected = false
+	frames, err := s2.openSocket(context.Background(), true, savedConfig(t, 123), func(context.Context) error { connected = true; return nil })
+	if err != nil || !connected || frames != nil {
+		t.Fatalf("a sync timeout must still connect: err=%v connected=%v frames=%v", err, connected, frames)
+	}
+}

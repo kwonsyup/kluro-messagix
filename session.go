@@ -282,6 +282,11 @@ func (s *messagixSession) openSocket(ctx context.Context, resumed bool, saved js
 		if tbl := s.resumeSync(ctx, saved); tbl != nil {
 			frames = s.handleTableFrames(tbl)
 		}
+		// The caller cancelled Start during the sync: do not open the socket. The
+		// sync's own timeout is not a cancel and falls through to connect.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 	}
 	if err := connect(s.ctx); err != nil {
 		return nil, err
