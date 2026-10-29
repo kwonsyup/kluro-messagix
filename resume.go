@@ -15,24 +15,25 @@ import (
 // resumeSyncTimeout bounds the whole resumed-start sync.
 var resumeSyncTimeout = 20 * time.Second
 
-// resumeSyncDatabases are the sync databases the page load's GraphQL sync asks for.
-var resumeSyncDatabases = []int64{1, 2, 95}
+// resumeSyncDatabases are the sync databases the resume sync asks for: the inbox (1)
+// and the contacts (2). The page load also asks for 95, the message-requests inbox;
+// requests are not imported, and 95's only other content (cutover links) is not worth
+// carrying it, so its table and cursor are left to the library's own socket sync.
+var resumeSyncDatabases = []int64{1, 2}
 
-// resumeSync is the GraphQL sync a page load runs for databases 1, 2 and 95 (the
-// library's setupConfigs and SyncDataGraphQL), for a session resumed from saved
-// state, which skipped the page load. The version and the sync params come from the
-// saved state's own copy of the page config, so nothing needs the page. One attempt,
-// bounded by resumeSyncTimeout, cancel honoured: a failure logs a fixed code and
-// returns what was applied (nothing if database 1 failed).
+// resumeSync is the GraphQL sync a page load runs, for the inbox (1) and the contacts
+// (2), for a session resumed from saved state, which skipped the page load. The
+// version and the sync params come from the saved state's own copy of the page
+// config, so nothing needs the page. One attempt, bounded by resumeSyncTimeout, cancel
+// honoured: a failure logs a fixed code and returns what was applied (nothing if
+// database 1 failed).
 //
 // Each database's table is applied to the session first and only then given to the
 // library's sync bookkeeping (PostHandlePublishResponse), which moves that database's
 // cursor and thread ranges, in the order the library applies them: every row is
-// consumed before its cursor moves, so none is acknowledged and lost. The library
-// itself keeps only database 1's table (plus 95's cutover links); databases 2 and 95
-// are applied whole here because their cursors advance. The fail-closed rule for
-// message requests applies to every row. The returned frames are for the initial
-// emitter.
+// consumed before its cursor moves, so none is acknowledged and lost (the library
+// itself keeps only database 1's table). The fail-closed rule for message requests
+// applies to every row. The returned frames are for the initial emitter.
 func (s *messagixSession) resumeSync(ctx context.Context, saved json.RawMessage) []Frame {
 	var cfg struct {
 		Configs struct {
