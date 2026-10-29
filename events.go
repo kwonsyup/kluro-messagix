@@ -12,6 +12,12 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 )
 
+// Thread folders that mean "not an accepted chat": a message request, or spam.
+const (
+	folderPending = "pending"
+	folderSpam    = "spam"
+)
+
 const msgIndexCap = 50000
 
 // pageCollector gathers the table rows answering one history request.
@@ -68,6 +74,47 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) (frames []Frame)
 	}
 
 	touched := map[string]bool{}
+	// A thread row in the "pending" or "spam" folder, or a message request row with
+	// status 1, marks the thread unaccepted: it is emitted with Typed=false whatever
+	// its type, so the connector qualifies nothing from it. Any other non-empty
+	// folder, or a request status other than 1, clears the mark and re-emits the
+	// thread typed; an empty folder does neither. The mark is memory only: after a
+	// restart a request the listing does not type stays untyped.
+	mark := func(key int64, unaccepted bool) {
+		if s.unaccepted[key] == unaccepted {
+			return
+		}
+		if unaccepted {
+			s.unaccepted[key] = true
+		} else {
+			delete(s.unaccepted, key)
+		}
+		if s.threads[wireID(false, key)] != nil {
+			touched[wireID(false, key)] = true
+		}
+	}
+	markFolder := func(key int64, folder string) {
+		switch folder {
+		case "":
+		case folderPending, folderSpam:
+			mark(key, true)
+		default:
+			mark(key, false)
+		}
+	}
+	for _, th := range tbl.LSDeleteThenInsertThread {
+		markFolder(th.ThreadKey, th.FolderName)
+	}
+	for _, th := range tbl.LSUpdateOrInsertThread {
+		markFolder(th.ThreadKey, th.FolderName)
+	}
+	for _, th := range tbl.LSVerifyThreadExists {
+		markFolder(th.ThreadKey, th.FolderName)
+	}
+	for _, r := range tbl.LSDeleteThenInsertMessageRequest {
+		// MessageRequestStatus 1 means the thread is in the pending folder.
+		mark(r.ThreadKey, r.MessageRequestStatus == 1)
+	}
 	upsertThread := func(key int64, typ table.ThreadType, name string, last int64) {
 		originalKey := key
 		s.rowKeys[originalKey] = true
@@ -232,7 +279,7 @@ func threadFrame(t Thread) Frame { return Frame{T: TThread, ThreadEvt: &t} }
 // wireThreadLocked builds the protocol thread. A one-to-one thread names the
 // other person; an encrypted thread names the open thread it continues.
 func (s *messagixSession) wireThreadLocked(t *threadInfo) Thread {
-	out := Thread{ID: wireID(t.Enc, t.Key), Kind: t.Kind, Typed: t.Typed, Title: t.Title, Encrypted: t.Enc, LastActivity: t.LastActivity}
+	out := Thread{ID: wireID(t.Enc, t.Key), Kind: t.Kind, Typed: t.Typed && (t.Enc || !s.unaccepted[t.Key]), Title: t.Title, Encrypted: t.Enc, LastActivity: t.LastActivity}
 	if t.Enc {
 		if open, ok := s.cutover[t.Key]; ok {
 			out.Predecessor = wireID(false, open)

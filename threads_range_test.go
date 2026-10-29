@@ -195,3 +195,96 @@ func TestListingCancelStillReportsTheCancel(t *testing.T) {
 		t.Fatalf("a cancelled listing must report the cancel, not stats: done=%v stats=%v err=%v", done, stats, err)
 	}
 }
+
+func typedOf(frames []Frame, id string) (typed, found bool) {
+	for i := len(frames) - 1; i >= 0; i-- {
+		if f := frames[i]; f.T == TThread && f.ThreadEvt.ID == id {
+			return f.ThreadEvt.Typed, true
+		}
+	}
+	return false, false
+}
+
+func threadRow(key int64, folder string) *table.LSTable {
+	return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: key, ThreadType: table.ONE_TO_ONE, FolderName: folder}}}
+}
+
+// A thread row in the pending or spam folder, or a status-1 request row, leaves the
+// thread untyped whatever its type; the kind is still set.
+func TestUnacceptedThreadsAreNeverTyped(t *testing.T) {
+	for name, tbl := range map[string]*table.LSTable{
+		"pending": threadRow(500, "pending"),
+		"spam":    threadRow(500, "spam"),
+		"status 1": {
+			LSDeleteThenInsertThread:         []*table.LSDeleteThenInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE}},
+			LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 500, MessageRequestStatus: 1}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newTestSession()
+			frames := s.handleTableFrames(tbl)
+			if typed, found := typedOf(frames, "500"); !found || typed {
+				t.Fatalf("a request thread must be emitted untyped: typed=%v found=%v", typed, found)
+			}
+			if th := s.threads["500"]; th == nil || th.Kind != "user" {
+				t.Fatalf("the kind may still be set: %+v", th)
+			}
+			// every later frame of it, including a listing, stays untyped
+			for _, f := range s.sortedThreadFrames() {
+				if f.ThreadEvt.ID == "500" && f.ThreadEvt.Typed {
+					t.Fatal("a listing must carry the request thread untyped")
+				}
+			}
+			later := s.handleTableFrames(&table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, ThreadName: "N"}}})
+			if typed, found := typedOf(later, "500"); !found || typed {
+				t.Fatalf("a later folderless row must not type it: typed=%v found=%v", typed, found)
+			}
+		})
+	}
+}
+
+// A different non-empty folder, or a request status other than 1, clears the mark and
+// re-emits the thread typed. An empty folder neither sets nor clears it.
+func TestAcceptingARequestTypesAndReemitsTheThread(t *testing.T) {
+	s := newTestSession()
+	s.handleTableFrames(threadRow(500, "pending"))
+	// an empty folder does not clear
+	frames := s.handleTableFrames(threadRow(500, ""))
+	if typed, _ := typedOf(frames, "500"); typed {
+		t.Fatal("an empty folder must not clear the mark")
+	}
+	// an inbox row clears and re-emits typed
+	frames = s.handleTableFrames(threadRow(500, "inbox"))
+	if typed, found := typedOf(frames, "500"); !found || !typed {
+		t.Fatalf("an inbox row must type and re-emit: typed=%v found=%v", typed, found)
+	}
+	// an empty folder does not set it either
+	frames = s.handleTableFrames(threadRow(500, ""))
+	if typed, _ := typedOf(frames, "500"); !typed {
+		t.Fatal("an empty folder must not mark a thread")
+	}
+	// a status-1 row marks an existing typed thread and re-emits it untyped; status 0 clears it
+	frames = s.handleTableFrames(&table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 500, MessageRequestStatus: 1}}})
+	if typed, found := typedOf(frames, "500"); !found || typed {
+		t.Fatalf("a status-1 row must untype and re-emit: typed=%v found=%v", typed, found)
+	}
+	frames = s.handleTableFrames(&table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 500, MessageRequestStatus: 0}}})
+	if typed, found := typedOf(frames, "500"); !found || !typed {
+		t.Fatalf("status 0 must type and re-emit: typed=%v found=%v", typed, found)
+	}
+	// the mark is memory only: a new session knows nothing of it
+	if fresh := newTestSession(); len(fresh.unaccepted) != 0 {
+		t.Fatal("the mark must not be persisted")
+	}
+}
+
+// Encrypted threads are unchanged by the mark.
+func TestEncryptedThreadsAreNotAffectedByTheMark(t *testing.T) {
+	s := newTestSession()
+	frames := s.handleTableFrames(&table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{
+		{ThreadKey: 4242, ThreadType: table.ENCRYPTED_OVER_WA_ONE_TO_ONE, FolderName: "pending"},
+	}})
+	if typed, found := typedOf(frames, "e:4242"); !found || !typed {
+		t.Fatalf("encrypted rows are not covered by the mark: typed=%v found=%v", typed, found)
+	}
+}

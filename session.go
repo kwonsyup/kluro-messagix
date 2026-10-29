@@ -74,6 +74,7 @@ type messagixSession struct {
 	names        map[int64]string
 	cutover      map[int64]int64   // encrypted chat id -> its pre-encryption (open) thread key
 	fbToWA       map[int64]int64   // facebook thread key -> encrypted chat id (hybrid threads)
+	unaccepted   map[int64]bool    // facebook thread keys whose latest folder row says request or spam (memory only)
 	rowKeys      map[int64]bool    // thread rows seen this run (counts only)
 	encRowKeys   map[int64]bool    // ... of an encrypted-over-WA type
 	msgIndex     map[string]string // message id -> wire thread id
@@ -127,6 +128,7 @@ func newSession() *messagixSession {
 		names:        map[int64]string{},
 		cutover:      map[int64]int64{},
 		fbToWA:       map[int64]int64{},
+		unaccepted:   map[int64]bool{},
 		rowKeys:      map[int64]bool{},
 		encRowKeys:   map[int64]bool{},
 		msgIndex:     map[string]string{},
