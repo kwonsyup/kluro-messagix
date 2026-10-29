@@ -153,7 +153,7 @@ type savedState struct {
 	FBToWA        map[int64]int64       `json:"fb_to_wa,omitempty"`
 }
 
-func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub, cookieMap map[string]string, state []byte, mode, platform string) (Ready, []Frame, error) {
+func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub, cookieMap map[string]string, state []byte, mode, platform string) (Ready, initialEmit, error) {
 	if mode != "" && mode != "logout_only" {
 		return Ready{}, nil, errCode("bad_request")
 	}
@@ -244,9 +244,9 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 
 	// The initial table's threads are returned with the ready answer; its
 	// messages are emitted as live (idempotent) once the loop is running.
-	var frames []Frame
+	var emitInitial initialEmit
 	if initial != nil {
-		frames = s.handleTableFrames(initial)
+		emitInitial = s.initialEmitter(s.handleTableFrames(initial))
 	}
 	if err := cli.Connect(s.ctx); err != nil {
 		logCode("warn", "connect_failed")
@@ -257,7 +257,7 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 	ready := Ready{Self: strconv.FormatInt(s.selfID, 10), Name: s.selfName, History: s.checkHistory(ctx)}
 	s.markStateDirty()
 	logCode("info", "session_started")
-	return ready, frames, nil
+	return ready, emitInitial, nil
 }
 
 // restore loads everything from a previous state blob except the messagix

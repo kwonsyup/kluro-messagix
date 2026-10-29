@@ -16,6 +16,12 @@ import (
 	"sync"
 )
 
+// initialEmit emits a backend's initial thread events, right after the ready
+// answer. A backend builds each thread frame from its current state when it runs,
+// not when Start returned, so the events never reflect an older state than a
+// live frame already emitted.
+type initialEmit func(emit emitFunc)
+
 // backend is the Messenger implementation the loop drives. The messagix-backed
 // session implements it; tests use a fake. All methods may be called from the
 // loop goroutine only. Live events (thread/message/edit/unsend/state) are
@@ -24,7 +30,7 @@ type backend interface {
 	// Start signs in with cookies and restores state; it returns the ready
 	// answer and the initial thread events to emit right after it. acks is
 	// the hub whose wait blocks an event until the connector commits it.
-	Start(ctx context.Context, emit emitFunc, acks *ackHub, cookies map[string]string, state []byte, mode, platform string) (Ready, []Frame, error)
+	Start(ctx context.Context, emit emitFunc, acks *ackHub, cookies map[string]string, state []byte, mode, platform string) (Ready, initialEmit, error)
 	// HistoryPIN restores the secure-storage enrollment. It returns the new
 	// history state, or an error: *authErr for a wrong/locked PIN.
 	HistoryPIN(ctx context.Context, pin []byte) (HistoryState, error)
@@ -210,9 +216,11 @@ func run(r io.Reader, w io.Writer, mkBackend func() backend) int {
 			started = true
 			logoutOnly = f.Mode == "logout_only"
 			em.emit(Frame{T: TReady, ID: f.ID, Self: ready.Self, Name: ready.Name, History: ready.History})
-			for _, evt := range initial {
-				evt.ID = 0
-				em.emit(evt)
+			if initial != nil {
+				initial(func(evt Frame) int64 {
+					evt.ID = 0
+					return em.emit(evt)
+				})
 			}
 		case THistoryPIN:
 			if !started {

@@ -84,13 +84,13 @@ type fakeBackend struct {
 	threadStats   map[string]int // returned by Threads
 }
 
-func (f *fakeBackend) Start(_ context.Context, emit emitFunc, acks *ackHub, cookies map[string]string, state []byte, mode, platform string) (Ready, []Frame, error) {
+func (f *fakeBackend) Start(_ context.Context, emit emitFunc, acks *ackHub, cookies map[string]string, state []byte, mode, platform string) (Ready, initialEmit, error) {
 	f.acks, f.emit = acks, emit
 	f.startMode = mode
 	f.startPlatform = platform
 	th := Thread{ID: "e:42", Kind: "user", Encrypted: true, Predecessor: "42", Participants: []Person{{ID: "1", Self: true}, {ID: "42", Name: "P"}}}
 	emit(Frame{T: TState, State: []byte("s1")})
-	return Ready{Self: "1", Name: "Me", History: HistoryNeedsPIN}, []Frame{threadFrame(th)}, nil
+	return Ready{Self: "1", Name: "Me", History: HistoryNeedsPIN}, func(emit emitFunc) { emit(threadFrame(th)) }, nil
 }
 func (f *fakeBackend) HistoryPIN(_ context.Context, pin []byte) (HistoryState, error) {
 	if string(pin) == "000000" {

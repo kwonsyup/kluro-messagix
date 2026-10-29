@@ -346,6 +346,43 @@ func (s *messagixSession) emitKnownThreads(ctx context.Context, emit emitFunc) e
 		ids = append(ids, id)
 	}
 	s.mu.Unlock()
+	return s.emitThreadIDs(ctx, ids, emit)
+}
+
+// initialEmitter turns the frames Start built from the initial table into an
+// emitter that runs after ready: the thread frames are rebuilt from current state
+// at emit time (so a live rejection in between is not undone), then the other
+// frames follow in their built order.
+func (s *messagixSession) initialEmitter(frames []Frame) initialEmit {
+	var ids []string
+	var rest []Frame
+	seen := map[string]bool{}
+	for _, f := range frames {
+		if f.T != TThread {
+			rest = append(rest, f)
+		} else if !seen[f.ThreadEvt.ID] {
+			seen[f.ThreadEvt.ID] = true
+			ids = append(ids, f.ThreadEvt.ID)
+		}
+	}
+	if len(ids) == 0 && len(rest) == 0 {
+		return nil
+	}
+	return func(emit emitFunc) {
+		ctx := s.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		_ = s.emitThreadIDs(ctx, ids, emit)
+		for _, f := range rest {
+			emit(f)
+		}
+	}
+}
+
+// emitThreadIDs emits a thread frame for each id, built from the current state
+// inside the lock that covers its emit.
+func (s *messagixSession) emitThreadIDs(ctx context.Context, ids []string, emit emitFunc) error {
 	for _, id := range ids {
 		if err := ctx.Err(); err != nil {
 			return err

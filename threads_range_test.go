@@ -424,3 +424,37 @@ func TestTablesAreEmittedUnderTheSameLockAsTheirBuild(t *testing.T) {
 		})
 	}
 }
+
+// Start's initial table is applied before the connection opens but its thread frames are emitted
+// after ready; a live pending row in between must not be undone by the older frame.
+func TestInitialThreadFramesAreBuiltAtEmitTime(t *testing.T) {
+	s := newTestSession()
+	snapshot := s.handleTableFrames(&table.LSTable{
+		LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 500, ThreadType: table.ONE_TO_ONE, FolderName: "inbox", ThreadName: "Stranger", LastActivityTimestampMs: 77}},
+		LSInsertMessage:          []*table.LSInsertMessage{{ThreadKey: 500, MessageId: "mid.1", SenderId: 500, Text: "hi", TimestampMs: 1}},
+	})
+	emitInitial := s.initialEmitter(snapshot)
+	if emitInitial == nil {
+		t.Fatal("an initial table with threads must yield an emitter")
+	}
+	// the rejection arrives after Start's snapshot, before main emits the initial frames
+	s.handleTableFrames(threadRow(500, "pending"))
+	var got []Frame
+	emitInitial(func(f Frame) int64 { got = append(got, f); return 0 })
+	th := lastThread(got, "500")
+	if th == nil || th.Kind != "" || th.Typed || th.Title != "" || len(th.Participants) != 0 || th.LastActivity != 77 {
+		t.Fatalf("the initial frame must carry the unaccepted shape, not the Start-time snapshot: %+v", th)
+	}
+	// the thread frame is still ahead of the message, and the message is emitted once
+	var order []string
+	for _, f := range got {
+		order = append(order, f.T)
+	}
+	if len(order) != 2 || order[0] != TThread || order[1] != TMessage {
+		t.Fatalf("order = %v, want thread then message", order)
+	}
+	// a table with nothing to emit yields no emitter
+	if s.initialEmitter(nil) != nil {
+		t.Fatal("no frames, no emitter")
+	}
+}
