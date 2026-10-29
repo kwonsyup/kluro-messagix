@@ -77,11 +77,8 @@ type messagixSession struct {
 	fbToWA         map[int64]int64                                                                                    // facebook thread key -> encrypted chat id (hybrid threads)
 	folderMark     map[int64]bool                                                                                     // facebook thread keys whose latest non-empty folder is pending or spam (memory only)
 	statusMark     map[int64]bool                                                                                     // ... whose latest message request status row is 1 (memory only)
-	postHandle     func(tbl *table.LSTable)                                                                           // test seam; nil means the client's PostHandlePublishResponse
-	group1WaitMS   int                                                                                                // how long the listing waited for the initial group-1 range (the cap on a timeout), count only
 	e2eeOffline    int                                                                                                // queued E2EE messages the server said it would flush at connect (OfflineSyncPreview), count only
 	e2eeOfflineEnd bool                                                                                               // OfflineSyncCompleted seen
-	resumeRange    bool                                                                                               // the resume sync applied a group-1 thread range, so the keystore is already filled
 	resumeRows     int                                                                                                // rows the resumed-start sync returned, count only
 	lsRequest      func(ctx context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) // test seam; nil means the client
 	beforeListEmit func(id string)                                                                                    // test seam: runs between the listing's snapshot of ids and its emit of one
@@ -908,26 +905,6 @@ func (s *messagixSession) webLogout(ctx context.Context, cli *messagix.Client) {
 		return
 	}
 	logCode("info", "web_logout_attempted")
-}
-
-// postHandleTable feeds a table to the library's sync bookkeeping, for the resume sync
-// only, before the socket opens, when nothing else of ours touches the library's
-// sync state. The state loop's dump reads that state (DumpState marshals the sync
-// store) and starts before the resume sync, so the call is made under flushMu, which
-// every dump runs under. The library's SyncManager is unsynchronised upstream; live
-// tables are not fed to it by the helper (there would be a second writer next to the
-// library's own recursion).
-func (s *messagixSession) postHandleTable(tbl *table.LSTable) {
-	s.flushMu.Lock()
-	defer s.flushMu.Unlock()
-	if s.postHandle != nil {
-		s.postHandle(tbl)
-		return
-	}
-	s.mu.Lock()
-	cli := s.client
-	s.mu.Unlock()
-	cli.PostHandlePublishResponse(tbl)
 }
 
 // handleMetaEvent forwards messagix connection events; message tables are

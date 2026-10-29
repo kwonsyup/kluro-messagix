@@ -677,7 +677,6 @@ func (s *messagixSession) listingStats(known, emitted, unlisted int) map[string]
 		"e2ee_offline_events":   s.e2eeOffline,
 		"e2ee_offline_done":     offlineDone,
 		"resume_sync_rows":      s.resumeRows,
-		"group1_range_wait_ms":  s.group1WaitMS,
 		"encrypted_unlisted":    unlisted,
 	}
 }

@@ -2,15 +2,14 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"strings"
-	"sync"
+	"reflect"
 	"testing"
 	"time"
 
+	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/graphql"
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
@@ -19,78 +18,48 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 )
 
-// pager is a group-1 thread pager that records which sync groups were asked for.
+// pager is the thread listing's client: ExecuteTasks answers a group-1 page from a script and records the request.
+// With no script it answers one page, from group1 if set, whose range row says there is nothing more.
 type pager struct {
 	group1 *table.LSTable
-	groups []int64
+	pages  []*table.LSTable
+	cursor string
+	err    error
+	tasks  []socket.FetchThreadsTask
 }
 
-func (r *pager) FetchMoreThreads(_ context.Context, group int64) (*socket.KeyStoreData, *table.LSTable, error) {
-	r.groups = append(r.groups, group)
+func (r *pager) GetCursor(int64) string { return r.cursor }
+
+func (r *pager) ExecuteTasks(_ context.Context, tasks ...socket.Task) (*table.LSTable, error) {
+	task := tasks[0].(*socket.FetchThreadsTask)
+	r.tasks = append(r.tasks, *task)
+	if r.err != nil {
+		return nil, r.err
+	}
+	if r.pages != nil {
+		if len(r.tasks) > len(r.pages) {
+			return nil, errors.New("walked past the scripted pages")
+		}
+		return r.pages[len(r.tasks)-1], nil
+	}
 	tbl := &table.LSTable{}
-	if group == 1 && r.group1 != nil {
+	if r.group1 != nil {
 		tbl = r.group1
 	}
-	return &socket.KeyStoreData{MinThreadKey: 7}, tbl, nil
-}
-
-func (r *pager) WaitForInitialThreadRange(context.Context, int64) error { return nil }
-
-// rangePager models the real client: the keystore says there is nothing more to page until a table
-// carrying a thread range is applied through PostHandlePublishResponse, which also moves the
-// generation WaitForInitialThreadRange observes. Nothing else advances either.
-type rangePager struct {
-	mu      sync.Mutex
-	mark    uint64 // the generation when the initial fetch was marked (at connect): the wait needs a bump past it
-	gen     uint64
-	changed chan struct{}
-	pages   int
-}
-
-func newRangePager() *rangePager { return &rangePager{changed: make(chan struct{})} }
-
-func (r *rangePager) PostHandlePublishResponse(tbl *table.LSTable) {
-	if len(tbl.LSUpsertSyncGroupThreadsRange) == 0 {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.gen++
-	close(r.changed)
-	r.changed = make(chan struct{})
-}
-
-func (r *rangePager) WaitForInitialThreadRange(ctx context.Context, _ int64) error {
-	for {
-		r.mu.Lock()
-		gen, changed, mark := r.gen, r.changed, r.mark
-		r.mu.Unlock()
-		if gen > mark {
-			return nil
-		}
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-}
-
-func (r *rangePager) FetchMoreThreads(context.Context, int64) (*socket.KeyStoreData, *table.LSTable, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.pages++
-	if r.gen == 0 {
-		return &socket.KeyStoreData{HasMoreBefore: false, MinThreadKey: 100}, &table.LSTable{}, nil
-	}
-	return &socket.KeyStoreData{HasMoreBefore: r.pages < 3, MinThreadKey: int64(100 - r.pages)}, &table.LSTable{}, nil
+	tbl.LSUpsertSyncGroupThreadsRange = append(tbl.LSUpsertSyncGroupThreadsRange, &table.LSUpsertSyncGroupThreadsRange{SyncGroup: 1, HasMoreBefore: false})
+	return tbl, nil
 }
 
 func listWithin(t *testing.T, s *messagixSession, r threadPager, ctx context.Context, bound time.Duration) (frames []Frame, stats map[string]int, err error, done bool) {
+	frames, res, err, done := listGap(t, s, r, ctx, bound)
+	return frames, res.Stats, err, done
+}
+
+func listGap(t *testing.T, s *messagixSession, r threadPager, ctx context.Context, bound time.Duration) (frames []Frame, res listingDone, err error, done bool) {
 	t.Helper()
 	type result struct {
-		stats map[string]int
-		err   error
+		res listingDone
+		err error
 	}
 	ch := make(chan result, 1)
 	go func() {
@@ -99,9 +68,9 @@ func listWithin(t *testing.T, s *messagixSession, r threadPager, ctx context.Con
 	}()
 	select {
 	case v := <-ch:
-		return frames, v.stats, v.err, true
+		return frames, v.res, v.err, true
 	case <-time.After(bound):
-		return nil, nil, nil, false
+		return nil, listingDone{}, nil, false
 	}
 }
 
@@ -185,7 +154,7 @@ func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
 	}
 	wantStats(t, stats, map[string]int{
 		"group1_threads": 3, "group1_encrypted_rows": 3, "hybrid_mappings": 0, "cutover_links": 0,
-		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_unlisted": 0, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0, "group1_range_wait_ms": 0,
+		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_unlisted": 0, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
 	})
 }
 
@@ -212,7 +181,7 @@ func TestKnownEncryptedKeyWithNoTableRowIsCountedNotEmitted(t *testing.T) {
 	}
 	wantStats(t, stats, map[string]int{
 		"group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 1, "cutover_links": 2,
-		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "encrypted_unlisted": 2, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0, "group1_range_wait_ms": 0,
+		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "encrypted_unlisted": 2, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
 	})
 }
 
@@ -230,20 +199,143 @@ func TestStateWithHybridKindStillLoads(t *testing.T) {
 	}
 }
 
-// Message requests (sync group 95) are never listed: the listing pages group 1 only.
+// The listing talks to the library only through ExecuteTasks (a plain request and response) and GetCursor: it
+// cannot call FetchMoreThreads, WaitForInitialThreadRange or PostHandlePublishResponse, so it never reads or
+// writes the library's keystore or sync state. The real client satisfies it.
+var _ threadPager = (*messagix.Client)(nil)
+
+func TestListingTalksToTheLibraryOnlyThroughPlainRequests(t *testing.T) {
+	typ := reflect.TypeOf((*threadPager)(nil)).Elem()
+	var names []string
+	for i := 0; i < typ.NumMethod(); i++ {
+		names = append(names, typ.Method(i).Name)
+	}
+	if len(names) != 2 || names[0] != "ExecuteTasks" || names[1] != "GetCursor" {
+		t.Fatalf("threadPager methods = %v", names)
+	}
+}
+
+// Message requests (sync group 95) are never listed: every request is for sync group 1, with the group-1 cursor.
 func TestListingNeverTouchesGroup95(t *testing.T) {
-	r := &pager{}
-	_, stats, err, done := listWithin(t, newTestSession(), r, context.Background(), 3*time.Second)
-	if !done || err != nil || stats == nil {
-		t.Fatalf("done=%v err=%v stats=%v", done, err, stats)
+	r := &pager{cursor: "cur-1"}
+	_, res, err, done := listGap(t, newTestSession(), r, context.Background(), 3*time.Second)
+	if !done || err != nil || res.Stats == nil || res.Gap != "" {
+		t.Fatalf("done=%v err=%v res=%+v", done, err, res)
 	}
-	if len(r.groups) == 0 {
-		t.Fatal("group 1 was never paged")
+	if len(r.tasks) != 1 {
+		t.Fatalf("walk made %d requests, want 1", len(r.tasks))
 	}
-	for _, g := range r.groups {
-		if g != 1 {
-			t.Fatalf("listing asked for sync group %d", g)
+	for _, task := range r.tasks {
+		if task.SyncGroup != 1 || task.Cursor != "cur-1" {
+			t.Fatalf("listing asked %+v", task)
 		}
+	}
+}
+
+func rangeRow(more bool, parent, minKey, minTS int64) *table.LSUpsertSyncGroupThreadsRange {
+	return &table.LSUpsertSyncGroupThreadsRange{SyncGroup: 1, ParentThreadKey: parent, HasMoreBefore: more, MinThreadKey: minKey, MinLastActivityTimestampMS: minTS}
+}
+
+func page(thread int64, rows ...*table.LSUpsertSyncGroupThreadsRange) *table.LSTable {
+	return &table.LSTable{
+		LSDeleteThenInsertThread:      []*table.LSDeleteThenInsertThread{{ThreadKey: thread, ThreadType: table.ONE_TO_ONE, FolderName: "inbox", ThreadName: "T"}},
+		LSUpsertSyncGroupThreadsRange: rows,
+	}
+}
+
+// The walk starts at the first page, addresses each next page by the previous reply's group-1 range row, and ends
+// complete when a reply says there is nothing more: every thread is emitted.
+func TestWalkFollowsEachRepliesRangeRowToTheEnd(t *testing.T) {
+	r := &pager{pages: []*table.LSTable{
+		page(101, rangeRow(true, -1, 90, 5000)),
+		page(102, rangeRow(true, -1, 80, 4000)),
+		page(103, rangeRow(false, -1, 70, 3000)),
+	}}
+	frames, res, err, done := listGap(t, newTestSession(), r, context.Background(), 10*time.Second)
+	if !done || err != nil || res.Gap != "" {
+		t.Fatalf("done=%v err=%v gap=%q", done, err, res.Gap)
+	}
+	want := []socket.FetchThreadsTask{
+		{ParentThreadKey: -1, ReferenceThreadKey: 0, ReferenceActivityTimestamp: 9999999999999, Cursor: "", SyncGroup: 1},
+		{ParentThreadKey: -1, ReferenceThreadKey: 90, ReferenceActivityTimestamp: 5000, Cursor: "", SyncGroup: 1},
+		{ParentThreadKey: -1, ReferenceThreadKey: 80, ReferenceActivityTimestamp: 4000, Cursor: "", SyncGroup: 1},
+	}
+	if len(r.tasks) != 3 {
+		t.Fatalf("requests = %+v", r.tasks)
+	}
+	for i := range want {
+		if r.tasks[i] != want[i] {
+			t.Fatalf("request %d = %+v, want %+v", i, r.tasks[i], want[i])
+		}
+	}
+	got := threadsByID(frames)
+	for _, id := range []string{"101", "102", "103"} {
+		if got[id] == nil || got[id].Kind != "user" {
+			t.Fatalf("thread %s not emitted: %v", id, got)
+		}
+	}
+}
+
+// A reply with no group-1 range row, or one that does not move, ends the walk incomplete; so does the page bound.
+func TestWalkEndsIncompleteWithoutAProgressingRange(t *testing.T) {
+	for name, pages := range map[string][]*table.LSTable{
+		"no range row":        {page(101, rangeRow(true, -1, 90, 5000)), page(102)},
+		"only another group":  {page(101, &table.LSUpsertSyncGroupThreadsRange{SyncGroup: 95, HasMoreBefore: true, MinThreadKey: 1})},
+		"range does not move": {page(101, rangeRow(true, -1, 90, 5000)), page(102, rangeRow(true, -1, 90, 5000))},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := &pager{pages: pages}
+			_, res, err, done := listGap(t, newTestSession(), r, context.Background(), 10*time.Second)
+			if !done || err != nil || res.Gap != "inbox_incomplete" || res.Stats == nil {
+				t.Fatalf("done=%v err=%v res=%+v", done, err, res)
+			}
+		})
+	}
+	t.Run("page bound", func(t *testing.T) {
+		const bound = 3
+		old := threadBatchLimit
+		threadBatchLimit = bound
+		defer func() { threadBatchLimit = old }()
+		oldDelay := threadBatchDelay
+		threadBatchDelay = time.Millisecond
+		defer func() { threadBatchDelay = oldDelay }()
+		var pages []*table.LSTable
+		for i := int64(1); i <= bound+2; i++ {
+			pages = append(pages, page(100+i, rangeRow(true, -1, 100-i, 9000-i)))
+		}
+		r := &pager{pages: pages}
+		_, res, err, done := listGap(t, newTestSession(), r, context.Background(), 10*time.Second)
+		if !done || err != nil || res.Gap != "inbox_incomplete" || len(r.tasks) != bound {
+			t.Fatalf("done=%v err=%v gap=%q requests=%d, want %d", done, err, res.Gap, len(r.tasks), bound)
+		}
+	})
+}
+
+// A failed request is the listing's error, as before.
+func TestWalkRequestErrorFailsTheListing(t *testing.T) {
+	r := &pager{err: errors.New("boom")}
+	_, res, err, done := listGap(t, newTestSession(), r, context.Background(), 3*time.Second)
+	if !done || err == nil || res.Stats != nil {
+		t.Fatalf("done=%v err=%v res=%+v", done, err, res)
+	}
+}
+
+// threads_done carries the gap through the loop, and no gap key when complete.
+func TestThreadsDoneCarriesTheInboxGap(t *testing.T) {
+	const startAndList = `{"t":"start","id":1,"cookies":{"c_user":"1","xs":"x","datr":"d"}}`
+	frames := runLoop(t, &fakeBackend{threadGap: "inbox_incomplete"}, startAndList, `{"t":"threads","id":2}`)
+	var done *Frame
+	for i, f := range frames {
+		if f.ID == 2 {
+			done = &frames[i]
+		}
+	}
+	if done == nil || done.T != TThreadsDone || done.Gap != "inbox_incomplete" || done.Err != "" {
+		t.Fatalf("gap answer = %+v", done)
+	}
+	b, _ := json.Marshal(Frame{T: TThreadsDone, ID: 2, Gap: "inbox_incomplete"})
+	if string(b) != `{"t":"threads_done","id":2,"gap":"inbox_incomplete"}` {
+		t.Fatalf("wire = %s", b)
 	}
 }
 
@@ -751,173 +843,4 @@ func TestOpenSocketChecksTheCallersCancelBeforeConnecting(t *testing.T) {
 	if err != nil || !connected || frames != nil {
 		t.Fatalf("a sync timeout must still connect: err=%v connected=%v frames=%v", err, connected, frames)
 	}
-}
-
-func withGroup1Wait(t *testing.T, d time.Duration) {
-	old := group1RangeWait
-	group1RangeWait = d
-	t.Cleanup(func() { group1RangeWait = old })
-}
-
-// The range never arrives: after the cap the listing pages anyway, with no error, and the stat is the cap.
-func TestPagingGoesAheadWhenTheGroup1RangeNeverArrives(t *testing.T) {
-	withGroup1Wait(t, 100*time.Millisecond)
-	var logged bytes.Buffer
-	oldErr := stderr
-	stderr = &logged
-	defer func() { stderr = oldErr }()
-	r := newRangePager()
-	_, stats, err, done := listWithin(t, newTestSession(), r, context.Background(), 5*time.Second)
-	if !done || err != nil || stats == nil {
-		t.Fatalf("a missing range must not fail the listing: done=%v err=%v", done, err)
-	}
-	if r.pages != 1 {
-		t.Fatalf("pages = %d, want the single early page", r.pages)
-	}
-	if !strings.Contains(logged.String(), `"code":"group1_range_timeout"`) || !strings.Contains(logged.String(), `"level":"info"`) {
-		t.Fatalf("log = %q", logged.String())
-	}
-	if w := stats["group1_range_wait_ms"]; w != 100 {
-		t.Fatalf("group1_range_wait_ms = %d, want the cap 100", w)
-	}
-}
-
-func TestCancelDuringTheGroup1RangeWait(t *testing.T) {
-	withGroup1Wait(t, time.Minute)
-	r := newRangePager()
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
-	_, stats, err, done := listWithin(t, newTestSession(), r, ctx, 3*time.Second)
-	if !done || err == nil || stats != nil || r.pages != 0 {
-		t.Fatalf("cancel must free the wait and not page: done=%v err=%v stats=%v pages=%d", done, err, stats, r.pages)
-	}
-}
-
-// The resume-sync tables go through the library's bookkeeping before connect, in the order they were fetched.
-// A group-1 range row in database 1's table is therefore in the keystore before the socket opens. The library marks
-// its initial fetch at connect, after that, so a wait for a bump past the mark would sit out the cap: the listing
-// skips the wait when the resume sync already supplied the range, and still waits when it did not.
-func TestResumeSyncTablesAreAppliedToTheLibraryBeforeConnect(t *testing.T) {
-	withGroup1Wait(t, 5*time.Second)
-	rangeRow := &table.LSTable{LSUpsertSyncGroupThreadsRange: []*table.LSUpsertSyncGroupThreadsRange{{SyncGroup: 1, HasMoreBefore: true, MinThreadKey: 5}}}
-	snapshot := func(withRange bool) func(context.Context, *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
-		return func(_ context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
-			if v.Database == 1 && withRange {
-				return &table.LSTable{LSUpsertSyncGroupThreadsRange: rangeRow.LSUpsertSyncGroupThreadsRange, LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 600, ThreadType: table.ONE_TO_ONE}}}, nil
-			}
-			return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: int64(600 + v.Database), ThreadType: table.ONE_TO_ONE}}}, nil
-		}
-	}
-	// connect marks the initial fetch at the current generation, as the library does at socket.go:137.
-	markAtConnect := func(r *rangePager) func(context.Context) error {
-		return func(context.Context) error {
-			r.mu.Lock()
-			r.mark = r.gen
-			r.mu.Unlock()
-			return nil
-		}
-	}
-
-	// With a range row: applied before connect, in order; the wait is skipped; paging goes past page 1.
-	s := newTestSession()
-	s.ctx = context.Background()
-	r := newRangePager()
-	var applied []int
-	s.postHandle = func(tbl *table.LSTable) {
-		applied = append(applied, len(tbl.LSDeleteThenInsertThread)*10+len(tbl.LSUpsertSyncGroupThreadsRange))
-		r.PostHandlePublishResponse(tbl)
-	}
-	s.lsRequest = snapshot(true)
-	genBeforeConnect := uint64(99)
-	connect := markAtConnect(r)
-	if _, err := s.openSocket(context.Background(), true, savedConfig(t, 123), func(ctx context.Context) error {
-		r.mu.Lock()
-		genBeforeConnect = r.gen
-		r.mu.Unlock()
-		return connect(ctx)
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if genBeforeConnect != 1 || len(applied) != 2 || applied[0] != 11 || applied[1] != 10 {
-		t.Fatalf("the snapshot's tables (db 1 then 2) must reach the bookkeeping before connect: gen=%d applied=%v", genBeforeConnect, applied)
-	}
-	start := time.Now()
-	_, stats, err, done := listWithin(t, s, r, context.Background(), 10*time.Second)
-	if !done || err != nil || time.Since(start) > 3*time.Second || stats["group1_range_wait_ms"] != 0 || r.pages < 2 {
-		t.Fatalf("the wait must be skipped and paging go past page 1: done=%v err=%v wait=%d pages=%d took=%v", done, err, stats["group1_range_wait_ms"], r.pages, time.Since(start))
-	}
-
-	// Without a range row: nothing is skipped, the wait runs to the cap and paging goes ahead.
-	withGroup1Wait(t, 150*time.Millisecond)
-	s2 := newTestSession()
-	s2.ctx = context.Background()
-	r2 := newRangePager()
-	s2.postHandle = r2.PostHandlePublishResponse
-	s2.lsRequest = snapshot(false)
-	if _, err := s2.openSocket(context.Background(), true, savedConfig(t, 123), markAtConnect(r2)); err != nil {
-		t.Fatal(err)
-	}
-	if r2.gen != 0 || s2.resumeRange {
-		t.Fatal("a snapshot without a range row must not advance the generation or skip the wait")
-	}
-	_, stats2, err, done := listWithin(t, s2, r2, context.Background(), 10*time.Second)
-	if !done || err != nil || stats2["group1_range_wait_ms"] != 150 || r2.pages != 1 {
-		t.Fatalf("with no range the wait runs to the cap and paging goes ahead: done=%v err=%v wait=%d pages=%d", done, err, stats2["group1_range_wait_ms"], r2.pages)
-	}
-}
-
-// Nothing else reads the library's sync state while the pre-connect bookkeeping writes it: the state loop starts before
-// the resume sync, and its dump marshals that state, so the bookkeeping runs under the lock every dump runs under.
-func TestResumeBookkeepingExcludesTheStateDump(t *testing.T) {
-	s := newTestSession()
-	s.ctx = context.Background()
-	s.lsRequest = func(context.Context, *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
-		return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 600, ThreadType: table.ONE_TO_ONE}}}, nil
-	}
-	calls := 0
-	s.postHandle = func(*table.LSTable) {
-		calls++
-		if s.flushMu.TryLock() {
-			s.flushMu.Unlock()
-			t.Error("the bookkeeping ran without the lock a state dump runs under")
-		}
-	}
-	s.resumeSync(context.Background(), savedConfig(t, 123))
-	if calls != 2 {
-		t.Fatalf("bookkeeping calls = %d, want 2", calls)
-	}
-}
-
-// Database 2 is applied whole before its cursor moves: a contact row in it is consumed (a participant name is
-// recorded) before the table reaches the library's bookkeeping, and database 1 is applied before its own.
-func TestResumeSyncAppliesEveryDatabaseBeforeItsCursorMoves(t *testing.T) {
-	s := newTestSession()
-	var order []string
-	s.postHandle = func(tbl *table.LSTable) {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if len(tbl.LSDeleteThenInsertContact) > 0 {
-			order = append(order, "db2 posted, name known="+s.names[42])
-		} else {
-			order = append(order, "db1 posted, thread known="+boolStr(s.threads["600"] != nil))
-		}
-	}
-	s.lsRequest = func(ctx context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
-		if v.Database == 2 {
-			return &table.LSTable{LSDeleteThenInsertContact: []*table.LSDeleteThenInsertContact{{Id: 42, Name: "Renamed"}}}, nil
-		}
-		return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 600, ThreadType: table.ONE_TO_ONE}}}, nil
-	}
-	s.resumeSync(context.Background(), savedConfig(t, 123))
-	want := []string{"db1 posted, thread known=true", "db2 posted, name known=Renamed"}
-	if len(order) != 2 || order[0] != want[0] || order[1] != want[1] {
-		t.Fatalf("every table must be applied before its own bookkeeping: %v, want %v", order, want)
-	}
-}
-
-func boolStr(b bool) string {
-	if b {
-		return "true"
-	}
-	return "false"
 }

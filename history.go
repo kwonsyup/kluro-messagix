@@ -327,37 +327,47 @@ func mapAuthOrUnknown(err error) error {
 
 var _ = waTypes.MessengerServer
 
-const (
+var (
 	threadBatchLimit = 400
 	threadBatchDelay = 500 * time.Millisecond
 )
 
-// threadPager is the part of the messagix client the thread listing uses.
+// threadPager is the part of the messagix client the thread listing uses. The listing
+// owns its paging: ExecuteTasks is a plain request and response, so it never reads or
+// writes the library's keystore or cursors, and GetCursor is the one read of the
+// group-1 cursor the library's own page fetch makes.
 type threadPager interface {
-	FetchMoreThreads(ctx context.Context, syncGroup int64) (*socket.KeyStoreData, *table.LSTable, error)
-	WaitForInitialThreadRange(ctx context.Context, syncGroup int64) error
+	ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error)
+	GetCursor(db int64) string
 }
 
-// group1RangeWait bounds the wait for the initial group-1 range. The range only
-// arrives from the server once the socket is up, and until it does the keystore
-// says there is nothing more to page, so paging first stops after one page.
-var group1RangeWait = 15 * time.Second
+// listingDone is what a finished listing reports on threads_done: counts, and a fixed
+// gap code when the inbox was not walked to its end.
+type listingDone struct {
+	Stats map[string]int
+	Gap   string
+}
+
+// gapInboxIncomplete says the walk of sync group 1 ended before the server said there
+// was nothing more (no range row in a reply, no progress, or the page bound).
+const gapInboxIncomplete = "inbox_incomplete"
 
 // Threads lists every thread: the ones already known, then the rest of the main
-// inbox (sync group 1) by paging it as the web client scrolls it in. Message
-// requests (sync group 95) are never listed: they are not imported until the
-// user accepts them in Messenger. The counts it returns go out on threads_done.
-func (s *messagixSession) Threads(ctx context.Context, emit emitFunc) (map[string]int, error) {
+// inbox (sync group 1), walked page by page with the requests the web client scrolls
+// it with. Message requests (sync group 95) are never listed: they are not imported
+// until the user accepts them in Messenger. The counts and any gap it returns go out
+// on threads_done.
+func (s *messagixSession) Threads(ctx context.Context, emit emitFunc) (listingDone, error) {
 	s.mu.Lock()
 	cli := s.client
 	s.mu.Unlock()
 	if cli == nil {
-		return nil, errCode("not_started")
+		return listingDone{}, errCode("not_started")
 	}
 	return s.listThreads(ctx, cli, emit)
 }
 
-func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit emitFunc) (map[string]int, error) {
+func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit emitFunc) (listingDone, error) {
 	emitted := map[string]bool{}
 	counted := func(f Frame) int64 {
 		if f.T == TThread && f.ThreadEvt != nil && f.ThreadEvt.Encrypted {
@@ -366,62 +376,41 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit
 		return emit(f)
 	}
 	if err := s.emitKnownThreads(ctx, counted); err != nil {
-		return nil, err
+		return listingDone{}, err
 	}
-	if err := s.pageThreads(ctx, cli, counted); err != nil {
-		return nil, err
+	gap, err := s.pageThreads(ctx, cli, counted)
+	if err != nil {
+		return listingDone{}, err
 	}
 	known, unlisted := s.encryptedCounts()
-	return s.listingStats(known, len(emitted), unlisted), nil
+	return listingDone{Stats: s.listingStats(known, len(emitted), unlisted), Gap: gap}, nil
 }
 
-// waitGroup1Range waits for the initial group-1 range before paging. A timeout is
-// not an error: the inbox list is still usable, so it logs a fixed code and pages
-// anyway. It records how long the wait took (the cap on a timeout).
-func (s *messagixSession) waitGroup1Range(ctx context.Context, cli threadPager) error {
-	s.mu.Lock()
-	filled := s.resumeRange
-	s.mu.Unlock()
-	if filled {
-		// The resume sync already wrote the group-1 range into the keystore before the
-		// socket opened. The library's initial-fetch mark is set at connect, after
-		// that, so its wait would only see a later bump: skip it.
-		return nil
-	}
-	wctx, cancel := context.WithTimeout(ctx, group1RangeWait)
-	defer cancel()
-	start := time.Now()
-	err := cli.WaitForInitialThreadRange(wctx, 1)
-	waited := time.Since(start)
-	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		logCode("info", "group1_range_timeout")
-		waited = group1RangeWait
-	}
-	s.mu.Lock()
-	s.group1WaitMS = int(waited.Milliseconds())
-	s.mu.Unlock()
-	return nil
-}
-
-func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit emitFunc) error {
+// pageThreads walks sync group 1 from its first page. Each reply goes through the
+// normal table path; the next page is addressed by the group-1 range row of that
+// same reply (its parent key, minimum thread key and minimum activity time), and the
+// walk is complete only when a reply says there is nothing more before. A reply with
+// no group-1 range row, a range that does not move, or the page bound ends it
+// incomplete. The group-1 cursor is read from the library once per request, as its
+// own page fetch does; nothing is written to the library.
+func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit emitFunc) (gap string, err error) {
 	const group = 1
-	if err := s.waitGroup1Range(ctx, cli); err != nil {
-		return err
-	}
-	var prevMin int64
+	ref := socket.FetchThreadsTask{ParentThreadKey: -1, ReferenceThreadKey: 0, ReferenceActivityTimestamp: 9999999999999}
 	for batch := 0; batch < threadBatchLimit; batch++ {
 		if err := ctx.Err(); err != nil {
-			return err
+			return "", err
 		}
-		ks, tbl, err := cli.FetchMoreThreads(ctx, group)
+		task := ref
+		task.IsAfter = 0
+		task.AdditionalPagesToFetch = 0
+		task.Cursor = cli.GetCursor(group)
+		task.SyncGroup = group
+		tbl, err := cli.ExecuteTasks(ctx, &task)
 		if err != nil {
-			return mapSendErr(err)
+			return "", mapSendErr(err)
 		}
-		if tbl == nil || ks == nil {
-			return nil
+		if tbl == nil {
+			return gapInboxIncomplete, nil
 		}
 		s.handleTableEmit(tbl, func(f Frame) int64 {
 			if ctx.Err() != nil {
@@ -430,19 +419,38 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 			return emit(f)
 		})
 		if err := ctx.Err(); err != nil {
-			return err
+			return "", err
 		}
-		if !ks.HasMoreBefore || ks.MinThreadKey == prevMin {
-			return nil
+		rng := group1Range(tbl)
+		if rng == nil {
+			return gapInboxIncomplete, nil
 		}
-		prevMin = ks.MinThreadKey
+		if !rng.HasMoreBefore {
+			return "", nil
+		}
+		next := socket.FetchThreadsTask{ParentThreadKey: rng.ParentThreadKey, ReferenceThreadKey: rng.MinThreadKey, ReferenceActivityTimestamp: rng.MinLastActivityTimestampMS}
+		if next.ParentThreadKey == ref.ParentThreadKey && next.ReferenceThreadKey == ref.ReferenceThreadKey && next.ReferenceActivityTimestamp == ref.ReferenceActivityTimestamp {
+			return gapInboxIncomplete, nil
+		}
+		ref = next
 		select {
 		case <-time.After(threadBatchDelay):
 		case <-ctx.Done():
-			return ctx.Err()
+			return "", ctx.Err()
 		}
 	}
-	return nil
+	return gapInboxIncomplete, nil
+}
+
+// group1Range is the last sync-group-1 thread range row of a reply, or nil.
+func group1Range(tbl *table.LSTable) *table.LSUpsertSyncGroupThreadsRange {
+	var out *table.LSUpsertSyncGroupThreadsRange
+	for _, r := range tbl.LSUpsertSyncGroupThreadsRange {
+		if r.SyncGroup == 1 {
+			out = r
+		}
+	}
+	return out
 }
 
 func nowMS() int64 { return time.Now().UnixMilli() }

@@ -17,8 +17,7 @@ var resumeSyncTimeout = 20 * time.Second
 
 // resumeSyncDatabases are the sync databases the resume sync asks for: the inbox (1)
 // and the contacts (2). The page load also asks for 95, the message-requests inbox;
-// requests are not imported, and 95's only other content (cutover links) is not worth
-// carrying it, so its table and cursor are left to the library's own socket sync.
+// requests are not imported, and 95's cursor is left to the library's own socket sync.
 var resumeSyncDatabases = []int64{1, 2}
 
 // resumeSync is the GraphQL sync a page load runs, for the inbox (1) and the contacts
@@ -28,12 +27,12 @@ var resumeSyncDatabases = []int64{1, 2}
 // honoured: a failure logs a fixed code and returns what was applied (nothing if
 // database 1 failed).
 //
-// Each database's table is applied to the session first and only then given to the
-// library's sync bookkeeping (PostHandlePublishResponse), which moves that database's
-// cursor and thread ranges, in the order the library applies them: every row is
-// consumed before its cursor moves, so none is acknowledged and lost (the library
-// itself keeps only database 1's table). The fail-closed rule for message requests
-// applies to every row. The returned frames are for the initial emitter.
+// Each table is only applied to the session (frames for the initial emitter); the
+// helper never writes the library's sync state. The cursors therefore stay where the
+// saved state left them and the library's own socket sync replays the same rows. A
+// replay is harmless: thread frames merge into the same thread record and are upserts
+// downstream, and the helper's messages carry their ids, which the connector's
+// import dedupes. The fail-closed rule for message requests applies to every row.
 func (s *messagixSession) resumeSync(ctx context.Context, saved json.RawMessage) []Frame {
 	var cfg struct {
 		Configs struct {
@@ -87,31 +86,11 @@ func (s *messagixSession) resumeSync(ctx context.Context, saved json.RawMessage)
 		}
 		frames = append(frames, s.handleTableFrames(tbl)...)
 		rows += countRows(tbl)
-		if db == 1 && hasGroup1Range(tbl) {
-			s.mu.Lock()
-			s.resumeRange = true
-			s.mu.Unlock()
-		}
-		// The library applies each database's cursors and thread ranges right after its
-		// request (SyncDataGraphQL); the snapshot's are fresher than the cached ones.
-		// Outside s.mu, before connect.
-		s.postHandleTable(tbl)
 	}
 	s.mu.Lock()
 	s.resumeRows = rows
 	s.mu.Unlock()
 	return frames
-}
-
-// hasGroup1Range reports whether a table carries a thread range for sync group 1,
-// which the bookkeeping that follows writes into the library's keystore.
-func hasGroup1Range(tbl *table.LSTable) bool {
-	for _, r := range tbl.LSUpsertSyncGroupThreadsRange {
-		if r.SyncGroup == 1 {
-			return true
-		}
-	}
-	return false
 }
 
 // countRows is the number of rows in a table, over every row-list field.
