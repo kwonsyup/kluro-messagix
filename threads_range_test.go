@@ -373,14 +373,96 @@ func TestAcceptingARequestTypesAndReemitsTheThread(t *testing.T) {
 	}
 }
 
-// Encrypted threads are unchanged by the mark.
-func TestEncryptedThreadsAreNotAffectedByTheMark(t *testing.T) {
+// The request marks apply to encrypted threads too: a database-95 origin, a pending or spam folder and a
+// request status of 1 each hold an e: thread as {id, last_activity_ms}; an unmarked encrypted row is typed.
+func TestEncryptedThreadsAreHeldByTheSameMarks(t *testing.T) {
+	enc := func(folder string) *table.LSTable {
+		return &table.LSTable{LSVerifyThreadExists: []*table.LSVerifyThreadExists{{ThreadKey: 4242, ThreadType: table.ENCRYPTED_OVER_WA_ONE_TO_ONE, FolderName: folder}}}
+	}
+	minimal := func(th *Thread) bool {
+		return th != nil && th.Kind == "" && !th.Typed && !th.Encrypted && th.Title == "" && len(th.Participants) == 0 && !connectorWouldQualify(th)
+	}
+	// database 95, no folder
 	s := newTestSession()
-	frames := s.handleTableFrames(&table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{
-		{ThreadKey: 4242, ThreadType: table.ENCRYPTED_OVER_WA_ONE_TO_ONE, FolderName: "pending"},
-	}})
-	if typed, found := typedOf(frames, "e:4242"); !found || !typed {
-		t.Fatalf("encrypted rows are not covered by the mark: typed=%v found=%v", typed, found)
+	if th := lastThread(s.handleRequestTableFrames(enc("")), "e:4242"); !minimal(th) {
+		t.Fatalf("a database-95 encrypted row with no folder must go out minimal: %+v", th)
+	}
+	// a pending folder
+	s = newTestSession()
+	if th := lastThread(s.handleTableFrames(enc("pending")), "e:4242"); !minimal(th) {
+		t.Fatalf("a pending encrypted row must go out minimal: %+v", th)
+	}
+	// a status-1 request row
+	s = newTestSession()
+	st1 := enc("")
+	st1.LSDeleteThenInsertMessageRequest = []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 4242, MessageRequestStatus: 1}}
+	if th := lastThread(s.handleTableFrames(st1), "e:4242"); !minimal(th) {
+		t.Fatalf("a status-1 encrypted row must go out minimal: %+v", th)
+	}
+	// no marks: typed
+	s = newTestSession()
+	if th := lastThread(s.handleTableFrames(enc("inbox")), "e:4242"); th == nil || th.Kind != "user" || !th.Typed || !th.Encrypted {
+		t.Fatalf("an unmarked encrypted row is typed: %+v", th)
+	}
+	// an accepted row releases it
+	s = newTestSession()
+	s.handleRequestTableFrames(enc(""))
+	if th := lastThread(s.handleTableFrames(enc("inbox")), "e:4242"); th == nil || th.Kind != "user" || !th.Typed || !th.Encrypted {
+		t.Fatalf("an inbox row must release a held encrypted thread: %+v", th)
+	}
+}
+
+// A mark carries across the plaintext key and the encrypted key of the same chat, in both directions,
+// and an accepted signal on either form releases both.
+func TestMarksCarryAcrossAChatsPlaintextAndEncryptedKeys(t *testing.T) {
+	plain := func(key int64, folder string) *table.LSTable {
+		return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: key, ThreadType: table.ONE_TO_ONE, FolderName: folder, ThreadName: "P"}}}
+	}
+	encRow := func(key int64, folder string) *table.LSTable {
+		return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: key, ThreadType: table.ENCRYPTED_OVER_WA_ONE_TO_ONE, FolderName: folder}}}
+	}
+	held := func(th *Thread) bool { return th != nil && th.Kind == "" && !th.Typed }
+	free := func(th *Thread) bool { return th != nil && th.Kind == "user" && th.Typed }
+
+	// the same number: plaintext 700 marked, then an encrypted row 700 with no folder
+	s := newTestSession()
+	s.handleTableFrames(plain(700, "pending"))
+	if th := lastThread(s.handleTableFrames(encRow(700, "")), "e:700"); !held(th) {
+		t.Fatalf("the encrypted thread must inherit the plaintext key's mark: %+v", th)
+	}
+	// an accepted encrypted row releases the plaintext thread too
+	frames := s.handleTableFrames(encRow(700, "inbox"))
+	if !free(lastThread(frames, "e:700")) || !free(lastThread(frames, "700")) {
+		t.Fatalf("an accepted row must release both forms: e=%+v p=%+v", lastThread(frames, "e:700"), lastThread(frames, "700"))
+	}
+
+	// a hybrid mapping: plaintext 400 marked, mapped to chat 1400, then an encrypted row for 1400
+	s = newTestSession()
+	s.handleTableFrames(plain(400, "pending"))
+	s.handleTableFrames(&table.LSTable{LSVerifyHybridThreadExists: []*table.LSVerifyHybridThreadExists{{ThreadKey: 400, ThreadJID: 1400, ThreadType: table.ONE_TO_ONE}}})
+	if th := lastThread(s.handleTableFrames(encRow(1400, "")), "e:1400"); !held(th) {
+		t.Fatalf("a mapped chat's encrypted thread must inherit the plaintext mark: %+v", th)
+	}
+	// an accepted row on the encrypted key releases the marked plaintext key of the mapped chat
+	frames = s.handleTableFrames(encRow(1400, "inbox"))
+	if !free(lastThread(frames, "e:1400")) || !free(lastThread(frames, "400")) {
+		t.Fatalf("an accepted encrypted row must release the mapped plaintext key: e=%+v p=%+v", lastThread(frames, "e:1400"), lastThread(frames, "400"))
+	}
+	// and the other direction: an encrypted-key mark holds the plaintext thread
+	s = newTestSession()
+	s.handleTableFrames(plain(400, "inbox"))
+	s.handleTableFrames(&table.LSTable{LSVerifyHybridThreadExists: []*table.LSVerifyHybridThreadExists{{ThreadKey: 400, ThreadJID: 1400, ThreadType: table.ONE_TO_ONE}}})
+	frames = s.handleTableFrames(&table.LSTable{LSVerifyThreadExists: []*table.LSVerifyThreadExists{{ThreadKey: 1400, ThreadType: table.ENCRYPTED_OVER_WA_ONE_TO_ONE, FolderName: "pending"}}})
+	if th := lastThread(frames, "400"); !held(th) {
+		t.Fatalf("a mark on the encrypted key must hold the plaintext thread and re-emit it: %+v", th)
+	}
+
+	// a cutover link: the open thread marked, the linked encrypted thread inherits it
+	s = newTestSession()
+	s.handleTableFrames(plain(42, "spam"))
+	s.handleTableFrames(&table.LSTable{LSCreateOpenToE2EEThreadLink: []*table.LSCreateOpenToE2EEThreadLink{{OpenThreadID: 42, ArmadilloThreadID: 4242}}})
+	if th := lastThread(s.handleTableFrames(encRow(4242, "")), "e:4242"); !held(th) {
+		t.Fatalf("the encrypted thread must inherit its open thread's mark: %+v", th)
 	}
 }
 

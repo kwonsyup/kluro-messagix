@@ -110,21 +110,25 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) []Frame {
 // The caller holds s.mu.
 func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []Frame) {
 	dirty := false
+	touched := map[string]bool{}
 	for _, c := range tbl.LSCreateOpenToE2EEThreadLink {
 		if s.cutover[c.ArmadilloThreadID] != c.OpenThreadID {
 			s.cutover[c.ArmadilloThreadID] = c.OpenThreadID
+			s.touchUnacceptedLocked(touched, c.ArmadilloThreadID)
 			dirty = true
 		}
 	}
 	for _, j := range tbl.LSUpdateThreadAuthorityAndMappingWithOTIDFromJID {
 		if s.fbToWA[j.ThreadKey] != j.ThreadJID {
 			s.fbToWA[j.ThreadKey] = j.ThreadJID
+			s.touchUnacceptedLocked(touched, j.ThreadKey)
 			dirty = true
 		}
 	}
 	for _, j := range tbl.LSVerifyHybridThreadExists {
 		if s.fbToWA[j.ThreadKey] != j.ThreadJID {
 			s.fbToWA[j.ThreadKey] = j.ThreadJID
+			s.touchUnacceptedLocked(touched, j.ThreadKey)
 			dirty = true
 		}
 	}
@@ -139,7 +143,6 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []F
 		}
 	}
 
-	touched := map[string]bool{}
 	// A thread row in the "pending" or "spam" folder, or a message request row with
 	// status 1, marks the thread unaccepted: it is emitted with Typed=false whatever
 	// its type, so the connector qualifies nothing from it. Any other non-empty
@@ -150,15 +153,28 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []F
 	// and the latest request status row. A status row only clears what a status row
 	// set, and a folder only clears what a folder set, so a spam folder stays
 	// unaccepted next to a status-0 row, as in the library.
+	// A mark belongs to the chat, not to one key: it is set on the row's key, read
+	// through every related key (the same number as a plaintext and an encrypted
+	// thread, a hybrid mapping, a cutover link), and cleared on all of them, so an
+	// accepted signal on either form accepts the chat. A change re-emits every
+	// existing thread of the chat.
 	set := func(marks map[int64]bool, key int64, on bool) {
-		before := s.unacceptedLocked(key)
+		changed := false
 		if on {
-			marks[key] = true
+			if !marks[key] {
+				marks[key] = true
+				changed = true
+			}
 		} else {
-			delete(marks, key)
+			for _, k := range s.relatedKeysLocked(key) {
+				if marks[k] {
+					delete(marks, k)
+					changed = true
+				}
+			}
 		}
-		if s.unacceptedLocked(key) != before && s.threads[wireID(false, key)] != nil {
-			touched[wireID(false, key)] = true
+		if changed {
+			s.touchRelatedLocked(touched, key)
 		}
 	}
 	markFolder := func(key int64, folder string) {
@@ -351,13 +367,14 @@ func threadFrame(t Thread) Frame { return Frame{T: TThread, ThreadEvt: &t} }
 // wireThreadLocked builds the protocol thread. A one-to-one thread names the
 // other person; an encrypted thread names the open thread it continues.
 func (s *messagixSession) wireThreadLocked(t *threadInfo) Thread {
-	if !t.Enc && s.unacceptedLocked(t.Key) {
+	if s.unacceptedLocked(t.Key) {
 		// A message request qualifies for nothing: the connector imports any
 		// one-to-one thread that names another person, typed or not, so the frame
 		// carries no kind, no type, no participants and no title (usually the
 		// stranger's name). The real ones stay in
-		// memory and go out when a later row accepts the thread.
-		return Thread{ID: wireID(false, t.Key), LastActivity: t.LastActivity}
+		// memory and go out when a later row accepts the thread. An encrypted thread
+		// is held the same way: any mark of its chat applies to it.
+		return Thread{ID: wireID(t.Enc, t.Key), LastActivity: t.LastActivity}
 	}
 	out := Thread{ID: wireID(t.Enc, t.Key), Kind: t.Kind, Typed: t.Typed, Title: t.Title, Encrypted: t.Enc, LastActivity: t.LastActivity}
 	if t.Enc {
@@ -385,7 +402,64 @@ func (s *messagixSession) wireThread(t *threadInfo) Thread {
 // unacceptedLocked reports whether a facebook thread is a message request or
 // spam by either source. The caller holds s.mu.
 func (s *messagixSession) unacceptedLocked(key int64) bool {
-	return s.folderMark[key] || s.statusMark[key] || s.requestSource[key]
+	for _, k := range s.relatedKeysLocked(key) {
+		if s.folderMark[k] || s.statusMark[k] || s.requestSource[k] {
+			return true
+		}
+	}
+	return false
+}
+
+// relatedKeysLocked is the keys of the same chat as key, key included: the number
+// itself (a plaintext thread and its encrypted form share it), the hybrid mapping
+// either way, and the cutover link either way. The caller holds s.mu.
+func (s *messagixSession) relatedKeysLocked(key int64) []int64 {
+	out := []int64{key}
+	add := func(k int64) {
+		for _, have := range out {
+			if have == k {
+				return
+			}
+		}
+		out = append(out, k)
+	}
+	if w, ok := s.fbToWA[key]; ok {
+		add(w)
+	}
+	for fb, w := range s.fbToWA {
+		if w == key {
+			add(fb)
+		}
+	}
+	if open, ok := s.cutover[key]; ok {
+		add(open)
+	}
+	for armadillo, open := range s.cutover {
+		if open == key {
+			add(armadillo)
+		}
+	}
+	return out
+}
+
+// touchRelatedLocked marks every existing thread of key's chat, plaintext or
+// encrypted, for re-emission.
+func (s *messagixSession) touchRelatedLocked(touched map[string]bool, key int64) {
+	for _, k := range s.relatedKeysLocked(key) {
+		for _, enc := range []bool{false, true} {
+			if id := wireID(enc, k); s.threads[id] != nil {
+				touched[id] = true
+			}
+		}
+	}
+}
+
+// touchUnacceptedLocked is touchRelatedLocked for a chat that is unaccepted, used
+// when a mapping or link changes which threads belong to it.
+func (s *messagixSession) touchUnacceptedLocked(touched map[string]bool, key int64) {
+	if s.unacceptedLocked(key) {
+		s.touchRelatedLocked(touched, key)
+	}
 }
 
 // emitKnownThreads emits a thread frame for every thread the helper knows. Each
