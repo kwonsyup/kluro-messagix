@@ -153,7 +153,7 @@ func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
 		t.Fatal("a plain existence row must not create a thread")
 	}
 	wantStats(t, stats, map[string]int{
-		"group1_threads": 3, "group1_encrypted_rows": 3, "hybrid_mappings": 0, "cutover_links": 0,
+		"inbox_stop": 0, "inbox_pages": 1, "group1_threads": 3, "group1_encrypted_rows": 3, "hybrid_mappings": 0, "cutover_links": 0,
 		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_unlisted": 0, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
 	})
 }
@@ -180,7 +180,7 @@ func TestKnownEncryptedKeyWithNoTableRowIsCountedNotEmitted(t *testing.T) {
 		t.Fatal("the already-known encrypted thread must still be listed")
 	}
 	wantStats(t, stats, map[string]int{
-		"group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 1, "cutover_links": 2,
+		"inbox_stop": 0, "inbox_pages": 1, "group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 1, "cutover_links": 2,
 		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "encrypted_unlisted": 2, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
 	})
 }
@@ -913,5 +913,29 @@ func TestOpenSocketChecksTheCallersCancelBeforeConnecting(t *testing.T) {
 	frames, err := s2.openSocket(context.Background(), true, savedConfig(t, 123), func(context.Context) error { connected = true; return nil })
 	if err != nil || !connected || frames != nil {
 		t.Fatalf("a sync timeout must still connect: err=%v connected=%v frames=%v", err, connected, frames)
+	}
+}
+
+func TestInboxStopStats(t *testing.T) {
+	oldLimit, oldDelay := threadBatchLimit, threadBatchDelay
+	threadBatchLimit, threadBatchDelay = 2, time.Millisecond
+	defer func() { threadBatchLimit, threadBatchDelay = oldLimit, oldDelay }()
+	for _, tc := range []struct {
+		name        string
+		pages       []*table.LSTable
+		stop, count int
+	}{
+		{"no table", []*table.LSTable{nil}, 1, 0},
+		{"no range", []*table.LSTable{page(1)}, 2, 1},
+		{"no movement", []*table.LSTable{page(1, rangeRow(true, -1, 9, 50)), page(2, rangeRow(true, -1, 9, 50))}, 3, 2},
+		{"bound", []*table.LSTable{page(1, rangeRow(true, -1, 9, 50)), page(2, rangeRow(true, -1, 8, 40))}, 4, 2},
+		{"complete", []*table.LSTable{page(1, rangeRow(false, -1, 9, 50))}, 0, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, res, err, done := listGap(t, newTestSession(), &pager{pages: tc.pages}, context.Background(), time.Second)
+			if !done || err != nil || res.Stats["inbox_stop"] != tc.stop || res.Stats["inbox_pages"] != tc.count {
+				t.Fatalf("done=%v err=%v stats=%v", done, err, res.Stats)
+			}
+		})
 	}
 }
