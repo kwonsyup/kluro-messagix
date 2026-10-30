@@ -153,7 +153,7 @@ func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
 		t.Fatal("a plain existence row must not create a thread")
 	}
 	wantStats(t, stats, map[string]int{
-		"inbox_stop": 0, "inbox_pages": 1, "group1_threads": 3, "group1_encrypted_rows": 3, "hybrid_mappings": 0, "cutover_links": 0,
+		"inbox_stop": 0, "inbox_pages": 1, "inbox_rows_total": 1, "inbox_rows_parent_inbox": 1, "inbox_rows_parent0_more": 0, "inbox_rows_parent0_end": 0, "inbox_rows_other_parent": 0, "group1_threads": 3, "group1_encrypted_rows": 3, "hybrid_mappings": 0, "cutover_links": 0,
 		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_unlisted": 0, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
 	})
 }
@@ -180,7 +180,7 @@ func TestKnownEncryptedKeyWithNoTableRowIsCountedNotEmitted(t *testing.T) {
 		t.Fatal("the already-known encrypted thread must still be listed")
 	}
 	wantStats(t, stats, map[string]int{
-		"inbox_stop": 0, "inbox_pages": 1, "group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 1, "cutover_links": 2,
+		"inbox_stop": 0, "inbox_pages": 1, "inbox_rows_total": 1, "inbox_rows_parent_inbox": 1, "inbox_rows_parent0_more": 0, "inbox_rows_parent0_end": 0, "inbox_rows_other_parent": 0, "group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 1, "cutover_links": 2,
 		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "encrypted_unlisted": 2, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
 	})
 }
@@ -276,6 +276,23 @@ func TestWalkFollowsEachRepliesRangeRowToTheEnd(t *testing.T) {
 	}
 }
 
+func TestWalkFollowsParentZeroMoreThenEnd(t *testing.T) {
+	oldDelay := threadBatchDelay
+	threadBatchDelay = time.Millisecond
+	defer func() { threadBatchDelay = oldDelay }()
+	r := &pager{pages: []*table.LSTable{
+		page(101, rangeRow(true, 0, 90, 5000)),
+		page(102, rangeRow(false, 0, 80, 4000)),
+	}}
+	_, res, err, done := listGap(t, newTestSession(), r, context.Background(), time.Second)
+	if !done || err != nil || res.Gap != "" || len(r.tasks) != 2 {
+		t.Fatalf("done=%v err=%v gap=%q requests=%d", done, err, res.Gap, len(r.tasks))
+	}
+	if task := r.tasks[1]; task.ParentThreadKey != -1 || task.ReferenceThreadKey != 90 || task.ReferenceActivityTimestamp != 5000 {
+		t.Fatalf("second request = %+v", task)
+	}
+}
+
 // A reply with no group-1 range row, or one that does not move, ends the walk incomplete; so does the page bound.
 func TestWalkEndsIncompleteWithoutAProgressingRange(t *testing.T) {
 	for name, pages := range map[string][]*table.LSTable{
@@ -351,7 +368,7 @@ func TestWalkUsesOnlyTheRequestedParentsRangeRow(t *testing.T) {
 }
 
 // A HasMoreBefore=false row for parent 0 ends the group (the library's own convention), whether or not the inbox
-// parent's row is also there; parent 0 saying "more" decides nothing. Rows are read in order and the last deciding
+// parent's row is also there. Rows are read in order and the last deciding
 // row wins, as the library's keystore updates do.
 func TestWalkCompletesOnAParentZeroEndRow(t *testing.T) {
 	zero := func(more bool) *table.LSUpsertSyncGroupThreadsRange { return rangeRow(more, 0, 0, 0) }
@@ -361,7 +378,6 @@ func TestWalkCompletesOnAParentZeroEndRow(t *testing.T) {
 		requests int
 	}{
 		"parent 0 end completes":              {[]*table.LSTable{page(101, zero(false))}, "", 1},
-		"parent 0 more is not a decision":     {[]*table.LSTable{page(101, zero(true))}, "inbox_incomplete", 1},
 		"inbox more, then parent 0 end":       {[]*table.LSTable{page(101, rangeRow(true, -1, 90, 5000), zero(false))}, "", 1},
 		"parent 0 end, then inbox more":       {[]*table.LSTable{page(101, zero(false), rangeRow(true, -1, 90, 5000)), page(102, zero(false))}, "", 2},
 		"parent 0 more does not redirect":     {[]*table.LSTable{page(101, rangeRow(true, -1, 90, 5000), zero(true)), page(102, rangeRow(false, -1, 80, 4000))}, "", 2},
@@ -376,6 +392,45 @@ func TestWalkCompletesOnAParentZeroEndRow(t *testing.T) {
 			for _, task := range r.tasks {
 				if task.ParentThreadKey != -1 {
 					t.Fatalf("a request was redirected to parent %d", task.ParentThreadKey)
+				}
+			}
+		})
+	}
+}
+
+func TestInboxRangeRowCountsAndFallbackStops(t *testing.T) {
+	oldLimit, oldDelay := threadBatchLimit, threadBatchDelay
+	threadBatchLimit, threadBatchDelay = 2, time.Millisecond
+	defer func() { threadBatchLimit, threadBatchDelay = oldLimit, oldDelay }()
+	otherGroup := &table.LSUpsertSyncGroupThreadsRange{SyncGroup: 95}
+	for _, tc := range []struct {
+		name                                 string
+		pages                                []*table.LSTable
+		stop, total, inbox, more, end, other int
+	}{
+		{"mixed", []*table.LSTable{page(1, rangeRow(true, 0, 9, 50), rangeRow(true, 7, 8, 40), otherGroup), page(2, rangeRow(false, 0, 0, 0), rangeRow(false, 8, 0, 0))}, 0, 4, 0, 1, 1, 2},
+		{"inbox counted", []*table.LSTable{page(1, rangeRow(false, -1, 0, 0), rangeRow(true, 0, 9, 50))}, 0, 2, 1, 1, 0, 0},
+		{"no rows", []*table.LSTable{page(1)}, 2, 0, 0, 0, 0, 0},
+		{"other more", []*table.LSTable{page(1, rangeRow(true, 7, 9, 50))}, 2, 1, 0, 0, 0, 1},
+		{"other end", []*table.LSTable{page(1, rangeRow(false, 7, 9, 50))}, 2, 1, 0, 0, 0, 1},
+		{"no movement", []*table.LSTable{page(1, rangeRow(true, 0, 9, 50)), page(2, rangeRow(true, 0, 9, 50))}, 3, 2, 0, 2, 0, 0},
+		{"bound", []*table.LSTable{page(1, rangeRow(true, 0, 9, 50)), page(2, rangeRow(true, 0, 8, 40))}, 4, 2, 0, 2, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &pager{pages: tc.pages}
+			_, res, err, done := listGap(t, newTestSession(), r, context.Background(), time.Second)
+			if !done || err != nil {
+				t.Fatalf("done=%v err=%v", done, err)
+			}
+			want := map[string]int{"inbox_stop": tc.stop, "inbox_rows_total": tc.total, "inbox_rows_parent_inbox": tc.inbox, "inbox_rows_parent0_more": tc.more, "inbox_rows_parent0_end": tc.end, "inbox_rows_other_parent": tc.other}
+			for key, value := range want {
+				if res.Stats[key] != value {
+					t.Fatalf("stats[%s]=%d, want %d; stats=%v", key, res.Stats[key], value, res.Stats)
+				}
+			}
+			for _, task := range r.tasks {
+				if task.ParentThreadKey != -1 {
+					t.Fatalf("redirected: %+v", task)
 				}
 			}
 		})
