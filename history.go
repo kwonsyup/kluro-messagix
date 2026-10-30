@@ -378,12 +378,14 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit
 	if err := s.emitKnownThreads(ctx, counted); err != nil {
 		return listingDone{}, err
 	}
-	gap, err := s.pageThreads(ctx, cli, counted)
+	gap, stop, pages, err := s.pageThreads(ctx, cli, counted)
 	if err != nil {
 		return listingDone{}, err
 	}
 	known, unlisted := s.encryptedCounts()
-	return listingDone{Stats: s.listingStats(known, len(emitted), unlisted), Gap: gap}, nil
+	stats := s.listingStats(known, len(emitted), unlisted)
+	stats["inbox_stop"], stats["inbox_pages"] = stop, pages
+	return listingDone{Stats: stats, Gap: gap}, nil
 }
 
 // pageThreads walks sync group 1 from its first page. Each reply goes through the
@@ -393,12 +395,13 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit
 // no group-1 range row, a range that does not move, or the page bound ends it
 // incomplete. The group-1 cursor is read from the library once per request, as its
 // own page fetch does; nothing is written to the library.
-func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit emitFunc) (gap string, err error) {
+// Inbox stop codes: 0 complete, 1 no table, 2 no range, 3 no movement, 4 page bound.
+func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit emitFunc) (gap string, stop, pages int, err error) {
 	const group = 1
 	ref := socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, ReferenceThreadKey: 0, ReferenceActivityTimestamp: 9999999999999}
 	for batch := 0; batch < threadBatchLimit; batch++ {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return "", 0, pages, err
 		}
 		task := ref
 		task.IsAfter = 0
@@ -407,11 +410,12 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 		task.SyncGroup = group
 		tbl, err := cli.ExecuteTasks(ctx, &task)
 		if err != nil {
-			return "", mapSendErr(err)
+			return "", 0, pages, mapSendErr(err)
 		}
 		if tbl == nil {
-			return gapInboxIncomplete, nil
+			return gapInboxIncomplete, 1, pages, nil
 		}
+		pages++
 		s.handleTableEmit(tbl, func(f Frame) int64 {
 			if ctx.Err() != nil {
 				return 0
@@ -419,27 +423,27 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 			return emit(f)
 		})
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return "", 0, pages, err
 		}
 		rng := group1Range(tbl, inboxParentKey)
 		if rng == nil {
-			return gapInboxIncomplete, nil
+			return gapInboxIncomplete, 2, pages, nil
 		}
 		if !rng.HasMoreBefore {
-			return "", nil
+			return "", 0, pages, nil
 		}
 		next := socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, ReferenceThreadKey: rng.MinThreadKey, ReferenceActivityTimestamp: rng.MinLastActivityTimestampMS}
 		if next.ParentThreadKey == ref.ParentThreadKey && next.ReferenceThreadKey == ref.ReferenceThreadKey && next.ReferenceActivityTimestamp == ref.ReferenceActivityTimestamp {
-			return gapInboxIncomplete, nil
+			return gapInboxIncomplete, 3, pages, nil
 		}
 		ref = next
 		select {
 		case <-time.After(threadBatchDelay):
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", 0, pages, ctx.Err()
 		}
 	}
-	return gapInboxIncomplete, nil
+	return gapInboxIncomplete, 4, pages, nil
 }
 
 // inboxParentKey is the parent thread key of the main inbox: the only parent the walk
