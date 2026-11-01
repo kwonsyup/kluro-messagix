@@ -327,8 +327,14 @@ func mapAuthOrUnknown(err error) error {
 
 var _ = waTypes.MessengerServer
 
+// threadBatchLimit is the per-walk request cap. Meta chooses the page size (the task
+// carries none), so the cap is sized on a conservative 20 threads per page: 50 requests
+// reach 1000 chats, about 30 times the 32 chats seen on the largest observed account, while
+// at the 500 ms delay a walk makes at most 50 requests over about 25 s. Reaching the cap
+// ends the walk incomplete with inbox_stop 4 and saves its continuation (see pageThreads),
+// so an inbox longer than the cap is covered over several walks.
 var (
-	threadBatchLimit = 400
+	threadBatchLimit = 50
 	threadBatchDelay = 500 * time.Millisecond
 )
 
@@ -378,27 +384,46 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit
 	if err := s.emitKnownThreads(ctx, counted); err != nil {
 		return listingDone{}, err
 	}
-	gap, stop, pages, err := s.pageThreads(ctx, cli, counted)
+	rows := inboxRowCounts{}
+	gap, stop, pages, err := s.pageThreads(ctx, cli, counted, &rows)
 	if err != nil {
 		return listingDone{}, err
 	}
 	known, unlisted := s.encryptedCounts()
 	stats := s.listingStats(known, len(emitted), unlisted)
 	stats["inbox_stop"], stats["inbox_pages"] = stop, pages
+	stats["inbox_rows_total"] = rows.total
+	stats["inbox_rows_parent_inbox"] = rows.inbox
+	stats["inbox_rows_parent0_more"] = rows.parent0More
+	stats["inbox_rows_parent0_end"] = rows.parent0End
+	stats["inbox_rows_other_parent"] = rows.other
 	return listingDone{Stats: stats, Gap: gap}, nil
 }
 
 // pageThreads walks sync group 1 from its first page. Each reply goes through the
 // normal table path; the next page is addressed by the group-1 range row of that
-// same reply (its parent key, minimum thread key and minimum activity time), and the
-// walk is complete only when a reply says there is nothing more before. A reply with
-// no group-1 range row, a range that does not move, or the page bound ends it
+// same reply (its minimum thread key and minimum activity time); the requested parent
+// stays fixed. The walk is complete only when a reply says there is nothing more before.
+// A reply with no deciding range row, a range that does not move, or the page bound ends it
 // incomplete. The group-1 cursor is read from the library once per request, as its
 // own page fetch does; nothing is written to the library.
 // Inbox stop codes: 0 complete, 1 no table, 2 no range, 3 no movement, 4 page bound.
-func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit emitFunc) (gap string, stop, pages int, err error) {
+//
+// A walk that ends at the page bound keeps its continuation position in s.inboxResume,
+// and the next walk of this session resumes there, so an inbox longer than the cap is
+// reached over several walks. The position is taken (cleared) when a walk starts, so a
+// walk that completes, stops for any other reason or fails leaves nothing saved and the
+// next walk starts from the top and sees new threads. It lives in process memory only:
+// a companion restart re-walks from the top.
+func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit emitFunc, rows *inboxRowCounts) (gap string, stop, pages int, err error) {
 	const group = 1
 	ref := socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, ReferenceThreadKey: 0, ReferenceActivityTimestamp: 9999999999999}
+	s.mu.Lock()
+	if r := s.inboxResume; r != nil {
+		ref.ReferenceThreadKey, ref.ReferenceActivityTimestamp = r.threadKey, r.activityMS
+	}
+	s.inboxResume = nil
+	s.mu.Unlock()
 	for batch := 0; batch < threadBatchLimit; batch++ {
 		if err := ctx.Err(); err != nil {
 			return "", 0, pages, err
@@ -425,7 +450,7 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 		if err := ctx.Err(); err != nil {
 			return "", 0, pages, err
 		}
-		rng := group1Range(tbl, inboxParentKey)
+		rng := group1Range(tbl, inboxParentKey, rows)
 		if rng == nil {
 			return gapInboxIncomplete, 2, pages, nil
 		}
@@ -443,31 +468,50 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 			return "", 0, pages, ctx.Err()
 		}
 	}
+	s.mu.Lock()
+	s.inboxResume = &inboxResumeRef{threadKey: ref.ReferenceThreadKey, activityMS: ref.ReferenceActivityTimestamp}
+	s.mu.Unlock()
 	return gapInboxIncomplete, 4, pages, nil
 }
+
+// inboxResumeRef is the range position the next walk requests after a walk hit the page bound.
+type inboxResumeRef struct{ threadKey, activityMS int64 }
 
 // inboxParentKey is the parent thread key of the main inbox: the only parent the walk
 // requests. Other parent keys of sync group 1 (configs.ParentThreadKeys) are not walked.
 const inboxParentKey = -1
 
-// group1Range is the sync-group-1 thread range row of a reply that decides the walk,
-// or nil. A row for the inbox parent continues it (more) or completes it (no more); a
-// row for parent 0 completes it when it says no more, which is the library's own
-// end-of-group convention (syncManager.go updateThreadRanges: a HasMoreBefore=false row
-// ends the group only when its ParentThreadKey is 0). Any other row (another parent, or
-// parent 0 saying more) says nothing about this walk; its threads are still emitted with
-// the table. Rows are read in order and the last deciding row wins, as the library's
-// keystore updates do: a parent-0 end row after the inbox's continue row completes the
-// walk, and an inbox continue row after an end row continues it.
-func group1Range(tbl *table.LSTable, parent int64) *table.LSUpsertSyncGroupThreadsRange {
-	var out *table.LSUpsertSyncGroupThreadsRange
+// inboxRowCounts accumulates only group-1 row categories for one walk.
+type inboxRowCounts struct {
+	total, inbox, parent0More, parent0End, other int
+}
+
+// group1Range retains the last inbox or parent-0 end decision. If neither is
+// present, the last parent-0 more row supplies a cursor. Other parents never
+// decide the walk. The request parent remains fixed at inboxParentKey.
+func group1Range(tbl *table.LSTable, parent int64, counts *inboxRowCounts) *table.LSUpsertSyncGroupThreadsRange {
+	var out, fallback *table.LSUpsertSyncGroupThreadsRange
 	for _, r := range tbl.LSUpsertSyncGroupThreadsRange {
 		if r.SyncGroup != 1 {
 			continue
 		}
-		if r.ParentThreadKey == parent || (r.ParentThreadKey == 0 && !r.HasMoreBefore) {
+		counts.total++
+		switch {
+		case r.ParentThreadKey == parent:
+			counts.inbox++
 			out = r
+		case r.ParentThreadKey == 0 && r.HasMoreBefore:
+			counts.parent0More++
+			fallback = r
+		case r.ParentThreadKey == 0:
+			counts.parent0End++
+			out = r
+		default:
+			counts.other++
 		}
+	}
+	if out == nil {
+		return fallback
 	}
 	return out
 }

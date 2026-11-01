@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -153,7 +154,7 @@ func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
 		t.Fatal("a plain existence row must not create a thread")
 	}
 	wantStats(t, stats, map[string]int{
-		"inbox_stop": 0, "inbox_pages": 1, "group1_threads": 3, "group1_encrypted_rows": 3, "hybrid_mappings": 0, "cutover_links": 0,
+		"inbox_stop": 0, "inbox_pages": 1, "inbox_rows_total": 1, "inbox_rows_parent_inbox": 1, "inbox_rows_parent0_more": 0, "inbox_rows_parent0_end": 0, "inbox_rows_other_parent": 0, "group1_threads": 3, "group1_encrypted_rows": 3, "hybrid_mappings": 0, "cutover_links": 0,
 		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_unlisted": 0, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
 	})
 }
@@ -180,7 +181,7 @@ func TestKnownEncryptedKeyWithNoTableRowIsCountedNotEmitted(t *testing.T) {
 		t.Fatal("the already-known encrypted thread must still be listed")
 	}
 	wantStats(t, stats, map[string]int{
-		"inbox_stop": 0, "inbox_pages": 1, "group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 1, "cutover_links": 2,
+		"inbox_stop": 0, "inbox_pages": 1, "inbox_rows_total": 1, "inbox_rows_parent_inbox": 1, "inbox_rows_parent0_more": 0, "inbox_rows_parent0_end": 0, "inbox_rows_other_parent": 0, "group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 1, "cutover_links": 2,
 		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "encrypted_unlisted": 2, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
 	})
 }
@@ -276,6 +277,23 @@ func TestWalkFollowsEachRepliesRangeRowToTheEnd(t *testing.T) {
 	}
 }
 
+func TestWalkFollowsParentZeroMoreThenEnd(t *testing.T) {
+	oldDelay := threadBatchDelay
+	threadBatchDelay = time.Millisecond
+	defer func() { threadBatchDelay = oldDelay }()
+	r := &pager{pages: []*table.LSTable{
+		page(101, rangeRow(true, 0, 90, 5000)),
+		page(102, rangeRow(false, 0, 80, 4000)),
+	}}
+	_, res, err, done := listGap(t, newTestSession(), r, context.Background(), time.Second)
+	if !done || err != nil || res.Gap != "" || len(r.tasks) != 2 {
+		t.Fatalf("done=%v err=%v gap=%q requests=%d", done, err, res.Gap, len(r.tasks))
+	}
+	if task := r.tasks[1]; task.ParentThreadKey != -1 || task.ReferenceThreadKey != 90 || task.ReferenceActivityTimestamp != 5000 {
+		t.Fatalf("second request = %+v", task)
+	}
+}
+
 // A reply with no group-1 range row, or one that does not move, ends the walk incomplete; so does the page bound.
 func TestWalkEndsIncompleteWithoutAProgressingRange(t *testing.T) {
 	for name, pages := range map[string][]*table.LSTable{
@@ -351,7 +369,7 @@ func TestWalkUsesOnlyTheRequestedParentsRangeRow(t *testing.T) {
 }
 
 // A HasMoreBefore=false row for parent 0 ends the group (the library's own convention), whether or not the inbox
-// parent's row is also there; parent 0 saying "more" decides nothing. Rows are read in order and the last deciding
+// parent's row is also there. Rows are read in order and the last deciding
 // row wins, as the library's keystore updates do.
 func TestWalkCompletesOnAParentZeroEndRow(t *testing.T) {
 	zero := func(more bool) *table.LSUpsertSyncGroupThreadsRange { return rangeRow(more, 0, 0, 0) }
@@ -361,7 +379,6 @@ func TestWalkCompletesOnAParentZeroEndRow(t *testing.T) {
 		requests int
 	}{
 		"parent 0 end completes":              {[]*table.LSTable{page(101, zero(false))}, "", 1},
-		"parent 0 more is not a decision":     {[]*table.LSTable{page(101, zero(true))}, "inbox_incomplete", 1},
 		"inbox more, then parent 0 end":       {[]*table.LSTable{page(101, rangeRow(true, -1, 90, 5000), zero(false))}, "", 1},
 		"parent 0 end, then inbox more":       {[]*table.LSTable{page(101, zero(false), rangeRow(true, -1, 90, 5000)), page(102, zero(false))}, "", 2},
 		"parent 0 more does not redirect":     {[]*table.LSTable{page(101, rangeRow(true, -1, 90, 5000), zero(true)), page(102, rangeRow(false, -1, 80, 4000))}, "", 2},
@@ -376,6 +393,45 @@ func TestWalkCompletesOnAParentZeroEndRow(t *testing.T) {
 			for _, task := range r.tasks {
 				if task.ParentThreadKey != -1 {
 					t.Fatalf("a request was redirected to parent %d", task.ParentThreadKey)
+				}
+			}
+		})
+	}
+}
+
+func TestInboxRangeRowCountsAndFallbackStops(t *testing.T) {
+	oldLimit, oldDelay := threadBatchLimit, threadBatchDelay
+	threadBatchLimit, threadBatchDelay = 2, time.Millisecond
+	defer func() { threadBatchLimit, threadBatchDelay = oldLimit, oldDelay }()
+	otherGroup := &table.LSUpsertSyncGroupThreadsRange{SyncGroup: 95}
+	for _, tc := range []struct {
+		name                                 string
+		pages                                []*table.LSTable
+		stop, total, inbox, more, end, other int
+	}{
+		{"mixed", []*table.LSTable{page(1, rangeRow(true, 0, 9, 50), rangeRow(true, 7, 8, 40), otherGroup), page(2, rangeRow(false, 0, 0, 0), rangeRow(false, 8, 0, 0))}, 0, 4, 0, 1, 1, 2},
+		{"inbox counted", []*table.LSTable{page(1, rangeRow(false, -1, 0, 0), rangeRow(true, 0, 9, 50))}, 0, 2, 1, 1, 0, 0},
+		{"no rows", []*table.LSTable{page(1)}, 2, 0, 0, 0, 0, 0},
+		{"other more", []*table.LSTable{page(1, rangeRow(true, 7, 9, 50))}, 2, 1, 0, 0, 0, 1},
+		{"other end", []*table.LSTable{page(1, rangeRow(false, 7, 9, 50))}, 2, 1, 0, 0, 0, 1},
+		{"no movement", []*table.LSTable{page(1, rangeRow(true, 0, 9, 50)), page(2, rangeRow(true, 0, 9, 50))}, 3, 2, 0, 2, 0, 0},
+		{"bound", []*table.LSTable{page(1, rangeRow(true, 0, 9, 50)), page(2, rangeRow(true, 0, 8, 40))}, 4, 2, 0, 2, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &pager{pages: tc.pages}
+			_, res, err, done := listGap(t, newTestSession(), r, context.Background(), time.Second)
+			if !done || err != nil {
+				t.Fatalf("done=%v err=%v", done, err)
+			}
+			want := map[string]int{"inbox_stop": tc.stop, "inbox_rows_total": tc.total, "inbox_rows_parent_inbox": tc.inbox, "inbox_rows_parent0_more": tc.more, "inbox_rows_parent0_end": tc.end, "inbox_rows_other_parent": tc.other}
+			for key, value := range want {
+				if res.Stats[key] != value {
+					t.Fatalf("stats[%s]=%d, want %d; stats=%v", key, res.Stats[key], value, res.Stats)
+				}
+			}
+			for _, task := range r.tasks {
+				if task.ParentThreadKey != -1 {
+					t.Fatalf("redirected: %+v", task)
 				}
 			}
 		})
@@ -937,5 +993,114 @@ func TestInboxStopStats(t *testing.T) {
 				t.Fatalf("done=%v err=%v stats=%v", done, err, res.Stats)
 			}
 		})
+	}
+}
+
+// The shipped per-walk cap ends an endless, always-moving inbox as an incomplete walk reported as
+// stop 4 (page bound) after exactly that many requests.
+func TestWalkStopsAtTheShippedRequestCap(t *testing.T) {
+	if threadBatchLimit != 50 {
+		t.Fatalf("shipped cap = %d, want 50", threadBatchLimit)
+	}
+	oldDelay := threadBatchDelay
+	threadBatchDelay = time.Microsecond
+	defer func() { threadBatchDelay = oldDelay }()
+	pages := make([]*table.LSTable, threadBatchLimit+1)
+	for i := range pages {
+		pages[i] = page(int64(1000+i), rangeRow(true, -1, int64(900-i), int64(9000-i)))
+	}
+	r := &pager{pages: pages}
+	_, res, err, done := listGap(t, newTestSession(), r, context.Background(), 10*time.Second)
+	if !done || err != nil {
+		t.Fatalf("done=%v err=%v", done, err)
+	}
+	if len(r.tasks) != threadBatchLimit || res.Stats["inbox_stop"] != 4 || res.Stats["inbox_pages"] != threadBatchLimit || res.Gap != gapInboxIncomplete {
+		t.Fatalf("requests=%d gap=%q stats=%v", len(r.tasks), res.Gap, res.Stats)
+	}
+}
+
+// stableInbox is a fixed inbox of n pages that answers by the REQUESTED position, not by request count:
+// the top position is page 1, and page i is addressed only by the range row of page i-1. Any other
+// position is an error, so a wrong or stale continuation cannot read as progress.
+type stableInbox struct {
+	n      int
+	failAt int // when > 0, the request that would serve this page fails
+	served []int
+}
+
+func (p *stableInbox) minKey(i int) int64     { return int64(5000 - i) }
+func (p *stableInbox) minTS(i int) int64      { return int64(90000 - i) }
+func (p *stableInbox) GetCursor(int64) string { return "" }
+
+func (p *stableInbox) ExecuteTasks(_ context.Context, tasks ...socket.Task) (*table.LSTable, error) {
+	task := tasks[0].(*socket.FetchThreadsTask)
+	if task.ParentThreadKey != -1 || task.SyncGroup != 1 {
+		return nil, errors.New("wrong parent or group")
+	}
+	idx := 0
+	if task.ReferenceThreadKey == 0 && task.ReferenceActivityTimestamp == 9999999999999 {
+		idx = 1
+	}
+	for i := 1; i < p.n && idx == 0; i++ {
+		if task.ReferenceThreadKey == p.minKey(i) && task.ReferenceActivityTimestamp == p.minTS(i) {
+			idx = i + 1
+		}
+	}
+	if idx == 0 {
+		return nil, errors.New("unknown requested position")
+	}
+	if idx == p.failAt {
+		return nil, errors.New("boom")
+	}
+	p.served = append(p.served, idx)
+	return page(int64(1000+idx), rangeRow(idx < p.n, -1, p.minKey(idx), p.minTS(idx))), nil
+}
+
+// A stable inbox of more pages than the cap is reached over several walks: the capped walk saves its
+// continuation, the next walk resumes there and emits the page beyond the cap and completes, and the
+// walk after that starts from the top again.
+func TestCappedWalkResumesThenRestartsFromTheTop(t *testing.T) {
+	oldDelay := threadBatchDelay
+	threadBatchDelay = time.Microsecond
+	defer func() { threadBatchDelay = oldDelay }()
+	s := newTestSession()
+	inbox := &stableInbox{n: threadBatchLimit + 1}
+	last := int64(1000 + inbox.n)
+
+	frames, res, err, done := listGap(t, s, inbox, context.Background(), 10*time.Second)
+	if !done || err != nil || res.Stats["inbox_stop"] != 4 || len(inbox.served) != threadBatchLimit || threadsByID(frames)[fmt.Sprint(last)] != nil {
+		t.Fatalf("walk 1: done=%v err=%v stats=%v served=%d", done, err, res.Stats, len(inbox.served))
+	}
+
+	inbox.served = nil
+	frames, res, err, done = listGap(t, s, inbox, context.Background(), 10*time.Second)
+	if !done || err != nil || res.Gap != "" || res.Stats["inbox_stop"] != 0 || !reflect.DeepEqual(inbox.served, []int{inbox.n}) || threadsByID(frames)[fmt.Sprint(last)] == nil {
+		t.Fatalf("walk 2: done=%v err=%v gap=%q stats=%v served=%v", done, err, res.Gap, res.Stats, inbox.served)
+	}
+
+	inbox.served = nil
+	_, res, err, done = listGap(t, s, inbox, context.Background(), 10*time.Second)
+	if !done || err != nil || len(inbox.served) == 0 || inbox.served[0] != 1 || res.Stats["inbox_stop"] != 4 {
+		t.Fatalf("walk 3: done=%v err=%v stats=%v served=%v", done, err, res.Stats, inbox.served)
+	}
+}
+
+// A resumed walk that fails leaves nothing saved: the next walk starts from the top.
+func TestFailedResumedWalkRestartsFromTheTop(t *testing.T) {
+	oldDelay := threadBatchDelay
+	threadBatchDelay = time.Microsecond
+	defer func() { threadBatchDelay = oldDelay }()
+	s := newTestSession()
+	inbox := &stableInbox{n: threadBatchLimit + 1}
+	if _, _, err, done := listGap(t, s, inbox, context.Background(), 10*time.Second); !done || err != nil {
+		t.Fatalf("walk 1: done=%v err=%v", done, err)
+	}
+	inbox.failAt = inbox.n
+	if _, _, err, done := listGap(t, s, inbox, context.Background(), 10*time.Second); !done || err == nil {
+		t.Fatalf("walk 2 should fail: done=%v err=%v", done, err)
+	}
+	inbox.failAt, inbox.served = 0, nil
+	if _, _, err, done := listGap(t, s, inbox, context.Background(), 10*time.Second); !done || err != nil || len(inbox.served) == 0 || inbox.served[0] != 1 {
+		t.Fatalf("walk 3: done=%v err=%v served=%v", done, err, inbox.served)
 	}
 }
