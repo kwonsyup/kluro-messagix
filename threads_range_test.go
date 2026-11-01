@@ -994,3 +994,26 @@ func TestInboxStopStats(t *testing.T) {
 		})
 	}
 }
+
+// The shipped per-walk cap ends an endless, always-moving inbox as an incomplete walk reported as
+// stop 4 (page bound) after exactly that many requests.
+func TestWalkStopsAtTheShippedRequestCap(t *testing.T) {
+	if threadBatchLimit != 50 {
+		t.Fatalf("shipped cap = %d, want 50", threadBatchLimit)
+	}
+	oldDelay := threadBatchDelay
+	threadBatchDelay = time.Microsecond
+	defer func() { threadBatchDelay = oldDelay }()
+	pages := make([]*table.LSTable, threadBatchLimit+1)
+	for i := range pages {
+		pages[i] = page(int64(1000+i), rangeRow(true, -1, int64(900-i), int64(9000-i)))
+	}
+	r := &pager{pages: pages}
+	_, res, err, done := listGap(t, newTestSession(), r, context.Background(), 10*time.Second)
+	if !done || err != nil {
+		t.Fatalf("done=%v err=%v", done, err)
+	}
+	if len(r.tasks) != threadBatchLimit || res.Stats["inbox_stop"] != 4 || res.Stats["inbox_pages"] != threadBatchLimit || res.Gap != gapInboxIncomplete {
+		t.Fatalf("requests=%d gap=%q stats=%v", len(r.tasks), res.Gap, res.Stats)
+	}
+}

@@ -327,8 +327,13 @@ func mapAuthOrUnknown(err error) error {
 
 var _ = waTypes.MessengerServer
 
+// threadBatchLimit is the per-walk request cap. Meta chooses the page size (the task
+// carries none), so the cap is sized on a conservative 20 threads per page: 50 requests
+// reach 1000 chats, about 30 times the 32 chats seen on the largest observed account, while
+// at the 500 ms delay a walk makes at most 50 requests over about 25 s. Reaching the cap
+// ends the walk incomplete with inbox_stop 4.
 var (
-	threadBatchLimit = 400
+	threadBatchLimit = 50
 	threadBatchDelay = 500 * time.Millisecond
 )
 
