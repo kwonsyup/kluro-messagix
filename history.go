@@ -331,7 +331,8 @@ var _ = waTypes.MessengerServer
 // carries none), so the cap is sized on a conservative 20 threads per page: 50 requests
 // reach 1000 chats, about 30 times the 32 chats seen on the largest observed account, while
 // at the 500 ms delay a walk makes at most 50 requests over about 25 s. Reaching the cap
-// ends the walk incomplete with inbox_stop 4.
+// ends the walk incomplete with inbox_stop 4 and saves its continuation (see pageThreads),
+// so an inbox longer than the cap is covered over several walks.
 var (
 	threadBatchLimit = 50
 	threadBatchDelay = 500 * time.Millisecond
@@ -407,9 +408,22 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit
 // incomplete. The group-1 cursor is read from the library once per request, as its
 // own page fetch does; nothing is written to the library.
 // Inbox stop codes: 0 complete, 1 no table, 2 no range, 3 no movement, 4 page bound.
+//
+// A walk that ends at the page bound keeps its continuation position in s.inboxResume,
+// and the next walk of this session resumes there, so an inbox longer than the cap is
+// reached over several walks. The position is taken (cleared) when a walk starts, so a
+// walk that completes, stops for any other reason or fails leaves nothing saved and the
+// next walk starts from the top and sees new threads. It lives in process memory only:
+// a companion restart re-walks from the top.
 func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit emitFunc, rows *inboxRowCounts) (gap string, stop, pages int, err error) {
 	const group = 1
 	ref := socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, ReferenceThreadKey: 0, ReferenceActivityTimestamp: 9999999999999}
+	s.mu.Lock()
+	if r := s.inboxResume; r != nil {
+		ref.ReferenceThreadKey, ref.ReferenceActivityTimestamp = r.threadKey, r.activityMS
+	}
+	s.inboxResume = nil
+	s.mu.Unlock()
 	for batch := 0; batch < threadBatchLimit; batch++ {
 		if err := ctx.Err(); err != nil {
 			return "", 0, pages, err
@@ -454,8 +468,14 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 			return "", 0, pages, ctx.Err()
 		}
 	}
+	s.mu.Lock()
+	s.inboxResume = &inboxResumeRef{threadKey: ref.ReferenceThreadKey, activityMS: ref.ReferenceActivityTimestamp}
+	s.mu.Unlock()
 	return gapInboxIncomplete, 4, pages, nil
 }
+
+// inboxResumeRef is the range position the next walk requests after a walk hit the page bound.
+type inboxResumeRef struct{ threadKey, activityMS int64 }
 
 // inboxParentKey is the parent thread key of the main inbox: the only parent the walk
 // requests. Other parent keys of sync group 1 (configs.ParentThreadKeys) are not walked.

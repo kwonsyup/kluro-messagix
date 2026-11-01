@@ -70,6 +70,8 @@ type messagixSession struct {
 	selfID        int64
 	selfName      string
 
+	inboxResume *inboxResumeRef // where the next inbox walk resumes after one hit the page bound (memory only; guarded by mu)
+
 	threads        map[string]*threadInfo // by wire id
 	participants   map[int64][]int64      // participant rows waiting for their thread
 	names          map[int64]string

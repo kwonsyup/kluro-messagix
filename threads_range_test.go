@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -1015,5 +1016,91 @@ func TestWalkStopsAtTheShippedRequestCap(t *testing.T) {
 	}
 	if len(r.tasks) != threadBatchLimit || res.Stats["inbox_stop"] != 4 || res.Stats["inbox_pages"] != threadBatchLimit || res.Gap != gapInboxIncomplete {
 		t.Fatalf("requests=%d gap=%q stats=%v", len(r.tasks), res.Gap, res.Stats)
+	}
+}
+
+// stableInbox is a fixed inbox of n pages that answers by the REQUESTED position, not by request count:
+// the top position is page 1, and page i is addressed only by the range row of page i-1. Any other
+// position is an error, so a wrong or stale continuation cannot read as progress.
+type stableInbox struct {
+	n      int
+	failAt int // when > 0, the request that would serve this page fails
+	served []int
+}
+
+func (p *stableInbox) minKey(i int) int64     { return int64(5000 - i) }
+func (p *stableInbox) minTS(i int) int64      { return int64(90000 - i) }
+func (p *stableInbox) GetCursor(int64) string { return "" }
+
+func (p *stableInbox) ExecuteTasks(_ context.Context, tasks ...socket.Task) (*table.LSTable, error) {
+	task := tasks[0].(*socket.FetchThreadsTask)
+	if task.ParentThreadKey != -1 || task.SyncGroup != 1 {
+		return nil, errors.New("wrong parent or group")
+	}
+	idx := 0
+	if task.ReferenceThreadKey == 0 && task.ReferenceActivityTimestamp == 9999999999999 {
+		idx = 1
+	}
+	for i := 1; i < p.n && idx == 0; i++ {
+		if task.ReferenceThreadKey == p.minKey(i) && task.ReferenceActivityTimestamp == p.minTS(i) {
+			idx = i + 1
+		}
+	}
+	if idx == 0 {
+		return nil, errors.New("unknown requested position")
+	}
+	if idx == p.failAt {
+		return nil, errors.New("boom")
+	}
+	p.served = append(p.served, idx)
+	return page(int64(1000+idx), rangeRow(idx < p.n, -1, p.minKey(idx), p.minTS(idx))), nil
+}
+
+// A stable inbox of more pages than the cap is reached over several walks: the capped walk saves its
+// continuation, the next walk resumes there and emits the page beyond the cap and completes, and the
+// walk after that starts from the top again.
+func TestCappedWalkResumesThenRestartsFromTheTop(t *testing.T) {
+	oldDelay := threadBatchDelay
+	threadBatchDelay = time.Microsecond
+	defer func() { threadBatchDelay = oldDelay }()
+	s := newTestSession()
+	inbox := &stableInbox{n: threadBatchLimit + 1}
+	last := int64(1000 + inbox.n)
+
+	frames, res, err, done := listGap(t, s, inbox, context.Background(), 10*time.Second)
+	if !done || err != nil || res.Stats["inbox_stop"] != 4 || len(inbox.served) != threadBatchLimit || threadsByID(frames)[fmt.Sprint(last)] != nil {
+		t.Fatalf("walk 1: done=%v err=%v stats=%v served=%d", done, err, res.Stats, len(inbox.served))
+	}
+
+	inbox.served = nil
+	frames, res, err, done = listGap(t, s, inbox, context.Background(), 10*time.Second)
+	if !done || err != nil || res.Gap != "" || res.Stats["inbox_stop"] != 0 || !reflect.DeepEqual(inbox.served, []int{inbox.n}) || threadsByID(frames)[fmt.Sprint(last)] == nil {
+		t.Fatalf("walk 2: done=%v err=%v gap=%q stats=%v served=%v", done, err, res.Gap, res.Stats, inbox.served)
+	}
+
+	inbox.served = nil
+	_, res, err, done = listGap(t, s, inbox, context.Background(), 10*time.Second)
+	if !done || err != nil || len(inbox.served) == 0 || inbox.served[0] != 1 || res.Stats["inbox_stop"] != 4 {
+		t.Fatalf("walk 3: done=%v err=%v stats=%v served=%v", done, err, res.Stats, inbox.served)
+	}
+}
+
+// A resumed walk that fails leaves nothing saved: the next walk starts from the top.
+func TestFailedResumedWalkRestartsFromTheTop(t *testing.T) {
+	oldDelay := threadBatchDelay
+	threadBatchDelay = time.Microsecond
+	defer func() { threadBatchDelay = oldDelay }()
+	s := newTestSession()
+	inbox := &stableInbox{n: threadBatchLimit + 1}
+	if _, _, err, done := listGap(t, s, inbox, context.Background(), 10*time.Second); !done || err != nil {
+		t.Fatalf("walk 1: done=%v err=%v", done, err)
+	}
+	inbox.failAt = inbox.n
+	if _, _, err, done := listGap(t, s, inbox, context.Background(), 10*time.Second); !done || err == nil {
+		t.Fatalf("walk 2 should fail: done=%v err=%v", done, err)
+	}
+	inbox.failAt, inbox.served = 0, nil
+	if _, _, err, done := listGap(t, s, inbox, context.Background(), 10*time.Second); !done || err != nil || len(inbox.served) == 0 || inbox.served[0] != 1 {
+		t.Fatalf("walk 3: done=%v err=%v served=%v", done, err, inbox.served)
 	}
 }
