@@ -511,8 +511,14 @@ func (s *messagixSession) deliverEncrypted(evt *events.FBMessage) bool {
 	s.mu.Lock()
 	s.e2eeReceived++
 	s.mu.Unlock()
-	if _, ok := e2eeChatKey(evt.Info.MessageSource); !ok {
-		return s.unparsedChat(evt)
+	if _, ok := e2eeChatKey(evt.Info.Chat); !ok {
+		// Visibility only: as before, the message is acknowledged. The class of
+		// the id's server is logged, never the id.
+		logCode("warn", "e2ee_unparsed_chat_"+e2eeServerClass(evt.Info.Chat.Server))
+		s.mu.Lock()
+		s.e2eeUnparsed++
+		s.mu.Unlock()
+		return true
 	}
 	frames := s.waMessageFrames(evt)
 	if len(frames) == 0 {
@@ -550,65 +556,6 @@ func (s *messagixSession) deliverEncrypted(evt *events.FBMessage) bool {
 	return true
 }
 
-// maxUnparsedRedeliveries bounds how often one message whose chat id cannot be
-// read is left unacknowledged: the server redelivers an unacknowledged
-// message, so a permanently unreadable one must not come back forever. Only
-// that message is affected: whatsmeow keeps its plaintext and sends no receipt
-// for it, and handles the other messages independently, so a parseable
-// message is never held behind it.
-const (
-	maxUnparsedRedeliveries = 3
-	maxUnparsedTracked      = 4096
-)
-
-// unparsedChat handles an encrypted message whose chat id maps to no Messenger
-// id. It is counted and logged by server class only (never the id), and it is
-// NOT acknowledged, so Meta redelivers it, until the bound, after which it is
-// acknowledged and counted as given up. The per-message counts live in a
-// first-in-first-out table: when it is full only the oldest entry is dropped,
-// and a count is never reset by other ids coming and going.
-func (s *messagixSession) unparsedChat(evt *events.FBMessage) bool {
-	logCode("warn", "e2ee_unparsed_chat_"+e2eeServerClass(evt.Info.Chat.Server))
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.e2eeUnparsed++
-	id := evt.Info.ID
-	if s.unparsedSeen == nil {
-		s.unparsedSeen = map[string]int{}
-	}
-	if _, tracked := s.unparsedSeen[id]; !tracked {
-		limit := s.unparsedCap
-		if limit <= 0 {
-			limit = maxUnparsedTracked
-		}
-		for len(s.unparsedSeen) >= limit && len(s.unparsedOrder) > 0 {
-			oldest := s.unparsedOrder[0]
-			s.unparsedOrder = s.unparsedOrder[1:]
-			delete(s.unparsedSeen, oldest)
-		}
-		s.unparsedOrder = append(s.unparsedOrder, id)
-	}
-	s.unparsedSeen[id]++
-	if s.unparsedSeen[id] >= maxUnparsedRedeliveries {
-		delete(s.unparsedSeen, id)
-		for i, o := range s.unparsedOrder {
-			if o == id {
-				s.unparsedOrder = append(s.unparsedOrder[:i], s.unparsedOrder[i+1:]...)
-				break
-			}
-		}
-		s.e2eeGaveUp++
-		return true
-	}
-	return false
-}
-
-func (s *messagixSession) unparsedCount(id string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.unparsedSeen[id]
-}
-
 // e2eeServerClass names a JID server for the log: a fixed set, never anything
 // the message chose.
 func e2eeServerClass(server string) string {
@@ -628,12 +575,11 @@ func e2eeServerClass(server string) string {
 }
 
 // e2eeChatKey is the chat's numeric Messenger id, read from the id itself and
-// nothing else. Any other form (a suffixed or malformed id, a LID that is not
-// a Messenger id) is left unparsed: guessing at the peer would route a reply
-// to the wrong person.
-func e2eeChatKey(src waTypes.MessageSource) (int64, bool) {
-	id, err := strconv.ParseInt(src.Chat.User, 10, 64)
-	if err != nil || id <= 0 {
+// nothing else (unchanged from the shipped parse): any other form is left
+// unparsed, since guessing at the peer could route a reply to the wrong person.
+func e2eeChatKey(chat waTypes.JID) (int64, bool) {
+	id, err := strconv.ParseInt(chat.User, 10, 64)
+	if err != nil || id == 0 {
 		return 0, false
 	}
 	return id, true
@@ -641,7 +587,7 @@ func e2eeChatKey(src waTypes.MessageSource) (int64, bool) {
 
 func (s *messagixSession) waMessageFrames(evt *events.FBMessage) []Frame {
 	chat := evt.Info.Chat
-	chatID, ok := e2eeChatKey(evt.Info.MessageSource)
+	chatID, ok := e2eeChatKey(chat)
 	if !ok {
 		return nil
 	}
@@ -777,12 +723,10 @@ func (s *messagixSession) listingStats(known, emitted, unlisted int) map[string]
 		"resume_sync_rows":      s.resumeRows,
 		"encrypted_unlisted":    unlisted,
 		// Every encrypted message that reached deliverEncrypted, how many of
-		// them were emitted, how many had a chat id that maps to no Messenger
-		// id (and how many of those were finally acknowledged anyway).
+		// them were emitted, how many had a chat id that maps to no Messenger id.
 		"e2ee_received":              s.e2eeReceived,
 		"e2ee_emitted":               s.e2eeEmitted,
 		"e2ee_dropped_unparsed_chat": s.e2eeUnparsed,
-		"e2ee_unparsed_given_up":     s.e2eeGaveUp,
 	}
 }
 

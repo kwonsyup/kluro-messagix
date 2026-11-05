@@ -36,43 +36,27 @@ func TestNumericChatIDsStillParse(t *testing.T) {
 	}
 }
 
-// Forms whose peer cannot be established from the id itself are not guessed
-// at: a wrong guess routes a reply to the wrong person.
-func TestMalformedAndAmbiguousChatIDsAreNotGuessed(t *testing.T) {
-	for _, jid := range []waTypes.JID{
-		{User: "4242.invalid", Server: waTypes.GroupServer},
-		{User: "4242:7", Server: waTypes.MessengerServer},
-		{User: "4242.0:7", Server: waTypes.MessengerServer},
-		{User: "4242abc", Server: waTypes.HiddenUserServer},
-		{User: "-4242", Server: waTypes.MessengerServer},
-		{User: "0", Server: waTypes.MessengerServer},
-	} {
-		s := newTestSession()
-		alt := waTypes.NewJID("9999", waTypes.MessengerServer) // an alternate address is not used either
-		if frames := s.waMessageFrames(e2eeEvent(jid, alt, "IDX")); len(frames) != 0 {
-			t.Errorf("%q@%s produced %d frames", jid.User, jid.Server, len(frames))
-		}
-		if s.deliverEncrypted(e2eeEvent(jid, alt, "IDY")) {
-			t.Errorf("%q@%s was acknowledged on first delivery", jid.User, jid.Server)
-		}
-	}
-}
-
 func unparsedEvent(id string) *events.FBMessage {
 	return e2eeEvent(waTypes.NewJID("not-a-number-SECRET", waTypes.MessengerServer), waTypes.EmptyJID, id)
 }
 
-func TestUnparsedChatIsCountedLoggedAndNotAcked(t *testing.T) {
+func TestUnparsedChatIsCountedLoggedAndStillAcked(t *testing.T) {
 	testStderr.Reset()
 	s := newTestSession()
 	var emitted int
 	s.emit = func(Frame) int64 { emitted++; return 0 }
-	if s.deliverEncrypted(unparsedEvent("M1")) {
-		t.Fatal("an undelivered message was acknowledged to the server")
+	if !s.deliverEncrypted(unparsedEvent("M1")) {
+		t.Fatal("behaviour changed: the message is no longer acknowledged as in the shipped helper")
+	}
+	if emitted != 0 {
+		t.Fatalf("emitted %d frames for an unreadable chat", emitted)
 	}
 	st := s.listingStats(0, 0, 0)
 	if st["e2ee_received"] != 1 || st["e2ee_emitted"] != 0 || st["e2ee_dropped_unparsed_chat"] != 1 {
 		t.Fatalf("stats = %v", st)
+	}
+	if _, ok := st["e2ee_unparsed_given_up"]; ok {
+		t.Fatal("the redelivery counter should be gone")
 	}
 	log := testStderr.String()
 	if !strings.Contains(log, `"code":"e2ee_unparsed_chat_msgr"`) {
@@ -83,58 +67,14 @@ func TestUnparsedChatIsCountedLoggedAndNotAcked(t *testing.T) {
 	}
 }
 
-func TestUnparsedReplayOfManyIDsEachGivesUpAfterExactlyThreeDeliveries(t *testing.T) {
-	s := newTestSession()
-	const n = 600 // replayed round-robin, more than a small cap
-	acked := map[int]int{}
-	for round := 1; round <= maxUnparsedRedeliveries; round++ {
-		for i := 0; i < n; i++ {
-			if s.deliverEncrypted(unparsedEvent(fmt.Sprintf("R%d", i))) {
-				acked[i] = round
-			}
+// The parse is the shipped one, byte for byte in behaviour.
+func TestChatParseMatchesTheShippedRule(t *testing.T) {
+	for user, want := range map[string]bool{
+		"4242": true, "-4242": true, "0": false, "": false, "4242:7": false, "4242.0": false, "4242abc": false, "abc": false,
+	} {
+		if _, ok := e2eeChatKey(waTypes.NewJID(user, waTypes.MessengerServer)); ok != want {
+			t.Errorf("%q: ok=%v want %v", user, ok, want)
 		}
-	}
-	for i := 0; i < n; i++ {
-		if acked[i] != maxUnparsedRedeliveries {
-			t.Fatalf("id %d acknowledged on delivery %d, want %d", i, acked[i], maxUnparsedRedeliveries)
-		}
-	}
-	if st := s.listingStats(0, 0, 0); st["e2ee_unparsed_given_up"] != n {
-		t.Fatalf("given up = %d", st["e2ee_unparsed_given_up"])
-	}
-}
-
-func TestUnparsedTrackingEvictsOnlyTheOldestAndNeverResetsACount(t *testing.T) {
-	s := newTestSession()
-	s.unparsedCap = 8
-	for i := 0; i < 8; i++ {
-		s.deliverEncrypted(unparsedEvent(fmt.Sprintf("E%d", i))) // count 1 each
-	}
-	s.deliverEncrypted(unparsedEvent("E8")) // full: evicts only the oldest (E0)
-	if got := s.unparsedCount("E1"); got != 1 {
-		t.Fatalf("E1 count = %d, want 1 (a younger entry survives the eviction)", got)
-	}
-	s.deliverEncrypted(unparsedEvent("E1")) // 2
-	if !s.deliverEncrypted(unparsedEvent("E1")) {
-		t.Fatal("E1 was not given up on its third delivery")
-	}
-}
-
-func TestUnparsedChatRedeliveryIsBounded(t *testing.T) {
-	s := newTestSession()
-	acked := 0
-	for i := 0; i < maxUnparsedRedeliveries+3; i++ {
-		if s.deliverEncrypted(unparsedEvent("LOOP")) {
-			acked++
-			break
-		}
-	}
-	if acked != 1 {
-		t.Fatalf("the same unparsable message was refused forever")
-	}
-	st := s.listingStats(0, 0, 0)
-	if st["e2ee_dropped_unparsed_chat"] != maxUnparsedRedeliveries || st["e2ee_unparsed_given_up"] != 1 {
-		t.Fatalf("stats = %v", st)
 	}
 }
 
