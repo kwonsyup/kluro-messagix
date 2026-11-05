@@ -155,7 +155,7 @@ func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
 	}
 	wantStats(t, stats, map[string]int{
 		"inbox_stop": 0, "inbox_pages": 1, "inbox_rows_total": 1, "inbox_rows_parent_inbox": 1, "inbox_rows_parent0_more": 0, "inbox_rows_parent0_end": 0, "inbox_rows_other_parent": 0, "group1_threads": 3, "group1_encrypted_rows": 3, "hybrid_mappings": 0, "cutover_links": 0,
-		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "encrypted_unlisted": 0, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
+		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "e2ee_received": 0, "e2ee_emitted": 0, "e2ee_dropped_unparsed_chat": 0, "e2ee_unparsed_given_up": 0, "encrypted_unlisted": 0, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
 	})
 }
 
@@ -182,7 +182,7 @@ func TestKnownEncryptedKeyWithNoTableRowIsCountedNotEmitted(t *testing.T) {
 	}
 	wantStats(t, stats, map[string]int{
 		"inbox_stop": 0, "inbox_pages": 1, "inbox_rows_total": 1, "inbox_rows_parent_inbox": 1, "inbox_rows_parent0_more": 0, "inbox_rows_parent0_end": 0, "inbox_rows_other_parent": 0, "group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 1, "cutover_links": 2,
-		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "encrypted_unlisted": 2, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
+		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "e2ee_received": 0, "e2ee_emitted": 0, "e2ee_dropped_unparsed_chat": 0, "e2ee_unparsed_given_up": 0, "encrypted_unlisted": 2, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
 	})
 }
 

@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"strconv"
+	"strings"
 	"sync"
 
 	"go.mau.fi/whatsmeow/proto/waConsumerApplication"
@@ -508,9 +509,15 @@ func (s *messagixSession) deliverEncrypted(evt *events.FBMessage) bool {
 	s.workWG.Add(1)
 	s.mu.Unlock()
 	defer s.workWG.Done()
+	s.mu.Lock()
+	s.e2eeReceived++
+	s.mu.Unlock()
+	if _, ok := e2eeChatKey(evt.Info.MessageSource); !ok {
+		return s.unparsedChat(evt)
+	}
 	frames := s.waMessageFrames(evt)
 	if len(frames) == 0 {
-		return true
+		return true // a reaction that changes nothing here
 	}
 	// Seal first: this message's decryption advanced Signal sessions in the
 	// device store, and the connector must seal that state before it commits
@@ -530,21 +537,105 @@ func (s *messagixSession) deliverEncrypted(evt *events.FBMessage) bool {
 			seqs = append(seqs, seq)
 		}
 	}
-	if len(seqs) == 0 {
-		return true // a bare thread or reaction row: nothing is committed
-	}
-	for _, seq := range seqs {
-		if !s.acks.wait(seq) {
-			return false
+	if len(seqs) > 0 {
+		for _, seq := range seqs {
+			if !s.acks.wait(seq) {
+				return false
+			}
 		}
 	}
+	// A bare thread or reaction row commits nothing but was still emitted.
+	s.mu.Lock()
+	s.e2eeEmitted++
+	s.mu.Unlock()
 	return true
+}
+
+// maxUnparsedRedeliveries bounds how often one message whose chat id cannot be
+// read is left unacknowledged: the server redelivers an unacknowledged
+// message, so a permanently unreadable one must not come back forever.
+const (
+	maxUnparsedRedeliveries = 3
+	maxUnparsedTracked      = 256
+)
+
+// unparsedChat handles an encrypted message whose chat id maps to no Messenger
+// id. It is counted and logged by server class only (never the id), and it is
+// NOT acknowledged, so Meta redelivers it, until the bound, after which it is
+// acknowledged and counted as given up.
+func (s *messagixSession) unparsedChat(evt *events.FBMessage) bool {
+	logCode("warn", "e2ee_unparsed_chat_"+e2eeServerClass(evt.Info.Chat.Server))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.e2eeUnparsed++
+	if s.unparsedSeen == nil || len(s.unparsedSeen) >= maxUnparsedTracked {
+		s.unparsedSeen = map[string]int{}
+	}
+	s.unparsedSeen[evt.Info.ID]++
+	if s.unparsedSeen[evt.Info.ID] >= maxUnparsedRedeliveries {
+		delete(s.unparsedSeen, evt.Info.ID)
+		s.e2eeGaveUp++
+		return true
+	}
+	return false
+}
+
+// e2eeServerClass names a JID server for the log: a fixed set, never anything
+// the message chose.
+func e2eeServerClass(server string) string {
+	switch server {
+	case waTypes.MessengerServer:
+		return "msgr"
+	case waTypes.HiddenUserServer:
+		return "lid"
+	case waTypes.HostedLIDServer:
+		return "hosted_lid"
+	case waTypes.GroupServer:
+		return "g_us"
+	case waTypes.DefaultUserServer, waTypes.LegacyUserServer:
+		return "pn"
+	}
+	return "other"
+}
+
+// e2eeChatKey maps an encrypted message's chat to its numeric Messenger id,
+// the same id send.go builds its JID from. The user part may carry an agent or
+// device suffix ("4242.0:7") when it was not parsed into the JID fields. A
+// chat whose own id is not numeric (a LID with no Messenger id) falls back to
+// the alternate address the event carries.
+func e2eeChatKey(src waTypes.MessageSource) (int64, bool) {
+	if id, ok := numericJIDUser(src.Chat); ok {
+		return id, true
+	}
+	if src.Chat.Server == waTypes.GroupServer {
+		return 0, false
+	}
+	alt := src.SenderAlt
+	if src.IsFromMe {
+		alt = src.RecipientAlt
+	}
+	if alt.Server == waTypes.MessengerServer {
+		return numericJIDUser(alt)
+	}
+	return 0, false
+}
+
+func numericJIDUser(j waTypes.JID) (int64, bool) {
+	user := j.User
+	if i := strings.IndexAny(user, ".:"); i >= 0 {
+		user = user[:i]
+	}
+	id, err := strconv.ParseInt(user, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, false
+	}
+	return id, true
 }
 
 func (s *messagixSession) waMessageFrames(evt *events.FBMessage) []Frame {
 	chat := evt.Info.Chat
-	chatID, err := strconv.ParseInt(chat.User, 10, 64)
-	if err != nil || chatID == 0 {
+	chatID, ok := e2eeChatKey(evt.Info.MessageSource)
+	if !ok {
 		return nil
 	}
 	senderID, _ := strconv.ParseInt(evt.Info.Sender.User, 10, 64)
@@ -678,5 +769,12 @@ func (s *messagixSession) listingStats(known, emitted, unlisted int) map[string]
 		"e2ee_offline_done":     offlineDone,
 		"resume_sync_rows":      s.resumeRows,
 		"encrypted_unlisted":    unlisted,
+		// Every encrypted message that reached deliverEncrypted, how many of
+		// them were emitted, how many had a chat id that maps to no Messenger
+		// id (and how many of those were finally acknowledged anyway).
+		"e2ee_received":              s.e2eeReceived,
+		"e2ee_emitted":               s.e2eeEmitted,
+		"e2ee_dropped_unparsed_chat": s.e2eeUnparsed,
+		"e2ee_unparsed_given_up":     s.e2eeGaveUp,
 	}
 }
