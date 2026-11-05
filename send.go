@@ -30,7 +30,6 @@ func (s *messagixSession) Send(ctx context.Context, thread, otid, text string) (
 	}
 	s.mu.Lock()
 	cli, ecli := s.client, s.e2ee
-	t := s.threads[thread]
 	s.mu.Unlock()
 	if cli == nil {
 		return nil, errCode("not_started")
@@ -41,11 +40,7 @@ func (s *messagixSession) Send(ctx context.Context, thread, otid, text string) (
 		if ecli == nil {
 			return nil, errCode("unavailable")
 		}
-		server := waTypes.MessengerServer
-		if t != nil && t.Kind == "group" {
-			server = waTypes.GroupServer
-		}
-		jid := waTypes.NewJID(strconv.FormatInt(key, 10), server)
+		jid := waTypes.NewJID(strconv.FormatInt(key, 10), s.encryptedServer(thread))
 		msg := &waConsumerApplication.ConsumerApplication{
 			Payload: &waConsumerApplication.ConsumerApplication_Payload{
 				Payload: &waConsumerApplication.ConsumerApplication_Payload_Content{

@@ -85,7 +85,9 @@ type messagixSession struct {
 	e2eeEmitted    int                                                                                                // ... that were emitted
 	e2eeUnparsed   int                                                                                                // ... whose chat id maps to no Messenger id
 	e2eeGaveUp     int                                                                                                // ... of those, acknowledged after the redelivery bound
-	unparsedSeen   map[string]int                                                                                     // message id -> times seen unparsed (bounded)
+	unparsedSeen   map[string]int                                                                                     // message id -> times seen unparsed (bounded, oldest evicted)
+	unparsedOrder  []string                                                                                           // insertion order of unparsedSeen
+	unparsedCap    int                                                                                                // test seam: the table size; 0 means maxUnparsedTracked
 	resumeRows     int                                                                                                // rows the resumed-start sync returned, count only
 	lsRequest      func(ctx context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) // test seam; nil means the client
 	beforeListEmit func(id string)                                                                                    // test seam: runs between the listing's snapshot of ids and its emit of one

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -17,45 +18,43 @@ func e2eeEvent(chat, alt waTypes.JID, id string) *events.FBMessage {
 	return &events.FBMessage{Info: info, Message: consumerText("hello")}
 }
 
-func TestEveryRealChatFormParsesToItsFBID(t *testing.T) {
-	cases := []struct {
-		name string
-		jid  waTypes.JID
-		want string
-	}{
-		{"msgr user", waTypes.NewJID("4242", waTypes.MessengerServer), "e:4242"},
-		{"msgr device form", waTypes.JID{User: "4242", Device: 7, Server: waTypes.MessengerServer}, "e:4242"},
-		{"msgr agent form", waTypes.JID{User: "4242", RawAgent: 3, Server: waTypes.MessengerServer}, "e:4242"},
-		{"msgr user text with device suffix", waTypes.JID{User: "4242:7", Server: waTypes.MessengerServer}, "e:4242"},
-		{"msgr user text with agent and device", waTypes.JID{User: "4242.0:7", Server: waTypes.MessengerServer}, "e:4242"},
-		{"lid", waTypes.NewJID("4242", waTypes.HiddenUserServer), "e:4242"},
-		{"group", waTypes.NewJID("4242", waTypes.GroupServer), "e:4242"},
-	}
-	for _, c := range cases {
+func TestNumericChatIDsStillParse(t *testing.T) {
+	for _, jid := range []waTypes.JID{
+		waTypes.NewJID("4242", waTypes.MessengerServer),
+		{User: "4242", Device: 7, Server: waTypes.MessengerServer},
+		waTypes.NewJID("4242", waTypes.GroupServer),
+	} {
 		s := newTestSession()
-		frames := s.waMessageFrames(e2eeEvent(c.jid, waTypes.EmptyJID, "ID1"))
 		var thread, msg bool
-		for _, f := range frames {
-			if f.T == TThread && f.ThreadEvt.ID == c.want {
-				thread = true
-			}
-			if f.T == TMessage && f.Message.Thread == c.want && f.Message.ID == "wa:ID1" && f.Message.Encrypted {
-				msg = true
-			}
+		for _, f := range s.waMessageFrames(e2eeEvent(jid, waTypes.EmptyJID, "ID1")) {
+			thread = thread || (f.T == TThread && f.ThreadEvt.ID == "e:4242")
+			msg = msg || (f.T == TMessage && f.Message.Thread == "e:4242" && f.Message.ID == "wa:ID1" && f.Message.Encrypted)
 		}
 		if !thread || !msg {
-			t.Errorf("%s: thread=%v message=%v frames=%d", c.name, thread, msg, len(frames))
+			t.Errorf("%v: thread=%v message=%v", jid, thread, msg)
 		}
 	}
 }
 
-func TestLIDChatWithoutANumericIDUsesItsMessengerAlternate(t *testing.T) {
-	s := newTestSession()
-	chat := waTypes.NewJID("abc-not-numeric", waTypes.HiddenUserServer)
-	alt := waTypes.NewJID("4242", waTypes.MessengerServer)
-	frames := s.waMessageFrames(e2eeEvent(chat, alt, "ID2"))
-	if len(frames) == 0 || frames[0].T != TThread || frames[0].ThreadEvt.ID != "e:4242" {
-		t.Fatalf("frames = %+v", frames)
+// Forms whose peer cannot be established from the id itself are not guessed
+// at: a wrong guess routes a reply to the wrong person.
+func TestMalformedAndAmbiguousChatIDsAreNotGuessed(t *testing.T) {
+	for _, jid := range []waTypes.JID{
+		{User: "4242.invalid", Server: waTypes.GroupServer},
+		{User: "4242:7", Server: waTypes.MessengerServer},
+		{User: "4242.0:7", Server: waTypes.MessengerServer},
+		{User: "4242abc", Server: waTypes.HiddenUserServer},
+		{User: "-4242", Server: waTypes.MessengerServer},
+		{User: "0", Server: waTypes.MessengerServer},
+	} {
+		s := newTestSession()
+		alt := waTypes.NewJID("9999", waTypes.MessengerServer) // an alternate address is not used either
+		if frames := s.waMessageFrames(e2eeEvent(jid, alt, "IDX")); len(frames) != 0 {
+			t.Errorf("%q@%s produced %d frames", jid.User, jid.Server, len(frames))
+		}
+		if s.deliverEncrypted(e2eeEvent(jid, alt, "IDY")) {
+			t.Errorf("%q@%s was acknowledged on first delivery", jid.User, jid.Server)
+		}
 	}
 }
 
@@ -81,6 +80,43 @@ func TestUnparsedChatIsCountedLoggedAndNotAcked(t *testing.T) {
 	}
 	if strings.Contains(log, "SECRET") || strings.Contains(log, "not-a-number") {
 		t.Fatalf("the log carried the id: %q", log)
+	}
+}
+
+func TestUnparsedReplayOfManyIDsEachGivesUpAfterExactlyThreeDeliveries(t *testing.T) {
+	s := newTestSession()
+	const n = 600 // replayed round-robin, more than a small cap
+	acked := map[int]int{}
+	for round := 1; round <= maxUnparsedRedeliveries; round++ {
+		for i := 0; i < n; i++ {
+			if s.deliverEncrypted(unparsedEvent(fmt.Sprintf("R%d", i))) {
+				acked[i] = round
+			}
+		}
+	}
+	for i := 0; i < n; i++ {
+		if acked[i] != maxUnparsedRedeliveries {
+			t.Fatalf("id %d acknowledged on delivery %d, want %d", i, acked[i], maxUnparsedRedeliveries)
+		}
+	}
+	if st := s.listingStats(0, 0, 0); st["e2ee_unparsed_given_up"] != n {
+		t.Fatalf("given up = %d", st["e2ee_unparsed_given_up"])
+	}
+}
+
+func TestUnparsedTrackingEvictsOnlyTheOldestAndNeverResetsACount(t *testing.T) {
+	s := newTestSession()
+	s.unparsedCap = 8
+	for i := 0; i < 8; i++ {
+		s.deliverEncrypted(unparsedEvent(fmt.Sprintf("E%d", i))) // count 1 each
+	}
+	s.deliverEncrypted(unparsedEvent("E8")) // full: evicts only the oldest (E0)
+	if got := s.unparsedCount("E1"); got != 1 {
+		t.Fatalf("E1 count = %d, want 1 (a younger entry survives the eviction)", got)
+	}
+	s.deliverEncrypted(unparsedEvent("E1")) // 2
+	if !s.deliverEncrypted(unparsedEvent("E1")) {
+		t.Fatal("E1 was not given up on its third delivery")
 	}
 }
 
@@ -121,5 +157,28 @@ func TestEncryptedOneToOneMessageIsEmittedAndCounted(t *testing.T) {
 	st := s.listingStats(0, 0, 0)
 	if st["e2ee_received"] != 1 || st["e2ee_emitted"] != 1 || st["e2ee_dropped_unparsed_chat"] != 0 {
 		t.Fatalf("stats = %v", st)
+	}
+}
+
+// Send reads a thread's kind while the receive path writes it.
+func TestSendReadsTheThreadKindUnderTheSessionLock(t *testing.T) {
+	s := newTestSession()
+	s.waMessageFrames(e2eeEvent(waTypes.NewJID("4242", waTypes.MessengerServer), waTypes.EmptyJID, "K0"))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 500; i++ {
+			s.waMessageFrames(e2eeEvent(waTypes.NewJID("4242", waTypes.GroupServer), waTypes.EmptyJID, fmt.Sprintf("K%d", i)))
+		}
+	}()
+	for i := 0; i < 500; i++ {
+		_ = s.encryptedServer("e:4242")
+	}
+	<-done
+	if got := s.encryptedServer("e:4242"); got != waTypes.GroupServer {
+		t.Fatalf("server = %q", got)
+	}
+	if got := s.encryptedServer("e:9"); got != waTypes.MessengerServer {
+		t.Fatalf("unknown thread server = %q", got)
 	}
 }
