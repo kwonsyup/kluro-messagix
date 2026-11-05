@@ -81,6 +81,9 @@ type messagixSession struct {
 	statusMark     map[int64]bool                                                                                     // ... whose latest message request status row is 1 (memory only)
 	e2eeOffline    int                                                                                                // queued E2EE messages the server said it would flush at connect (OfflineSyncPreview), count only
 	e2eeOfflineEnd bool                                                                                               // OfflineSyncCompleted seen
+	e2eeReceived   int                                                                                                // encrypted message events that reached deliverEncrypted, count only
+	e2eeEmitted    int                                                                                                // ... that were emitted
+	e2eeUnparsed   int                                                                                                // ... whose chat id maps to no Messenger id
 	resumeRows     int                                                                                                // rows the resumed-start sync returned, count only
 	lsRequest      func(ctx context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) // test seam; nil means the client
 	beforeListEmit func(id string)                                                                                    // test seam: runs between the listing's snapshot of ids and its emit of one

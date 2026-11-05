@@ -508,9 +508,21 @@ func (s *messagixSession) deliverEncrypted(evt *events.FBMessage) bool {
 	s.workWG.Add(1)
 	s.mu.Unlock()
 	defer s.workWG.Done()
+	s.mu.Lock()
+	s.e2eeReceived++
+	s.mu.Unlock()
+	if _, ok := e2eeChatKey(evt.Info.Chat); !ok {
+		// Visibility only: as before, the message is acknowledged. The class of
+		// the id's server is logged, never the id.
+		logCode("warn", "e2ee_unparsed_chat_"+e2eeServerClass(evt.Info.Chat.Server))
+		s.mu.Lock()
+		s.e2eeUnparsed++
+		s.mu.Unlock()
+		return true
+	}
 	frames := s.waMessageFrames(evt)
 	if len(frames) == 0 {
-		return true
+		return true // a reaction that changes nothing here
 	}
 	// Seal first: this message's decryption advanced Signal sessions in the
 	// device store, and the connector must seal that state before it commits
@@ -530,21 +542,53 @@ func (s *messagixSession) deliverEncrypted(evt *events.FBMessage) bool {
 			seqs = append(seqs, seq)
 		}
 	}
-	if len(seqs) == 0 {
-		return true // a bare thread or reaction row: nothing is committed
-	}
-	for _, seq := range seqs {
-		if !s.acks.wait(seq) {
-			return false
+	if len(seqs) > 0 {
+		for _, seq := range seqs {
+			if !s.acks.wait(seq) {
+				return false
+			}
 		}
 	}
+	// A bare thread or reaction row commits nothing but was still emitted.
+	s.mu.Lock()
+	s.e2eeEmitted++
+	s.mu.Unlock()
 	return true
+}
+
+// e2eeServerClass names a JID server for the log: a fixed set, never anything
+// the message chose.
+func e2eeServerClass(server string) string {
+	switch server {
+	case waTypes.MessengerServer:
+		return "msgr"
+	case waTypes.HiddenUserServer:
+		return "lid"
+	case waTypes.HostedLIDServer:
+		return "hosted_lid"
+	case waTypes.GroupServer:
+		return "g_us"
+	case waTypes.DefaultUserServer, waTypes.LegacyUserServer:
+		return "pn"
+	}
+	return "other"
+}
+
+// e2eeChatKey is the chat's numeric Messenger id, read from the id itself and
+// nothing else (unchanged from the shipped parse): any other form is left
+// unparsed, since guessing at the peer could route a reply to the wrong person.
+func e2eeChatKey(chat waTypes.JID) (int64, bool) {
+	id, err := strconv.ParseInt(chat.User, 10, 64)
+	if err != nil || id == 0 {
+		return 0, false
+	}
+	return id, true
 }
 
 func (s *messagixSession) waMessageFrames(evt *events.FBMessage) []Frame {
 	chat := evt.Info.Chat
-	chatID, err := strconv.ParseInt(chat.User, 10, 64)
-	if err != nil || chatID == 0 {
+	chatID, ok := e2eeChatKey(chat)
+	if !ok {
 		return nil
 	}
 	senderID, _ := strconv.ParseInt(evt.Info.Sender.User, 10, 64)
@@ -678,5 +722,21 @@ func (s *messagixSession) listingStats(known, emitted, unlisted int) map[string]
 		"e2ee_offline_done":     offlineDone,
 		"resume_sync_rows":      s.resumeRows,
 		"encrypted_unlisted":    unlisted,
+		// Every encrypted message that reached deliverEncrypted, how many of
+		// them were emitted, how many had a chat id that maps to no Messenger id.
+		"e2ee_received":              s.e2eeReceived,
+		"e2ee_emitted":               s.e2eeEmitted,
+		"e2ee_dropped_unparsed_chat": s.e2eeUnparsed,
 	}
+}
+
+// encryptedServer is the JID server an encrypted thread is addressed on. The
+// thread's kind is read under the session lock: the receive path writes it.
+func (s *messagixSession) encryptedServer(thread string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t := s.threads[thread]; t != nil && t.Kind == "group" {
+		return waTypes.GroupServer
+	}
+	return waTypes.MessengerServer
 }
