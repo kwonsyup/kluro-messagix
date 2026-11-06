@@ -44,9 +44,20 @@ func (s *messagixSession) handleTable(tbl *table.LSTable) {
 // s.mu, thread frames ahead of their messages as built, so a later row (a live
 // rejection, say) cannot land between a frame's build and its emit.
 func (s *messagixSession) handleTableEmit(tbl *table.LSTable, emit emitFunc) {
+	s.handleTableEmitAt(tbl, 0, emit)
+}
+
+// handleTableEmitAt is handleTableEmit for the reply to a request issued in
+// connection epoch issued: its roster rows count as seen in that epoch, so a
+// reply issued before a reconnect never certifies a roster after it. Zero
+// means the current epoch.
+func (s *messagixSession) handleTableEmitAt(tbl *table.LSTable, issued int64, emit emitFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, f := range s.buildTableFramesLocked(tbl) {
+	if issued == 0 {
+		issued = s.connEpoch
+	}
+	for _, f := range s.buildTableFramesLocked(tbl, issued) {
 		emit(f)
 	}
 }
@@ -56,29 +67,41 @@ func (s *messagixSession) handleTableEmit(tbl *table.LSTable, emit emitFunc) {
 func (s *messagixSession) handleTableFrames(tbl *table.LSTable) []Frame {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.buildTableFramesLocked(tbl)
+	return s.buildTableFramesLocked(tbl, s.connEpoch)
 }
 
 // buildTableFramesLocked applies a table to the session and returns its frames.
-// The caller holds s.mu.
-func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []Frame) {
+// Its roster rows count as seen in epoch. The caller holds s.mu.
+func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64) (frames []Frame) {
 	dirty := false
+	touched := map[string]bool{}
+	// supersede re-emits an open thread that an encrypted record now continues;
+	// membersCompleteLocked never certifies it again.
+	supersede := func(key int64) {
+		if t := s.threads[wireID(false, key)]; t != nil {
+			t.RosterEpoch = 0
+			touched[wireID(false, key)] = true
+		}
+	}
 	for _, c := range tbl.LSCreateOpenToE2EEThreadLink {
 		if s.cutover[c.ArmadilloThreadID] != c.OpenThreadID {
 			s.cutover[c.ArmadilloThreadID] = c.OpenThreadID
 			dirty = true
+			supersede(c.OpenThreadID)
 		}
 	}
 	for _, j := range tbl.LSUpdateThreadAuthorityAndMappingWithOTIDFromJID {
 		if s.fbToWA[j.ThreadKey] != j.ThreadJID {
 			s.fbToWA[j.ThreadKey] = j.ThreadJID
 			dirty = true
+			supersede(j.ThreadKey)
 		}
 	}
 	for _, j := range tbl.LSVerifyHybridThreadExists {
 		if s.fbToWA[j.ThreadKey] != j.ThreadJID {
 			s.fbToWA[j.ThreadKey] = j.ThreadJID
 			dirty = true
+			supersede(j.ThreadKey)
 		}
 	}
 	for _, c := range tbl.LSDeleteThenInsertContact {
@@ -92,7 +115,6 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []F
 		}
 	}
 
-	touched := map[string]bool{}
 	// A thread row in the "pending" or "spam" folder, or a message request row with
 	// status 1, marks the thread unaccepted: it is emitted with Typed=false whatever
 	// its type, so the connector qualifies nothing from it. Any other non-empty
@@ -179,13 +201,17 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []F
 			upsertThread(th.ThreadKey, th.ThreadType, "", 0)
 		}
 	}
+	// A bulk reset empties the roster before this table's participant rows.
+	for _, r := range tbl.LSRemoveAllParticipantsForThread {
+		s.resetParticipantsLocked(r.ThreadKey, touched)
+	}
 	for _, p := range tbl.LSAddParticipantIdToGroupThread {
 		key, enc := s.mapKey(p.ThreadKey)
 		if t := s.threads[wireID(enc, key)]; t != nil {
-			t.seeParticipant(p.ContactId, s.connEpoch)
+			t.seeParticipant(p.ContactId, epoch)
 			touched[wireID(enc, key)] = true
 		} else {
-			s.participants[p.ThreadKey] = append(s.participants[p.ThreadKey], pendingParticipant{p.ContactId, s.connEpoch})
+			s.participants[p.ThreadKey] = append(s.participants[p.ThreadKey], pendingParticipant{p.ContactId, epoch})
 		}
 	}
 	// A snapshot row with a count marks the roster as taken in this epoch; a
@@ -196,7 +222,7 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []F
 			// A snapshot without a count replaces the old one: unknown.
 			t.MemberCount, t.RosterEpoch = th.MemberCount, 0
 			if th.MemberCount > 0 {
-				t.RosterEpoch = s.connEpoch
+				t.RosterEpoch = epoch
 			}
 		}
 	}
@@ -345,6 +371,23 @@ func (s *messagixSession) removeParticipantLocked(threadKey, id int64, touched m
 	}
 }
 
+// resetParticipantsLocked applies a remove-all row: the thread's participants,
+// their freshness, its buffered rows and its snapshot are all dropped. A typed
+// one-to-one thread keeps the other person, who is its key.
+func (s *messagixSession) resetParticipantsLocked(threadKey int64, touched map[string]bool) {
+	delete(s.participants, threadKey)
+	key, enc := s.mapKey(threadKey)
+	t := s.threads[wireID(enc, key)]
+	if t == nil {
+		return
+	}
+	t.Participants, t.Seen, t.RosterEpoch = nil, nil, 0
+	if t.Typed && t.Kind == "user" {
+		t.addParticipant(t.Key)
+	}
+	touched[wireID(enc, key)] = true
+}
+
 func (t *threadInfo) addParticipant(id int64) {
 	if id == 0 {
 		return
@@ -401,6 +444,15 @@ func (s *messagixSession) bumpConnEpoch() {
 	s.mu.Unlock()
 }
 
+// setLinkDown records a socket going down or coming up. Either way every roster
+// snapshot taken so far ends; while down, no roster is complete.
+func (s *messagixSession) setLinkDown(down bool) {
+	s.mu.Lock()
+	s.connEpoch++
+	s.linkDown = down
+	s.mu.Unlock()
+}
+
 // freshOthersLocked is the thread's participants other than self whose latest
 // participant row arrived in the current connection epoch, as wire ids. A
 // participant last seen in an older epoch is left out: it may have been
@@ -416,13 +468,29 @@ func (s *messagixSession) freshOthersLocked(t *threadInfo) []string {
 }
 
 // membersCompleteLocked reports whether the fresh others are known to be the
-// whole roster: an open typed group whose snapshot count, taken in this
-// connection epoch with no delta since, equals self plus the others seen in
-// this epoch. Identities from an older epoch never count.
+// whole roster: an open typed group, not continued by an encrypted record,
+// whose snapshot count, taken in this connection epoch with no delta since,
+// equals self plus the others seen in this epoch, while the socket is up.
+// Identities from an older epoch never count.
 func (s *messagixSession) membersCompleteLocked(t *threadInfo) bool {
-	return !t.Enc && t.Typed && t.Kind == "group" && !s.unacceptedLocked(t.Key) &&
+	return !t.Enc && !s.linkDown && !s.supersededLocked(t) && t.Typed && t.Kind == "group" && !s.unacceptedLocked(t.Key) &&
 		t.MemberCount > 0 && t.RosterEpoch != 0 && t.RosterEpoch == s.connEpoch &&
 		t.MemberCount == int64(1+len(s.freshOthersLocked(t)))
+}
+
+// supersededLocked reports whether an open thread's record is continued by an
+// encrypted one: a hybrid mapping or encrypted record under its key, or a
+// cutover naming it as the predecessor. Its roster then lives elsewhere.
+func (s *messagixSession) supersededLocked(t *threadInfo) bool {
+	if _, enc := s.mapKey(t.Key); enc {
+		return true
+	}
+	for _, open := range s.cutover {
+		if open == t.Key {
+			return true
+		}
+	}
+	return false
 }
 
 func threadFrame(t Thread) Frame { return Frame{T: TThread, ThreadEvt: &t} }

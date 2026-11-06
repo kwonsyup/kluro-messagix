@@ -100,7 +100,8 @@ type messagixSession struct {
 	rosterLogged   map[string]int64 // thread -> epoch its roster diagnostic was logged in
 	rosterLogN     int64            // diagnostics logged in rosterLogEpoch
 	rosterLogEpoch int64
-	connEpoch      int64 // bumped on (re)connect and offline sync completion; starts at 1
+	connEpoch      int64 // bumped on (re)connect, disconnect and offline sync completion; starts at 1
+	linkDown       bool  // from Start or a socket disconnect until the next connected event: no roster is complete
 
 	lastState       time.Time
 	lastStateBlob   []byte
@@ -246,6 +247,7 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 	}
 	s.mu.Lock()
 	s.client = cli
+	s.linkDown = true // until the socket's first sync completes
 	s.mu.Unlock()
 
 	var currentUser types.UserInfo
@@ -941,15 +943,19 @@ func (s *messagixSession) handleMetaEvent(ctx context.Context, rawEvt any) {
 	case *table.LSTable:
 		s.handleTable(evt)
 	case *messagix.ConnectedEvent, *messagix.ReconnectedEvent:
-		s.bumpConnEpoch()
+		// messagix emits these after the socket's sync, so rows from before
+		// it, and from the sync itself, belong to an ended epoch.
+		s.setLinkDown(false)
 		s.markStateDirty()
 		s.scheduleE2EE()
 	case *messagix.TransientDisconnectEvent:
+		s.setLinkDown(true)
 		logCode("info", "transient_disconnect")
 		if errors.Is(evt.Err, messagix.ErrFatalSocketSyncError) {
 			s.fullReconnect()
 		}
 	case *messagix.PermanentErrorEvent:
+		s.setLinkDown(true)
 		if dgwCloseStatus(evt.Err) == dgw.CloseStatusUnauthorized {
 			logCode("warn", "auth_invalid")
 			s.emit(Frame{T: TAuth, Auth: AuthInvalid})

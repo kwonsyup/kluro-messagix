@@ -183,8 +183,9 @@ type Frame struct {
 	OTID     string            `json:"otid,omitempty"`
 	Text     string            `json:"text,omitempty"`
 	// Expect, on send, is the other participants the connector believes the
-	// group has; nil means no check.
-	Expect []string `json:"expect,omitempty"`
+	// group has; absent means no check. A pointer keeps a present empty list
+	// on the wire, where the helper refuses it.
+	Expect *[]string `json:"expect,omitempty"`
 
 	// events
 	Self      string         `json:"self,omitempty"`

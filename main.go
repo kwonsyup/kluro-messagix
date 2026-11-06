@@ -280,7 +280,11 @@ func run(r io.Reader, w io.Writer, mkBackend func() backend) int {
 				em.emit(Frame{T: TError, ID: f.ID, Err: "not_started"})
 				return -1
 			}
-			sent, err := b.Send(ctx, f.Thread, f.OTID, f.Text, f.Expect)
+			var expect []string
+			if f.Expect != nil {
+				expect = append([]string{}, *f.Expect...) // present: non-nil, even when empty
+			}
+			sent, err := b.Send(ctx, f.Thread, f.OTID, f.Text, expect)
 			if err != nil {
 				em.emit(Frame{T: TError, ID: f.ID, Err: codeOf(err)})
 				return -1

@@ -28,6 +28,12 @@ func (s *messagixSession) Send(ctx context.Context, thread, otid, text string, e
 	if !ok || text == "" {
 		return nil, errCode("bad_request")
 	}
+	// The roster check is the last step before the provider call: on the open
+	// path, the only one a guarded send reaches (an encrypted thread is never
+	// complete), nothing between them takes a lock or waits. s.mu cannot be held
+	// across the call: table rows reach handleTable on the socket's single frame
+	// goroutine, which also delivers this call's reply, so a held lock would
+	// stall both until the reply times out and the send reads "unknown".
 	s.mu.Lock()
 	cli, ecli := s.client, s.e2ee
 	var rosterErr error
@@ -91,10 +97,11 @@ func (s *messagixSession) Send(ctx context.Context, thread, otid, text string, e
 
 // expectLocked is nil only for an open group with a complete roster whose
 // fresh others (seen in this connection epoch) are exactly expect, in any
-// order. The caller holds s.mu.
+// order. An empty expect names no recipient and is refused. The caller holds
+// s.mu.
 func (s *messagixSession) expectLocked(thread string, expect []string) error {
 	t := s.threads[thread]
-	if t == nil || !s.membersCompleteLocked(t) {
+	if t == nil || len(expect) == 0 || !s.membersCompleteLocked(t) {
 		return errCode("roster_changed")
 	}
 	have := s.freshOthersLocked(t)
