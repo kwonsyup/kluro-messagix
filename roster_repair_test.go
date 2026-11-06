@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -252,4 +253,308 @@ func TestSendExpectUnconfirmedVersusChanged(t *testing.T) {
 			t.Fatalf("link down, expect [%s]: %v", expect, err)
 		}
 	}
+}
+
+// refreshFake is the client of the roster refresh and of a concurrent Threads walk. It
+// records whether two ExecuteTasks calls overlapped, which the helper assumes never happens.
+type refreshFake struct {
+	mu          sync.Mutex
+	inflight    int
+	overlapped  bool
+	tasks       []socket.FetchThreadsTask
+	startedAt   []time.Time
+	reply       func(n int) *table.LSTable // page n, 1-based; nil means an empty page
+	more        func(n int) bool           // whether page n says there is more before it
+	during      func(n int)                // runs while request n is in flight
+	gate        chan struct{}              // if set, request 1 blocks until it is closed
+	firstServed chan struct{}              // closed when request 1 has started
+}
+
+func (r *refreshFake) GetCursor(int64) string { return "" }
+
+func (r *refreshFake) ExecuteTasks(_ context.Context, tasks ...socket.Task) (*table.LSTable, error) {
+	r.mu.Lock()
+	r.inflight++
+	if r.inflight > 1 {
+		r.overlapped = true
+	}
+	r.tasks = append(r.tasks, *tasks[0].(*socket.FetchThreadsTask))
+	r.startedAt = append(r.startedAt, time.Now())
+	n := len(r.tasks)
+	r.mu.Unlock()
+	defer func() { r.mu.Lock(); r.inflight--; r.mu.Unlock() }()
+	if n == 1 && r.firstServed != nil {
+		close(r.firstServed)
+	}
+	if n == 1 && r.gate != nil {
+		<-r.gate
+	}
+	if r.during != nil {
+		r.during(n)
+	}
+	tbl := &table.LSTable{}
+	if r.reply != nil {
+		tbl = r.reply(n)
+	}
+	more := r.more != nil && r.more(n)
+	tbl.LSUpsertSyncGroupThreadsRange = append(tbl.LSUpsertSyncGroupThreadsRange,
+		&table.LSUpsertSyncGroupThreadsRange{SyncGroup: 1, ParentThreadKey: -1, HasMoreBefore: more, MinThreadKey: int64(1000 - n), MinLastActivityTimestampMS: int64(5000 - n)})
+	return tbl, nil
+}
+
+func (r *refreshFake) taskCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.tasks)
+}
+
+// twoGroups is marketplace two-person groups, each with one other member (key+1).
+func twoGroups(keys ...int64) *table.LSTable {
+	tbl := &table.LSTable{}
+	for _, k := range keys {
+		tbl.LSDeleteThenInsertThread = append(tbl.LSDeleteThenInsertThread, &table.LSDeleteThenInsertThread{ThreadKey: k, ThreadType: table.MARKETPLACE, MemberCount: 2})
+		tbl.LSAddParticipantIdToGroupThread = append(tbl.LSAddParticipantIdToGroupThread, &table.LSAddParticipantIdToGroupThread{ThreadKey: k, ContactId: k + 1})
+	}
+	return tbl
+}
+
+// refreshHarness is a live session whose refresh uses fake, with every emitted
+// frame and every finished refresh recorded.
+type refreshHarness struct {
+	s      *messagixSession
+	fake   *refreshFake
+	done   chan struct{}
+	fmu    sync.Mutex
+	frames []Frame
+}
+
+func newRefreshHarness(t *testing.T, fake *refreshFake) *refreshHarness {
+	t.Helper()
+	oldDebounce, oldPages, oldDelay := rosterRefreshDebounce, rosterRefreshPages, threadBatchDelay
+	rosterRefreshDebounce, threadBatchDelay = 0, time.Millisecond
+	t.Cleanup(func() { rosterRefreshDebounce, rosterRefreshPages, threadBatchDelay = oldDebounce, oldPages, oldDelay })
+	h := &refreshHarness{s: liveTestSession(), fake: fake, done: make(chan struct{}, 16)}
+	h.s.refreshPager = fake
+	h.s.emit = func(f Frame) int64 { h.fmu.Lock(); h.frames = append(h.frames, f); h.fmu.Unlock(); return 0 }
+	h.s.afterRefresh = func() { h.done <- struct{}{} }
+	return h
+}
+
+// waitRefresh waits for one refresh goroutine to end.
+func (h *refreshHarness) waitRefresh(t *testing.T) {
+	t.Helper()
+	select {
+	case <-h.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("refresh did not finish")
+	}
+}
+
+// noRefresh fails if a refresh goroutine ends within d.
+func (h *refreshHarness) noRefresh(t *testing.T, d time.Duration) {
+	t.Helper()
+	select {
+	case <-h.done:
+		t.Fatal("unexpected refresh")
+	case <-time.After(d):
+	}
+}
+
+func (h *refreshHarness) threadFrame(id string, complete bool) bool {
+	h.fmu.Lock()
+	defer h.fmu.Unlock()
+	for _, f := range h.frames {
+		if f.T == TThread && f.ThreadEvt.ID == id && f.ThreadEvt.MembersComplete == complete {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *refreshHarness) drop() {
+	h.s.handleMetaEvent(context.Background(), &messagix.TransientDisconnectEvent{Err: errors.New("closed")})
+}
+
+func (h *refreshHarness) reconnect() {
+	h.s.handleMetaEvent(context.Background(), &messagix.ReconnectedEvent{})
+}
+
+// After a reconnect one refresh walk is issued from the top of the inbox, certifies
+// the group again, and its c1 frame goes out through the normal path.
+func TestReconnectRefreshCertifiesGroup(t *testing.T) {
+	fake := &refreshFake{reply: func(int) *table.LSTable { return groupRows(2, 7) }, more: func(int) bool { return true }}
+	h := newRefreshHarness(t, fake)
+	h.s.handleTableFrames(groupRows(2, 7))
+	mustComplete(t, h.s, "2002", true, "premise")
+	h.drop()
+	h.reconnect()
+	h.waitRefresh(t)
+	mustComplete(t, h.s, "2002", true, "after the refresh")
+	if err := expectErr(h.s, "2002", "7"); err != nil {
+		t.Fatalf("send after the refresh: %v", err)
+	}
+	h.noRefresh(t, 100*time.Millisecond)
+	// The page certified the only target, so the walk stopped though it said there was more.
+	if got := fake.taskCount(); got != 1 {
+		t.Fatalf("walk requests = %d, want 1", got)
+	}
+	if task := fake.tasks[0]; task.ParentThreadKey != -1 || task.ReferenceThreadKey != 0 || task.ReferenceActivityTimestamp != 9999999999999 || task.SyncGroup != 1 {
+		t.Fatalf("first request = %+v, want the top of the main inbox", task)
+	}
+	if !h.threadFrame("2002", true) {
+		t.Fatal("no certified thread frame was emitted")
+	}
+}
+
+// The first Connected of a run triggers nothing; a Connected after a disconnect does.
+func TestInitialConnectedDoesNotRefresh(t *testing.T) {
+	fake := &refreshFake{reply: func(int) *table.LSTable { return groupRows(2, 7) }}
+	h := newRefreshHarness(t, fake)
+	h.s.handleTableFrames(groupRows(2, 7))
+	h.s.handleMetaEvent(context.Background(), &messagix.ConnectedEvent{})
+	h.noRefresh(t, 150*time.Millisecond)
+	if got := fake.taskCount(); got != 0 {
+		t.Fatalf("initial Connected issued %d walk requests", got)
+	}
+	h.drop()
+	h.s.handleMetaEvent(context.Background(), &messagix.ConnectedEvent{})
+	h.waitRefresh(t)
+	if got := fake.taskCount(); got != 1 {
+		t.Fatalf("Connected after a disconnect issued %d walk requests, want 1", got)
+	}
+	// A further Connected without a disconnect in between is not a reconnect.
+	h.s.handleMetaEvent(context.Background(), &messagix.ConnectedEvent{})
+	h.noRefresh(t, 100*time.Millisecond)
+}
+
+// A refresh reply issued before a further disconnect certifies nothing, and
+// neither does anything after it until fresh rows arrive.
+func TestRefreshReplyIssuedBeforeSecondDisconnectCertifiesNothing(t *testing.T) {
+	var h *refreshHarness
+	fake := &refreshFake{reply: func(int) *table.LSTable { return groupRows(2, 7) }}
+	fake.during = func(int) { h.s.setLinkDown(true) }
+	h = newRefreshHarness(t, fake)
+	h.s.handleTableFrames(groupRows(2, 7))
+	h.drop()
+	h.reconnect()
+	h.waitRefresh(t)
+	mustComplete(t, h.s, "2002", false, "reply issued before the second disconnect")
+	if h.threadFrame("2002", true) {
+		t.Fatal("a certified frame was emitted from a stale reply")
+	}
+	h.s.setLinkDown(false) // the link is back up, with no new rows yet
+	mustComplete(t, h.s, "2002", false, "link back, no rows")
+	if err := expectErr(h.s, "2002", "7"); codeOf(err) != "roster_unconfirmed" {
+		t.Fatalf("send on a stale refresh: %v", err)
+	}
+}
+
+// The refresh keeps its own start and never reads, clears or saves inboxResume,
+// including when it ends at its page cap.
+func TestRefreshLeavesInboxResumeAlone(t *testing.T) {
+	fake := &refreshFake{more: func(int) bool { return true }} // never reaches the group
+	h := newRefreshHarness(t, fake)
+	rosterRefreshPages = 3
+	h.s.handleTableFrames(groupRows(2, 7))
+	resume := &inboxResumeRef{threadKey: 77, activityMS: 8888}
+	h.s.inboxResume = resume
+	h.drop()
+	h.reconnect()
+	h.waitRefresh(t)
+	h.s.mu.Lock()
+	got := h.s.inboxResume
+	h.s.mu.Unlock()
+	if got != resume || *got != (inboxResumeRef{77, 8888}) {
+		t.Fatalf("inboxResume = %+v, want it untouched", got)
+	}
+	if n := fake.taskCount(); n != 3 {
+		t.Fatalf("requests = %d, want the cap 3", n)
+	}
+	if task := fake.tasks[0]; task.ReferenceThreadKey != 0 || task.ReferenceActivityTimestamp != 9999999999999 {
+		t.Fatalf("the refresh started at the resume position: %+v", task)
+	}
+	mustComplete(t, h.s, "2002", false, "not reached")
+}
+
+// A refresh and a Threads walk never run ExecuteTasks at the same time; the
+// refresh waits for the walk and then runs.
+func TestRefreshDoesNotOverlapThreadsWalk(t *testing.T) {
+	fake := &refreshFake{reply: func(int) *table.LSTable { return groupRows(2, 7) }, gate: make(chan struct{}), firstServed: make(chan struct{})}
+	h := newRefreshHarness(t, fake)
+	h.s.handleTableFrames(groupRows(2, 7))
+	walked := make(chan error, 1)
+	go func() {
+		_, err := h.s.listThreads(context.Background(), fake, func(Frame) int64 { return 0 })
+		walked <- err
+	}()
+	<-fake.firstServed // the Threads walk's request is in flight
+	h.drop()
+	h.reconnect()
+	h.noRefresh(t, 150*time.Millisecond)
+	if got := fake.taskCount(); got != 1 {
+		t.Fatalf("the refresh issued a request during the Threads walk (%d)", got)
+	}
+	close(fake.gate)
+	if err := <-walked; err != nil {
+		t.Fatal(err)
+	}
+	h.waitRefresh(t)
+	fake.mu.Lock()
+	overlapped, n := fake.overlapped, len(fake.tasks)
+	fake.mu.Unlock()
+	if overlapped {
+		t.Fatal("ExecuteTasks calls overlapped")
+	}
+	if n < 2 {
+		t.Fatalf("the refresh never ran after the walk (%d requests)", n)
+	}
+	mustComplete(t, h.s, "2002", true, "refresh after the walk")
+}
+
+// A group the refresh's pages do not reach stays unconfirmed, and Send refuses it.
+func TestRefreshUnreachedThreadStaysUnconfirmed(t *testing.T) {
+	fake := &refreshFake{reply: func(int) *table.LSTable { return twoGroups(2002) }}
+	h := newRefreshHarness(t, fake)
+	h.s.handleTableFrames(twoGroups(2002, 3003))
+	mustComplete(t, h.s, "2002", true, "premise")
+	mustComplete(t, h.s, "3003", true, "premise")
+	h.drop()
+	h.reconnect()
+	h.waitRefresh(t)
+	mustComplete(t, h.s, "2002", true, "reached")
+	mustComplete(t, h.s, "3003", false, "not reached")
+	if err := expectErr(h.s, "3003", "3004"); codeOf(err) != "roster_unconfirmed" {
+		t.Fatalf("send to the unreached group: %v", err)
+	}
+	if err := expectErr(h.s, "2002", "2003"); err != nil {
+		t.Fatalf("send to the reached group: %v", err)
+	}
+}
+
+// A reconnect storm costs one refresh: the latest reconnect wins and starts are
+// at least the debounce apart.
+func TestRefreshDebouncesReconnectStorm(t *testing.T) {
+	fake := &refreshFake{reply: func(int) *table.LSTable { return groupRows(2, 7) }}
+	h := newRefreshHarness(t, fake)
+	const debounce = 300 * time.Millisecond
+	rosterRefreshDebounce = debounce
+	h.s.handleTableFrames(groupRows(2, 7))
+	h.drop()
+	h.reconnect()
+	h.waitRefresh(t)
+	for i := 0; i < 4; i++ {
+		h.drop()
+		h.reconnect()
+	}
+	h.waitRefresh(t)
+	h.noRefresh(t, 2*debounce)
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.tasks) != 2 {
+		t.Fatalf("requests = %d, want 2 (one per debounce window)", len(fake.tasks))
+	}
+	if gap := fake.startedAt[1].Sub(fake.startedAt[0]); gap < debounce {
+		t.Fatalf("refresh starts %v apart, want at least %v", gap, debounce)
+	}
+	mustComplete(t, h.s, "2002", true, "after the last reconnect")
 }

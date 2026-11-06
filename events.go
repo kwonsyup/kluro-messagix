@@ -411,9 +411,15 @@ func (s *messagixSession) clearRosterLocked(threadKey int64, touched map[string]
 
 const rosterLogCap = 200
 
-// logRosterLocked logs counts only, once per typed group thread per epoch and
-// at most rosterLogCap lines per epoch: roster.t<type>.mc<count>.p<others>.c<0|1>,
-// counts capped at 9.
+// rosterLogRef is what a thread's last roster diagnostic said.
+type rosterLogRef struct {
+	epoch int64
+	p, c  int
+}
+
+// logRosterLocked logs counts only, per typed group thread once per epoch and
+// again whenever its p or c changes within the epoch, at most rosterLogCap
+// lines per epoch: roster.t<type>.mc<count>.p<others>.c<0|1>, counts capped at 9.
 func (s *messagixSession) logRosterLocked(t *threadInfo, complete bool) {
 	if t.Enc || !t.Typed || t.Kind != "group" {
 		return
@@ -422,19 +428,20 @@ func (s *messagixSession) logRosterLocked(t *threadInfo, complete bool) {
 		s.rosterLogEpoch, s.rosterLogN = s.connEpoch, 0
 	}
 	if s.rosterLogged == nil {
-		s.rosterLogged = map[string]int64{}
+		s.rosterLogged = map[string]rosterLogRef{}
 	}
 	id := wireID(false, t.Key)
-	if s.rosterLogged[id] == s.connEpoch || s.rosterLogN >= rosterLogCap {
-		return
-	}
-	s.rosterLogged[id] = s.connEpoch
-	s.rosterLogN++
 	c := 0
 	if complete {
 		c = 1
 	}
-	logCode("info", fmt.Sprintf("roster.t%d.mc%d.p%d.c%d", min(t.RawType, 99), min(t.MemberCount, 9), min(len(s.freshOthersLocked(t)), 9), c))
+	cur := rosterLogRef{epoch: s.connEpoch, p: min(len(s.freshOthersLocked(t)), 9), c: c}
+	if s.rosterLogged[id] == cur || s.rosterLogN >= rosterLogCap {
+		return
+	}
+	s.rosterLogged[id] = cur
+	s.rosterLogN++
+	logCode("info", fmt.Sprintf("roster.t%d.mc%d.p%d.c%d", min(t.RawType, 99), min(t.MemberCount, 9), cur.p, cur.c))
 }
 
 // bumpConnEpoch ends every roster snapshot taken so far.
@@ -450,6 +457,9 @@ func (s *messagixSession) setLinkDown(down bool) {
 	s.mu.Lock()
 	s.connEpoch++
 	s.linkDown = down
+	if down {
+		s.hadDisconnect = true
+	}
 	s.mu.Unlock()
 }
 

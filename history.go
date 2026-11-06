@@ -39,6 +39,10 @@ func (s *messagixSession) History(ctx context.Context, thread, cursor string, co
 	if enc {
 		return s.encryptedHistory(ctx, thread, key, cursor, count)
 	}
+	if err := s.acquireWalk(ctx); err != nil {
+		return nil, err
+	}
+	defer s.releaseWalk()
 	return s.lightspeedHistory(ctx, thread, key, cursor, count)
 }
 
@@ -374,6 +378,10 @@ func (s *messagixSession) Threads(ctx context.Context, emit emitFunc) (listingDo
 }
 
 func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit emitFunc) (listingDone, error) {
+	if err := s.acquireWalk(ctx); err != nil {
+		return listingDone{}, err
+	}
+	defer s.releaseWalk()
 	emitted := map[string]bool{}
 	counted := func(f Frame) int64 {
 		if f.T == TThread && f.ThreadEvt != nil && f.ThreadEvt.Encrypted {
@@ -416,17 +424,35 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit
 // next walk starts from the top and sees new threads. It lives in process memory only:
 // a companion restart re-walks from the top.
 func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit emitFunc, rows *inboxRowCounts) (gap string, stop, pages int, err error) {
-	const group = 1
-	ref := socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, ReferenceThreadKey: 0, ReferenceActivityTimestamp: 9999999999999}
+	ref := inboxTop
 	s.mu.Lock()
 	if r := s.inboxResume; r != nil {
 		ref.ReferenceThreadKey, ref.ReferenceActivityTimestamp = r.threadKey, r.activityMS
 	}
 	s.inboxResume = nil
 	s.mu.Unlock()
-	for batch := 0; batch < threadBatchLimit; batch++ {
+	gap, stop, pages, next, err := s.walkInbox(ctx, cli, emit, rows, ref, threadBatchLimit, nil)
+	if err == nil && stop == 4 {
+		s.mu.Lock()
+		s.inboxResume = &inboxResumeRef{threadKey: next.ReferenceThreadKey, activityMS: next.ReferenceActivityTimestamp}
+		s.mu.Unlock()
+	}
+	return gap, stop, pages, err
+}
+
+// inboxTop is the first page request of a walk: the newest threads of the main inbox.
+var inboxTop = socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, ReferenceThreadKey: 0, ReferenceActivityTimestamp: 9999999999999}
+
+// walkInbox pages group 1 from ref for at most limit requests and returns the next
+// request position (what a page-bound stop, code 4, would resume at). It owns no
+// shared walk state: pageThreads keeps inboxResume, and the roster refresh passes its
+// own start, limit and done. When done is set it is checked after each page is
+// applied; true ends the walk with stop code 5 (nothing more wanted).
+func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit emitFunc, rows *inboxRowCounts, ref socket.FetchThreadsTask, limit int, done func() bool) (gap string, stop, pages int, next socket.FetchThreadsTask, err error) {
+	const group = 1
+	for batch := 0; batch < limit; batch++ {
 		if err := ctx.Err(); err != nil {
-			return "", 0, pages, err
+			return "", 0, pages, ref, err
 		}
 		task := ref
 		task.IsAfter = 0
@@ -438,10 +464,10 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 		s.mu.Unlock()
 		tbl, err := cli.ExecuteTasks(ctx, &task)
 		if err != nil {
-			return "", 0, pages, mapSendErr(err)
+			return "", 0, pages, ref, mapSendErr(err)
 		}
 		if tbl == nil {
-			return gapInboxIncomplete, 1, pages, nil
+			return gapInboxIncomplete, 1, pages, ref, nil
 		}
 		pages++
 		// The reply's roster rows date from the request: a reconnect while it
@@ -453,30 +479,30 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 			return emit(f)
 		})
 		if err := ctx.Err(); err != nil {
-			return "", 0, pages, err
+			return "", 0, pages, ref, err
+		}
+		if done != nil && done() {
+			return "", 5, pages, ref, nil
 		}
 		rng := group1Range(tbl, inboxParentKey, rows)
 		if rng == nil {
-			return gapInboxIncomplete, 2, pages, nil
+			return gapInboxIncomplete, 2, pages, ref, nil
 		}
 		if !rng.HasMoreBefore {
-			return "", 0, pages, nil
+			return "", 0, pages, ref, nil
 		}
 		next := socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, ReferenceThreadKey: rng.MinThreadKey, ReferenceActivityTimestamp: rng.MinLastActivityTimestampMS}
 		if next.ParentThreadKey == ref.ParentThreadKey && next.ReferenceThreadKey == ref.ReferenceThreadKey && next.ReferenceActivityTimestamp == ref.ReferenceActivityTimestamp {
-			return gapInboxIncomplete, 3, pages, nil
+			return gapInboxIncomplete, 3, pages, ref, nil
 		}
 		ref = next
 		select {
 		case <-time.After(threadBatchDelay):
 		case <-ctx.Done():
-			return "", 0, pages, ctx.Err()
+			return "", 0, pages, ref, ctx.Err()
 		}
 	}
-	s.mu.Lock()
-	s.inboxResume = &inboxResumeRef{threadKey: ref.ReferenceThreadKey, activityMS: ref.ReferenceActivityTimestamp}
-	s.mu.Unlock()
-	return gapInboxIncomplete, 4, pages, nil
+	return gapInboxIncomplete, 4, pages, ref, nil
 }
 
 // inboxResumeRef is the range position the next walk requests after a walk hit the page bound.

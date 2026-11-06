@@ -382,3 +382,34 @@ func TestRosterDiagnosticCountsFreshOthers(t *testing.T) {
 		t.Fatalf("log = %q", got)
 	}
 }
+
+// The diagnostic also logs when a thread's p or c changes inside one epoch, so
+// a silent re-certification shows; an unchanged thread logs nothing more.
+func TestRosterDiagnosticLogsOnChangeWithinEpoch(t *testing.T) {
+	var buf bytes.Buffer
+	old := stderr
+	stderr = &buf
+	defer func() { stderr = old }()
+	s := newTestSession()
+	s.handleTableFrames(groupRows(2, 7))
+	buf.Reset()
+	s.bumpConnEpoch()
+	s.handleTableFrames(groupRows(2))
+	wireOf(t, s, "2002")
+	wireOf(t, s, "2002")
+	if n := strings.Count(buf.String(), "roster."); n != 1 || !strings.Contains(buf.String(), `"roster.t2.mc2.p0.c0"`) {
+		t.Fatalf("after the stale build: %q", buf.String())
+	}
+	s.handleTableFrames(groupRows(2, 7)) // same epoch: recertified
+	wireOf(t, s, "2002")
+	wireOf(t, s, "2002")
+	if n := strings.Count(buf.String(), "roster."); n != 2 || !strings.Contains(buf.String(), `"roster.t2.mc2.p0.c0"`) || !strings.Contains(buf.String(), `"roster.t2.mc2.p1.c1"`) {
+		t.Fatalf("after the recertification: %q", buf.String())
+	}
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var m map[string]string
+		if json.Unmarshal([]byte(line), &m) != nil || !regexp.MustCompile(`^[a-z0-9_.]{1,64}$`).MatchString(m["code"]) {
+			t.Fatalf("bad line %q", line)
+		}
+	}
+}
