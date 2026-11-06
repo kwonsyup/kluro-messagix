@@ -97,22 +97,22 @@ func (s *messagixSession) Send(ctx context.Context, thread, otid, text string, e
 
 // expectLocked is nil only for an open group with a complete roster whose
 // fresh others (seen in this connection epoch) are exactly expect, in any
-// order. An empty expect names no recipient and is refused. The caller holds
+// order. It is "roster_unconfirmed" when the roster is not known complete now
+// (unknown, encrypted, superseded, stale, link down, count mismatch, or more
+// than one other) or expect is empty or repeats an id, and "roster_changed"
+// only when a complete roster's others differ from expect. The caller holds
 // s.mu.
 func (s *messagixSession) expectLocked(thread string, expect []string) error {
-	t := s.threads[thread]
-	if t == nil || len(expect) == 0 || !s.membersCompleteLocked(t) {
-		return errCode("roster_changed")
-	}
-	have := s.freshOthersLocked(t)
-	if len(have) != len(expect) {
-		return errCode("roster_changed")
-	}
 	want := map[string]bool{}
 	for _, e := range expect {
 		want[e] = true
 	}
-	if len(want) != len(expect) {
+	t := s.threads[thread]
+	if t == nil || len(expect) == 0 || len(want) != len(expect) || !s.membersCompleteLocked(t) {
+		return errCode("roster_unconfirmed")
+	}
+	have := s.freshOthersLocked(t)
+	if len(have) != len(expect) {
 		return errCode("roster_changed")
 	}
 	for _, h := range have {

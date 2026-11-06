@@ -468,13 +468,14 @@ func (s *messagixSession) freshOthersLocked(t *threadInfo) []string {
 }
 
 // membersCompleteLocked reports whether the fresh others are known to be the
-// whole roster: an open typed group, not continued by an encrypted record,
-// whose snapshot count, taken in this connection epoch with no delta since,
-// equals self plus the others seen in this epoch, while the socket is up.
-// Identities from an older epoch never count.
+// whole roster: an open typed two-person group (self and exactly one other),
+// not continued by an encrypted record, whose snapshot count, taken in this
+// connection epoch with no delta since, equals self plus the others seen in
+// this epoch, while the socket is up. Identities from an older epoch never
+// count; a larger group is never complete.
 func (s *messagixSession) membersCompleteLocked(t *threadInfo) bool {
 	return !t.Enc && !s.linkDown && !s.supersededLocked(t) && t.Typed && t.Kind == "group" && !s.unacceptedLocked(t.Key) &&
-		t.MemberCount > 0 && t.RosterEpoch != 0 && t.RosterEpoch == s.connEpoch &&
+		t.MemberCount == 2 && t.RosterEpoch != 0 && t.RosterEpoch == s.connEpoch &&
 		t.MemberCount == int64(1+len(s.freshOthersLocked(t)))
 }
 

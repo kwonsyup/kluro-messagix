@@ -35,17 +35,24 @@ func wireOf(t *testing.T, s *messagixSession, id string) Thread {
 
 func TestMembersCompleteGroup(t *testing.T) {
 	s := newTestSession()
-	s.handleTableFrames(groupRows(3, 1, 7, 8))
+	// A two-person group: self (listed too) and one other.
+	s.handleTableFrames(groupRows(2, 1, 7))
 	if !wireOf(t, s, "2002").MembersComplete {
-		t.Fatal("full roster not complete")
-	}
-	// A two-person group: self and one other.
-	s.handleTableFrames(&table.LSTable{
-		LSDeleteThenInsertThread:        []*table.LSDeleteThenInsertThread{{ThreadKey: 3003, ThreadType: table.GROUP_THREAD, MemberCount: 2}},
-		LSAddParticipantIdToGroupThread: []*table.LSAddParticipantIdToGroupThread{{ThreadKey: 3003, ContactId: 9}},
-	})
-	if !wireOf(t, s, "3003").MembersComplete {
 		t.Fatal("two-person group not complete")
+	}
+}
+
+// Only self plus exactly one other is ever certified: a fully fresh larger
+// group stays copy-only and its expect is unconfirmed, not changed.
+func TestMembersLargerGroupNeverComplete(t *testing.T) {
+	s := newTestSession()
+	s.client = &messagix.Client{}
+	s.handleTableFrames(groupRows(3, 1, 7, 8))
+	if wireOf(t, s, "2002").MembersComplete {
+		t.Fatal("fresh three-member group complete")
+	}
+	if err := sendWith(s, "2002", []string{"7", "8"}); codeOf(err) != "roster_unconfirmed" {
+		t.Fatalf("expect on a three-member group: %v", err)
 	}
 }
 
@@ -67,12 +74,12 @@ func TestMembersIncompleteAfterDelta(t *testing.T) {
 		"remove": {LSRemoveParticipantFromThread: []*table.LSRemoveParticipantFromThread{{ThreadKey: 2002, ParticipantId: 8}}},
 	} {
 		s := newTestSession()
-		s.handleTableFrames(groupRows(3, 7, 8))
+		s.handleTableFrames(groupRows(2, 8))
 		s.handleTableFrames(delta)
 		if wireOf(t, s, "2002").MembersComplete {
 			t.Fatalf("%s delta left the roster complete", name)
 		}
-		s.handleTableFrames(groupRows(3, 7, 8))
+		s.handleTableFrames(groupRows(2, 8))
 		if !wireOf(t, s, "2002").MembersComplete {
 			t.Fatalf("%s: a new snapshot did not restore completeness", name)
 		}
@@ -81,12 +88,12 @@ func TestMembersIncompleteAfterDelta(t *testing.T) {
 
 func TestMembersIncompleteAfterReconnectUntilNewSnapshot(t *testing.T) {
 	s := newTestSession()
-	s.handleTableFrames(groupRows(3, 7, 8))
+	s.handleTableFrames(groupRows(2, 7))
 	s.bumpConnEpoch()
 	if wireOf(t, s, "2002").MembersComplete {
 		t.Fatal("complete after reconnect")
 	}
-	s.handleTableFrames(groupRows(3, 7, 8))
+	s.handleTableFrames(groupRows(2, 7))
 	if !wireOf(t, s, "2002").MembersComplete {
 		t.Fatal("not complete after a new DeleteThenInsert")
 	}
@@ -110,43 +117,47 @@ func sendWith(s *messagixSession, thread string, expect []string) error {
 }
 
 // A refused send must not reach the provider: the zero client would panic on
-// any write.
+// any write. A confirmed roster that differs is "roster_changed"; anything
+// that leaves the roster unconfirmed, or a malformed expect, is
+// "roster_unconfirmed". The encrypted case is refused before its own
+// "unavailable" check, so no encrypted send is attempted either.
 func TestSendExpectRefusals(t *testing.T) {
 	s := newTestSession()
 	s.client = &messagix.Client{}
-	s.handleTableFrames(groupRows(3, 7, 8))
+	s.handleTableFrames(groupRows(2, 7))
 	s.handleTableFrames(&table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{
 		{ThreadKey: 6, ThreadType: table.ENCRYPTED_OVER_WA_GROUP, MemberCount: 2}}})
 	for name, c := range map[string]struct {
 		thread string
 		expect []string
+		code   string
 	}{
-		"mismatch": {"2002", []string{"7", "9"}},
-		"subset":   {"2002", []string{"7"}},
-		"superset": {"2002", []string{"7", "8", "9"}},
-		"empty":    {"2002", []string{}},
-		"e2ee":     {"e:6", []string{"9"}},
-		"unknown":  {"4004", []string{"9"}},
+		"mismatch":  {"2002", []string{"9"}, "roster_changed"},
+		"superset":  {"2002", []string{"7", "9"}, "roster_changed"},
+		"empty":     {"2002", []string{}, "roster_unconfirmed"},
+		"duplicate": {"2002", []string{"7", "7"}, "roster_unconfirmed"},
+		"e2ee":      {"e:6", []string{"9"}, "roster_unconfirmed"},
+		"unknown":   {"4004", []string{"9"}, "roster_unconfirmed"},
 	} {
-		if err := sendWith(s, c.thread, c.expect); codeOf(err) != "roster_changed" {
-			t.Fatalf("%s: err %v", name, err)
+		if err := sendWith(s, c.thread, c.expect); codeOf(err) != c.code {
+			t.Fatalf("%s: err %v, want %s", name, err, c.code)
 		}
 	}
 	// Incomplete after a delta.
 	s.handleTableFrames(&table.LSTable{LSAddToMemberCount: []*table.LSAddToMemberCount{{ThreadKey: 2002, IncrementCount: 1}}})
-	if err := sendWith(s, "2002", []string{"8", "7"}); codeOf(err) != "roster_changed" {
+	if err := sendWith(s, "2002", []string{"7"}); codeOf(err) != "roster_unconfirmed" {
 		t.Fatalf("incomplete roster: %v", err)
 	}
 }
 
 func TestSendExpectMatchPassesCheck(t *testing.T) {
 	s := newTestSession()
-	s.handleTableFrames(groupRows(3, 7, 8))
+	s.handleTableFrames(groupRows(2, 7))
 	s.mu.Lock()
-	err := s.expectLocked("2002", []string{"8", "7"})
+	err := s.expectLocked("2002", []string{"7"})
 	s.mu.Unlock()
 	if err != nil {
-		t.Fatalf("order-insensitive match refused: %v", err)
+		t.Fatalf("match refused: %v", err)
 	}
 }
 
@@ -224,35 +235,28 @@ func expectErr(s *messagixSession, thread string, expect ...string) error {
 
 // Codex P1: self plus 7 and 8, reconnect after 8 is replaced by 9, then a
 // count-3 snapshot naming only 7. The cached 8 is from an older epoch and must
-// not fill the count.
+// not fill the count; and a three-member group is never certified anyway,
+// even once every member is fresh.
 func TestMembersStaleIdentityAfterReconnectNotComplete(t *testing.T) {
 	s := newTestSession()
 	s.client = &messagix.Client{}
 	s.handleTableFrames(groupRows(3, 7, 8))
-	if !wireOf(t, s, "2002").MembersComplete {
-		t.Fatal("premise: fresh full roster not complete")
-	}
 	s.bumpConnEpoch()
 	s.handleTableFrames(groupRows(3, 7))
 	if wireOf(t, s, "2002").MembersComplete {
 		t.Fatal("stale participant 8 certified a new snapshot")
 	}
 	for _, expect := range [][]string{{"7", "8"}, {"7", "9"}, {"7"}} {
-		if err := sendWith(s, "2002", expect); codeOf(err) != "roster_changed" {
+		if err := sendWith(s, "2002", expect); codeOf(err) != "roster_unconfirmed" {
 			t.Fatalf("expect %v: err %v", expect, err)
 		}
 	}
-	// The new member's row arrives in this epoch: the roster is 7 and 9 only.
 	s.handleTableFrames(groupRows(3, 9))
-	th := wireOf(t, s, "2002")
-	if !th.MembersComplete || strings.Join(othersOf(th), ",") != "7,9" {
-		t.Fatalf("complete=%v others=%v", th.MembersComplete, othersOf(th))
+	if wireOf(t, s, "2002").MembersComplete {
+		t.Fatal("fresh three-member group complete")
 	}
-	if err := sendWith(s, "2002", []string{"7", "8"}); codeOf(err) != "roster_changed" {
-		t.Fatalf("stale expect: %v", err)
-	}
-	if err := expectErr(s, "2002", "9", "7"); err != nil {
-		t.Fatalf("fresh expect refused: %v", err)
+	if err := sendWith(s, "2002", []string{"9", "7"}); codeOf(err) != "roster_unconfirmed" {
+		t.Fatalf("expect on a fresh three-member group: %v", err)
 	}
 }
 
@@ -274,7 +278,7 @@ func TestMembersTwoPersonReplacedAcrossReconnect(t *testing.T) {
 	if wireOf(t, s, "2002").MembersComplete {
 		t.Fatal("stale participant 7 certified a count-2 snapshot")
 	}
-	if err := sendWith(s, "2002", []string{"7"}); codeOf(err) != "roster_changed" {
+	if err := sendWith(s, "2002", []string{"7"}); codeOf(err) != "roster_unconfirmed" {
 		t.Fatalf("stale expect: %v", err)
 	}
 	// 9 is seen fresh in this epoch.
@@ -295,7 +299,7 @@ func TestMembersTwoPersonReplacedAcrossReconnect(t *testing.T) {
 	if wireOf(t, s, "2002").MembersComplete {
 		t.Fatal("9 from an older epoch certified the roster")
 	}
-	if err := sendWith(s, "2002", []string{"9"}); codeOf(err) != "roster_changed" {
+	if err := sendWith(s, "2002", []string{"9"}); codeOf(err) != "roster_unconfirmed" {
 		t.Fatalf("expect [9] with a stale roster: %v", err)
 	}
 }
@@ -334,6 +338,9 @@ func TestMembersRemovalRowRemovesParticipant(t *testing.T) {
 	}
 	if err := expectErr(s, "2002", "7", "8"); codeOf(err) != "roster_changed" {
 		t.Fatalf("removed participant still expected: %v", err)
+	}
+	if err := expectErr(s, "2002", "7"); err != nil {
+		t.Fatalf("remaining participant refused: %v", err)
 	}
 	// A removal for a thread not yet known drops the buffered row.
 	s.handleTableFrames(&table.LSTable{LSAddParticipantIdToGroupThread: []*table.LSAddParticipantIdToGroupThread{{ThreadKey: 3003, ContactId: 5}}})

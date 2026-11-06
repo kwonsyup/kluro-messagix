@@ -39,8 +39,10 @@ type backend interface {
 	// History returns one page of a thread, newest first.
 	History(ctx context.Context, thread, cursor string, count int) (*Page, error)
 	// Send sends one text; it never retries internally. A non-nil expect is
-	// the group's other participants; a different or unknown roster is refused
-	// "roster_changed" before any provider call.
+	// the group's other participants. Before any provider call, a roster not
+	// confirmed in this connection (or an empty expect) is refused
+	// "roster_unconfirmed", and a confirmed roster that differs is refused
+	// "roster_changed".
 	Send(ctx context.Context, thread, otid, text string, expect []string) (*Sent, error)
 	// Logout ends the session for good: best-effort provider sign-out and
 	// local device deletion, then everything in memory is wiped. Messenger
