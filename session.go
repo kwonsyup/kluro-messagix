@@ -107,9 +107,11 @@ type messagixSession struct {
 	rosterLogged   map[string]rosterLogRef // thread -> epoch and counts of its last roster diagnostic
 	rosterLogN     int64                   // diagnostics logged in rosterLogEpoch
 	rosterLogEpoch int64
-	connEpoch      int64 // bumped on (re)connect, disconnect and offline sync completion; starts at 1
-	hadDisconnect  bool  // a socket went down since the last connected event (guarded by mu)
-	linkDown       bool  // from Start or a socket disconnect until the next connected event: no roster is complete
+	connEpoch      int64           // bumped on (re)connect, disconnect and offline sync completion; starts at 1
+	mutSeq         int64           // last live roster mutation sequence (guarded by mu)
+	rosterMut      map[int64]int64 // thread row key -> sequence of its latest live roster row (guarded by mu)
+	hadDisconnect  bool            // a socket went down since the last connected event (guarded by mu)
+	linkDown       bool            // from Start or a socket disconnect until the next connected event: no roster is complete
 
 	lastState       time.Time
 	lastStateBlob   []byte
@@ -166,6 +168,7 @@ func parseWire(id string) (enc bool, key int64, ok bool) {
 func newSession() *messagixSession {
 	return &messagixSession{
 		connEpoch:    1,
+		rosterMut:    map[int64]int64{},
 		walkSem:      make(chan struct{}, 1),
 		threads:      map[string]*threadInfo{},
 		participants: map[int64][]pendingParticipant{},

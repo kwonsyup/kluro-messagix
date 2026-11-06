@@ -44,20 +44,31 @@ func (s *messagixSession) handleTable(tbl *table.LSTable) {
 // s.mu, thread frames ahead of their messages as built, so a later row (a live
 // rejection, say) cannot land between a frame's build and its emit.
 func (s *messagixSession) handleTableEmit(tbl *table.LSTable, emit emitFunc) {
-	s.handleTableEmitAt(tbl, 0, emit)
-}
-
-// handleTableEmitAt is handleTableEmit for the reply to a request issued in
-// connection epoch issued: its roster rows count as seen in that epoch, so a
-// reply issued before a reconnect never certifies a roster after it. Zero
-// means the current epoch.
-func (s *messagixSession) handleTableEmitAt(tbl *table.LSTable, issued int64, emit emitFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if issued == 0 {
-		issued = s.connEpoch
+	for _, f := range s.buildTableFramesLocked(tbl, s.connEpoch, nil) {
+		emit(f)
 	}
-	for _, f := range s.buildTableFramesLocked(tbl, issued) {
+}
+
+// issueMark is when a walk request was issued: the connection epoch and the
+// roster mutation sequence at that moment. A reply carries its mark so its roster
+// rows date from the request, not from when the reply is applied.
+type issueMark struct{ epoch, seq int64 }
+
+// issueMarkLocked is the mark of a request issued now. The caller holds s.mu.
+func (s *messagixSession) issueMarkLocked() issueMark {
+	return issueMark{epoch: s.connEpoch, seq: s.mutSeq}
+}
+
+// handleReplyEmit is handleTableEmit for the reply to a request issued at mark:
+// its roster rows count as seen in mark.epoch, so a reply issued before a reconnect
+// never certifies a roster after it; and a thread whose roster a live row changed
+// after the request takes none of the reply's roster rows (see buildTableFramesLocked).
+func (s *messagixSession) handleReplyEmit(tbl *table.LSTable, mark issueMark, emit emitFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, f := range s.buildTableFramesLocked(tbl, mark.epoch, &mark) {
 		emit(f)
 	}
 }
@@ -67,12 +78,28 @@ func (s *messagixSession) handleTableEmitAt(tbl *table.LSTable, issued int64, em
 func (s *messagixSession) handleTableFrames(tbl *table.LSTable) []Frame {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.buildTableFramesLocked(tbl, s.connEpoch)
+	return s.buildTableFramesLocked(tbl, s.connEpoch, nil)
 }
 
 // buildTableFramesLocked applies a table to the session and returns its frames.
 // Its roster rows count as seen in epoch. The caller holds s.mu.
-func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64) (frames []Frame) {
+//
+// reply is nil for a live table. Every live roster row (participant add or remove,
+// bulk reset, snapshot, count delta) records a new per-thread mutation sequence. A
+// reply to a walk request carries the sequence at issue: a thread whose live
+// sequence is newer takes none of that reply's roster rows (no reset, participant,
+// count or snapshot), so a delayed reply cannot undo a live change inside one epoch.
+// Its other facts (title, activity) still apply: they cannot certify anything.
+func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64, reply *issueMark) (frames []Frame) {
+	// stale: a reply's roster rows for this thread are older than a live change.
+	stale := func(key int64) bool { return reply != nil && s.rosterMut[key] > reply.seq }
+	// mutate records a live roster row for the thread.
+	mutate := func(key int64) {
+		if reply == nil {
+			s.mutSeq++
+			s.rosterMut[key] = s.mutSeq
+		}
+	}
 	dirty := false
 	touched := map[string]bool{}
 	// supersede re-emits an open thread that an encrypted record now continues;
@@ -203,9 +230,17 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 	}
 	// A bulk reset empties the roster before this table's participant rows.
 	for _, r := range tbl.LSRemoveAllParticipantsForThread {
+		if stale(r.ThreadKey) {
+			continue
+		}
+		mutate(r.ThreadKey)
 		s.resetParticipantsLocked(r.ThreadKey, touched)
 	}
 	for _, p := range tbl.LSAddParticipantIdToGroupThread {
+		if stale(p.ThreadKey) {
+			continue
+		}
+		mutate(p.ThreadKey)
 		key, enc := s.mapKey(p.ThreadKey)
 		if t := s.threads[wireID(enc, key)]; t != nil {
 			t.seeParticipant(p.ContactId, epoch)
@@ -217,6 +252,10 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 	// A snapshot row with a count marks the roster as taken in this epoch; a
 	// delta after it (same table or later) leaves the roster unknown.
 	for _, th := range tbl.LSDeleteThenInsertThread {
+		if stale(th.ThreadKey) {
+			continue
+		}
+		mutate(th.ThreadKey)
 		key, enc := s.mapKey(th.ThreadKey)
 		if t := s.threads[wireID(enc, key)]; t != nil {
 			// A snapshot without a count replaces the old one: unknown.
@@ -227,9 +266,17 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 		}
 	}
 	for _, d := range tbl.LSAddToMemberCount {
+		if stale(d.ThreadKey) {
+			continue
+		}
+		mutate(d.ThreadKey)
 		s.clearRosterLocked(d.ThreadKey, touched)
 	}
 	for _, d := range tbl.LSRemoveParticipantFromThread {
+		if stale(d.ThreadKey) {
+			continue
+		}
+		mutate(d.ThreadKey)
 		s.removeParticipantLocked(d.ThreadKey, d.ParticipantId, touched)
 		s.clearRosterLocked(d.ThreadKey, touched)
 	}

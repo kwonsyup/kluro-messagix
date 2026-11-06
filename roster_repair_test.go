@@ -558,3 +558,69 @@ func TestRefreshDebouncesReconnectStorm(t *testing.T) {
 	}
 	mustComplete(t, h.s, "2002", true, "after the last reconnect")
 }
+
+// staleOldRoster is the reply a delayed walk delivers for thread 2002: a bulk
+// participant reset, then the old snapshot (count 2) and participant 7.
+func staleOldRoster() *table.LSTable {
+	tbl := groupRows(2, 7)
+	tbl.LSRemoveAllParticipantsForThread = []*table.LSRemoveAllParticipantsForThread{{ThreadKey: 2002}}
+	return tbl
+}
+
+// liveJoin is a live row, inside the epoch, adding participant 9 to thread key.
+func liveJoin(key int64) *table.LSTable {
+	return &table.LSTable{LSAddParticipantIdToGroupThread: []*table.LSAddParticipantIdToGroupThread{{ThreadKey: key, ContactId: 9}}}
+}
+
+func mustNotCertify(t *testing.T, s *messagixSession, why string) {
+	t.Helper()
+	mustComplete(t, s, "2002", false, why)
+	if err := expectErr(s, "2002", "7"); err == nil || (codeOf(err) != "roster_unconfirmed" && codeOf(err) != "roster_changed") {
+		t.Fatalf("%s: send with expect [7] = %v, want roster_unconfirmed or roster_changed", why, err)
+	}
+}
+
+// Membership-mutation fence: a live join arrives after a walk request is issued
+// and before its reply (same epoch) carries the old roster. The reply must not
+// erase the joiner and re-certify the now three-member group.
+func TestRefreshReplyOlderThanLiveJoinDoesNotCertify(t *testing.T) {
+	var h *refreshHarness
+	fake := &refreshFake{reply: func(int) *table.LSTable { return staleOldRoster() }}
+	fake.during = func(int) { h.s.handleTableFrames(liveJoin(2002)) }
+	h = newRefreshHarness(t, fake)
+	h.s.handleTableFrames(groupRows(2, 7))
+	h.drop()
+	h.reconnect()
+	h.waitRefresh(t)
+	mustNotCertify(t, h.s, "refresh reply older than a live join")
+	if h.threadFrame("2002", true) {
+		t.Fatal("a certified frame was emitted from the stale reply")
+	}
+}
+
+func TestThreadsWalkReplyOlderThanLiveJoinDoesNotCertify(t *testing.T) {
+	s := liveTestSession()
+	s.handleTableFrames(groupRows(2, 7))
+	mustComplete(t, s, "2002", true, "premise")
+	fake := &refreshFake{reply: func(int) *table.LSTable { return staleOldRoster() }}
+	fake.during = func(int) { s.handleTableFrames(liveJoin(2002)) }
+	if _, _, err, done := listGap(t, s, fake, context.Background(), 5*time.Second); !done || err != nil {
+		t.Fatalf("listing: done=%v err=%v", done, err)
+	}
+	mustNotCertify(t, s, "listing reply older than a live join")
+}
+
+// The fence is per thread and per request: a live change to another thread, or one
+// before the request was issued, leaves the reply's roster rows in force.
+func TestReplyAfterUnrelatedOrEarlierLiveMutationStillCertifies(t *testing.T) {
+	var h *refreshHarness
+	fake := &refreshFake{reply: func(int) *table.LSTable { return twoGroups(2002) }}
+	fake.during = func(int) { h.s.handleTableFrames(liveJoin(3003)) } // another thread
+	h = newRefreshHarness(t, fake)
+	h.s.handleTableFrames(twoGroups(2002, 3003))
+	h.drop()
+	h.s.handleTableFrames(liveJoin(2002)) // earlier than the request
+	h.reconnect()
+	h.waitRefresh(t)
+	mustComplete(t, h.s, "2002", true, "reply with no later live mutation of its thread")
+}

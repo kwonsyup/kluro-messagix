@@ -460,7 +460,7 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 		task.Cursor = cli.GetCursor(group)
 		task.SyncGroup = group
 		s.mu.Lock()
-		issued := s.connEpoch
+		mark := s.issueMarkLocked()
 		s.mu.Unlock()
 		tbl, err := cli.ExecuteTasks(ctx, &task)
 		if err != nil {
@@ -472,7 +472,7 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 		pages++
 		// The reply's roster rows date from the request: a reconnect while it
 		// was in flight leaves them stale.
-		s.handleTableEmitAt(tbl, issued, func(f Frame) int64 {
+		s.handleReplyEmit(tbl, mark, func(f Frame) int64 {
 			if ctx.Err() != nil {
 				return 0
 			}
