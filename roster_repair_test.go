@@ -624,3 +624,101 @@ func TestReplyAfterUnrelatedOrEarlierLiveMutationStillCertifies(t *testing.T) {
 	h.waitRefresh(t)
 	mustComplete(t, h.s, "2002", true, "reply with no later live mutation of its thread")
 }
+
+// groupRowsIn is groupRows with a folder name on the thread row.
+func groupRowsIn(folder string, count int64, others ...int64) *table.LSTable {
+	tbl := groupRows(count, others...)
+	tbl.LSDeleteThenInsertThread[0].FolderName = folder
+	return tbl
+}
+
+func withReset(tbl *table.LSTable) *table.LSTable {
+	tbl.LSRemoveAllParticipantsForThread = []*table.LSRemoveAllParticipantsForThread{{ThreadKey: 2002}}
+	return tbl
+}
+
+// staleWalk runs one walk, through the roster refresh or a Threads listing, whose
+// request is issued after setup and whose reply (the old facts) arrives after live.
+func staleWalk(t *testing.T, mode string, setup, live, reply *table.LSTable) *messagixSession {
+	t.Helper()
+	fake := &refreshFake{reply: func(int) *table.LSTable { return reply }}
+	h := newRefreshHarness(t, fake)
+	h.s.handleTableFrames(setup)
+	fake.during = func(int) { h.s.handleTableFrames(live) }
+	if mode == "refresh" {
+		h.drop()
+		h.reconnect()
+		h.waitRefresh(t)
+	} else if _, _, err, done := listGap(t, h.s, fake, context.Background(), 5*time.Second); !done || err != nil {
+		t.Fatalf("listing: done=%v err=%v", done, err)
+	}
+	if fake.taskCount() == 0 {
+		t.Fatal("no walk was issued")
+	}
+	return h.s
+}
+
+// Sol's scenario: the request is issued at count 3 / {7,8} / inbox; a live reset and
+// snapshot make it count 2 / {7} / spam; the delayed reply must not clear the spam
+// mark and so certify a two-member roster on an unaccepted thread.
+func TestStaleReplyDoesNotClearLiveSpamMark(t *testing.T) {
+	for _, mode := range []string{"refresh", "listing"} {
+		t.Run(mode, func(t *testing.T) {
+			setup := withReset(groupRowsIn("inbox", 3, 7, 8))
+			setup.LSDeleteThenInsertThread = append(setup.LSDeleteThenInsertThread, twoGroups(3003).LSDeleteThenInsertThread...) // a refresh target
+			setup.LSAddParticipantIdToGroupThread = append(setup.LSAddParticipantIdToGroupThread, twoGroups(3003).LSAddParticipantIdToGroupThread...)
+			live := withReset(groupRowsIn(folderSpam, 2, 7))
+			reply := withReset(groupRowsIn("inbox", 3, 7, 8))
+			s := staleWalk(t, mode, setup, live, reply)
+			mustNotCertify(t, s, "stale inbox reply over a live spam move")
+			s.mu.Lock()
+			spam := s.folderMark[2002]
+			s.mu.Unlock()
+			if !spam {
+				t.Fatal("the spam mark was cleared")
+			}
+		})
+	}
+}
+
+// Folder alone, no roster change: a certified group moved to spam during the walk
+// stays unaccepted when the delayed reply says inbox, and Send is refused.
+func TestStaleReplyDoesNotUndoLiveMoveToSpam(t *testing.T) {
+	for _, mode := range []string{"refresh", "listing"} {
+		t.Run(mode, func(t *testing.T) {
+			live := &table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 2002, ThreadType: table.GROUP_THREAD, FolderName: folderSpam}}}
+			s := staleWalk(t, mode, groupRowsIn("inbox", 2, 7), live, groupRowsIn("inbox", 2, 7))
+			if mode == "refresh" {
+				// the reconnect made the roster unconfirmed; only the stale reply could have restored it
+				mustNotCertify(t, s, "stale inbox reply over a live spam move")
+			}
+			mustComplete(t, s, "2002", false, "unaccepted thread")
+			if err := expectErr(s, "2002", "7"); err == nil {
+				t.Fatal("send allowed on an unaccepted thread")
+			}
+		})
+	}
+}
+
+// Message request status: a live status 1 (a request) is not cleared by a delayed
+// reply carrying status 0.
+func TestStaleReplyDoesNotClearLiveMessageRequest(t *testing.T) {
+	for _, mode := range []string{"refresh", "listing"} {
+		t.Run(mode, func(t *testing.T) {
+			live := &table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 2002, MessageRequestStatus: 1}}}
+			reply := groupRowsIn("inbox", 2, 7)
+			reply.LSDeleteThenInsertMessageRequest = []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 2002, MessageRequestStatus: 0}}
+			s := staleWalk(t, mode, groupRowsIn("inbox", 2, 7), live, reply)
+			mustComplete(t, s, "2002", false, "message request")
+			if err := expectErr(s, "2002", "7"); err == nil {
+				t.Fatal("send allowed on a message request")
+			}
+			s.mu.Lock()
+			req := s.statusMark[2002]
+			s.mu.Unlock()
+			if !req {
+				t.Fatal("the request mark was cleared")
+			}
+		})
+	}
+}

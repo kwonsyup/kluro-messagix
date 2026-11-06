@@ -89,6 +89,9 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) []Frame {
 // reply to a walk request carries the sequence at issue: a thread whose live
 // sequence is newer takes none of that reply's roster rows (no reset, participant,
 // count or snapshot), so a delayed reply cannot undo a live change inside one epoch.
+// The same holds for every other certification input a live row can change: the
+// folder marks (pending or spam), the message request status and the thread's type.
+// The fence only ever withholds a reply's facts, so it can only reduce certification.
 // Its other facts (title, activity) still apply: they cannot certify anything.
 func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64, reply *issueMark) (frames []Frame) {
 	// stale: a reply's roster rows for this thread are older than a live change.
@@ -152,7 +155,16 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 	// and the latest request status row. A status row only clears what a status row
 	// set, and a folder only clears what a folder set, so a spam folder stays
 	// unaccepted next to a status-0 row, as in the library.
+	// Both marks are certification inputs, so they are fenced like the roster rows: a
+	// reply issued before a live change of this thread's mark leaves it alone, and a
+	// live row that changes a mark records the thread's mutation sequence.
 	set := func(marks map[int64]bool, key int64, on bool) {
+		if stale(key) {
+			return
+		}
+		if marks[key] != on {
+			mutate(key)
+		}
 		before := s.unacceptedLocked(key)
 		if on {
 			marks[key] = true
@@ -200,7 +212,9 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 		}
 		t := s.thread(enc, key)
 		s.takePendingLocked(t, originalKey)
-		if typ != table.UNKNOWN_THREAD_TYPE {
+		// Typing is a certification input too: a stale reply keeps the type the live
+		// rows gave the thread.
+		if typ != table.UNKNOWN_THREAD_TYPE && !stale(originalKey) {
 			t.Typed = true
 			t.RawType = int64(typ)
 			if typ.IsOneToOne() {
