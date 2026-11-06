@@ -70,7 +70,14 @@ type messagixSession struct {
 	selfID        int64
 	selfName      string
 
-	inboxResume *inboxResumeRef // where the next inbox walk resumes after one hit the page bound (memory only; guarded by mu)
+	walkSem       chan struct{}      // one network walk or history request at a time: Threads, History and the roster refresh hold it
+	refreshTimer  *time.Timer        // pending roster refresh (guarded by mu)
+	refreshCancel context.CancelFunc // the running roster refresh (guarded by mu)
+	refreshGen    int64              // latest scheduled refresh; an older timer does nothing (guarded by mu)
+	refreshLast   time.Time          // when the last refresh started (guarded by mu)
+	afterRefresh  func()             // test seam: runs when a refresh goroutine ends
+	refreshPager  threadPager        // test seam: the refresh's client; nil means the messagix client
+	inboxResume   *inboxResumeRef    // where the next inbox walk resumes after one hit the page bound (memory only; guarded by mu)
 
 	threads        map[string]*threadInfo         // by wire id
 	participants   map[int64][]pendingParticipant // participant rows waiting for their thread
@@ -97,11 +104,14 @@ type messagixSession struct {
 	stopped        bool
 	logoutOnly     bool
 	platform       string
-	rosterLogged   map[string]int64 // thread -> epoch its roster diagnostic was logged in
-	rosterLogN     int64            // diagnostics logged in rosterLogEpoch
+	rosterLogged   map[string]rosterLogRef // thread -> epoch and counts of its last roster diagnostic
+	rosterLogN     int64                   // diagnostics logged in rosterLogEpoch
 	rosterLogEpoch int64
-	connEpoch      int64 // bumped on (re)connect, disconnect and offline sync completion; starts at 1
-	linkDown       bool  // from Start or a socket disconnect until the next connected event: no roster is complete
+	connEpoch      int64           // bumped on (re)connect, disconnect and offline sync completion; starts at 1
+	mutSeq         int64           // last live roster mutation sequence (guarded by mu)
+	rosterMut      map[int64]int64 // thread row key -> sequence of its latest live roster row (guarded by mu)
+	hadDisconnect  bool            // a socket went down since the last connected event (guarded by mu)
+	linkDown       bool            // from Start or a socket disconnect until the next connected event: no roster is complete
 
 	lastState       time.Time
 	lastStateBlob   []byte
@@ -158,6 +168,8 @@ func parseWire(id string) (enc bool, key int64, ok bool) {
 func newSession() *messagixSession {
 	return &messagixSession{
 		connEpoch:    1,
+		rosterMut:    map[int64]int64{},
+		walkSem:      make(chan struct{}, 1),
 		threads:      map[string]*threadInfo{},
 		participants: map[int64][]pendingParticipant{},
 		names:        map[int64]string{},
@@ -945,9 +957,17 @@ func (s *messagixSession) handleMetaEvent(ctx context.Context, rawEvt any) {
 	case *messagix.ConnectedEvent, *messagix.ReconnectedEvent:
 		// messagix emits these after the socket's sync, so rows from before
 		// it, and from the sync itself, belong to an ended epoch.
+		_, reconnected := rawEvt.(*messagix.ReconnectedEvent)
+		s.mu.Lock()
+		refresh := reconnected || s.hadDisconnect
+		s.hadDisconnect = false
+		s.mu.Unlock()
 		s.setLinkDown(false)
 		s.markStateDirty()
 		s.scheduleE2EE()
+		if refresh { // not the first Connected of a run: the rosters just went stale
+			s.scheduleRosterRefresh()
+		}
 	case *messagix.TransientDisconnectEvent:
 		s.setLinkDown(true)
 		logCode("info", "transient_disconnect")
