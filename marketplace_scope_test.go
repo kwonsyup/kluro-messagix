@@ -475,3 +475,89 @@ func TestScopeDiagnosticIsCountsOnlyAndLoggedOnChange(t *testing.T) {
 		}
 	}
 }
+
+// hookPager is a History client that records every task and runs onTask while task n is in flight.
+type hookPager struct {
+	recordingPager
+	onTask func(n int)
+}
+
+func (h *hookPager) ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error) {
+	tbl, err := h.recordingPager.ExecuteTasks(ctx, tasks...)
+	if h.onTask != nil {
+		h.onTask(len(h.all))
+	}
+	return tbl, err
+}
+
+// Sol P1-2: History rechecks the request marks before every send. A request row that arrives while the call is
+// waiting stops it: neither the re-request of the first page (another 209) nor a further page (228) goes out.
+func TestRequestMarkArrivingMidHistoryStopsEverySend(t *testing.T) {
+	mark := &table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 3005, MessageRequestStatus: 1}}}
+	partial := &table.LSTable{
+		LSInsertNewMessageRange: []*table.LSInsertNewMessageRange{{ThreadKey: 3005, MinTimestampMs: 50, MinMessageId: "mid.1", MaxTimestampMs: 50, HasMoreBefore: true}},
+		LSUpsertMessage:         []*table.LSUpsertMessage{{ThreadKey: 3005, MessageId: "mid.1", TimestampMs: 50, SenderId: 3006, Text: "is this available?"}},
+	}
+	for name, tc := range map[string]struct {
+		rows  []*table.LSTable // applied while the first send is in flight
+		bound time.Duration
+	}{
+		"further page":            {[]*table.LSTable{mark, partial}, 3 * time.Second},
+		"re-request of the first": {[]*table.LSTable{mark}, historyReRequest + 3*time.Second},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newTestSession()
+			s.handleTableFrames(marketThread(3005, -1, "inbox")) // accepted: History may read it
+			h := &hookPager{}
+			h.onTask = func(n int) {
+				if n == 1 {
+					for _, tbl := range tc.rows {
+						s.handleTableFrames(tbl)
+					}
+				}
+			}
+			s.historyPager = h
+			ctx, cancel := context.WithTimeout(context.Background(), tc.bound)
+			defer cancel()
+			_, err := s.History(ctx, "3005", "", 20)
+			if codeOf(err) != "unavailable" {
+				t.Fatalf("History = %v, want unavailable", err)
+			}
+			if len(h.all) != 1 || h.all[0].GetLabel() != "209" {
+				labels := []string{}
+				for _, task := range h.all {
+					labels = append(labels, task.GetLabel())
+				}
+				t.Fatalf("tasks = %v, want only the first 209 sent before the mark", labels)
+			}
+		})
+	}
+}
+
+// The thread frame says when a thread carries a request mark, typed (a pending Marketplace thread) or inert, so the
+// connector can keep it out of history across restarts; an accepted thread says nothing.
+func TestThreadFrameCarriesTheRequestFact(t *testing.T) {
+	s := newTestSession()
+	frames := s.handleTableFrames(joinTables(marketThread(3005, -1, folderPending), marketThread(3009, -1, folderSpam), marketThread(3003, -1, "inbox")))
+	if th := lastThread(frames, "3005"); th == nil || !th.Request || !th.Typed {
+		t.Fatalf("pending Marketplace frame = %+v, want typed with request", th)
+	}
+	if th := lastThread(frames, "3009"); th == nil || !th.Request || th.Typed {
+		t.Fatalf("spam frame = %+v, want inert with request", th)
+	}
+	if th := lastThread(frames, "3003"); th == nil || th.Request {
+		t.Fatalf("accepted frame = %+v, want no request", th)
+	}
+	b, _ := json.Marshal(lastThread(frames, "3005"))
+	if !strings.Contains(string(b), `"request":true`) {
+		t.Fatalf("wire = %s", b)
+	}
+	b, _ = json.Marshal(lastThread(frames, "3003"))
+	if strings.Contains(string(b), `"request"`) {
+		t.Fatalf("an accepted thread's wire names request: %s", b)
+	}
+	frames = s.handleTableFrames(&table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 3005, ThreadType: table.MARKETPLACE, FolderName: "inbox"}}})
+	if th := lastThread(frames, "3005"); th == nil || th.Request {
+		t.Fatalf("accepted later = %+v, want the request fact cleared", th)
+	}
+}

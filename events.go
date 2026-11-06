@@ -584,9 +584,10 @@ func (s *messagixSession) wireThreadLocked(t *threadInfo) Thread {
 		// carries no kind, no type, no participants and no title (usually the
 		// stranger's name). The real ones stay in
 		// memory and go out when a later row accepts the thread.
-		return Thread{ID: wireID(false, t.Key), LastActivity: t.LastActivity}
+		return Thread{ID: wireID(false, t.Key), LastActivity: t.LastActivity, Request: true}
 	}
 	out := Thread{ID: wireID(t.Enc, t.Key), Kind: t.Kind, Typed: t.Typed, Title: t.Title, Encrypted: t.Enc, LastActivity: t.LastActivity}
+	out.Request = !t.Enc && s.requestMarkedLocked(t.Key)
 	if t.Enc {
 		if open, ok := s.cutover[t.Key]; ok {
 			out.Predecessor = wireID(false, open)

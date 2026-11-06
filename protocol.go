@@ -102,6 +102,10 @@ type Thread struct {
 	LastActivity int64    `json:"last_activity_ms,omitempty"`
 	// MembersComplete: participants are the whole roster of an open group.
 	MembersComplete bool `json:"members_complete,omitempty"`
+	// Request: the thread carries a message request mark (pending folder, spam
+	// folder or request status 1). Its history is never read while it does, so
+	// the connector keeps it out of history and stores the fact across restarts.
+	Request bool `json:"request,omitempty"`
 }
 
 type Person struct {

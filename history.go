@@ -57,7 +57,9 @@ func (s *messagixSession) History(ctx context.Context, thread, cursor string, co
 // CreateThreadTask (209) and no FetchMessagesTask is sent for it, since what the
 // server does with a thread open on a request is not established. It answers
 // "unavailable", a retry, and is read once a later row clears the mark. Until then
-// the thread holds only what the listing's own replies carried.
+// the thread holds only what the listing's own replies carried. The marks are
+// checked again before every send of the call (first page, re-request, further
+// pages), so a mark that arrives while the call waits stops it.
 func (s *messagixSession) lightspeedHistory(ctx context.Context, thread string, key int64, cursor string, count int) (*Page, error) {
 	s.mu.Lock()
 	var cli threadPager = s.historyPager
@@ -87,7 +89,15 @@ func (s *messagixSession) lightspeedHistory(ctx context.Context, thread string, 
 		}
 		refTS, refID = ts, id
 	}
+	// Every send rechecks the request marks: a row that marks the thread while
+	// this call waits stops the re-request and any further page.
 	request := func(ts int64, id string) error {
+		s.mu.Lock()
+		marked := s.requestMarkedLocked(key)
+		s.mu.Unlock()
+		if marked {
+			return errRequestMarked
+		}
 		var task socket.Task = &socket.FetchMessagesTask{
 			ThreadKey: key, Direction: 0, ReferenceTimestampMs: ts, ReferenceMessageId: id,
 			SyncGroup: 1, Cursor: cli.GetCursor(1),
@@ -99,7 +109,7 @@ func (s *messagixSession) lightspeedHistory(ctx context.Context, thread string, 
 		return err
 	}
 	if err := request(refTS, refID); err != nil {
-		return nil, mapSendErr(err)
+		return nil, historySendErr(err)
 	}
 	timer := time.NewTimer(historyWait)
 	defer timer.Stop()
@@ -115,7 +125,7 @@ func (s *messagixSession) lightspeedHistory(ctx context.Context, thread string, 
 			if !enough {
 				// More is wanted: ask for the page before what we hold.
 				if err := request(have.Range.MinTimestampMs, have.Range.MinMessageId); err != nil {
-					return nil, mapSendErr(err)
+					return nil, historySendErr(err)
 				}
 			} else {
 				c.finish()
@@ -132,12 +142,23 @@ func (s *messagixSession) lightspeedHistory(ctx context.Context, thread string, 
 			if !reRequested {
 				reRequested = true
 				if err := request(refTS, refID); err != nil {
-					return nil, mapSendErr(err)
+					return nil, historySendErr(err)
 				}
 			}
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
+}
+
+// errRequestMarked is a History send withheld because the thread carries a
+// request mark; it answers "unavailable", nothing having been sent.
+var errRequestMarked = errors.New("thread is a message request")
+
+func historySendErr(err error) error {
+	if errors.Is(err, errRequestMarked) {
+		return errCode("unavailable")
+	}
+	return mapSendErr(err)
 }
 
 func (s *messagixSession) lightspeedPage(thread string, c *pageCollector) *Page {
