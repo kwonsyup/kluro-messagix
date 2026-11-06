@@ -166,13 +166,24 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 		if marks[key] != on {
 			mutate(key)
 		}
-		before := s.unacceptedLocked(key)
+		before, beforeReq := s.unacceptedLocked(key), s.requestStateLocked(key)
 		if on {
 			marks[key] = true
 		} else {
 			delete(marks, key)
 		}
-		if s.unacceptedLocked(key) != before && s.threads[wireID(false, key)] != nil {
+		// The request fact on the frame: true while marked; false only once a
+		// clearing row is seen after a mark (positive evidence); else unknown.
+		if s.requestMarkedLocked(key) {
+			s.requestSeen[key] = true
+			delete(s.requestCleared, key)
+		} else if !on && s.requestSeen[key] {
+			s.requestCleared[key] = true
+		}
+		// Re-emit whenever what the frame says changes: its acceptance or its
+		// request fact (a status-only row on a Marketplace thread changes only
+		// the latter).
+		if (s.unacceptedLocked(key) != before || s.requestStateLocked(key) != beforeReq) && s.threads[wireID(false, key)] != nil {
 			touched[wireID(false, key)] = true
 		}
 	}
@@ -584,10 +595,12 @@ func (s *messagixSession) wireThreadLocked(t *threadInfo) Thread {
 		// carries no kind, no type, no participants and no title (usually the
 		// stranger's name). The real ones stay in
 		// memory and go out when a later row accepts the thread.
-		return Thread{ID: wireID(false, t.Key), LastActivity: t.LastActivity, Request: true}
+		return Thread{ID: wireID(false, t.Key), LastActivity: t.LastActivity, Request: requestFact(1)}
 	}
 	out := Thread{ID: wireID(t.Enc, t.Key), Kind: t.Kind, Typed: t.Typed, Title: t.Title, Encrypted: t.Enc, LastActivity: t.LastActivity}
-	out.Request = !t.Enc && s.requestMarkedLocked(t.Key)
+	if !t.Enc {
+		out.Request = requestFact(s.requestStateLocked(t.Key))
+	}
 	if t.Enc {
 		if open, ok := s.cutover[t.Key]; ok {
 			out.Predecessor = wireID(false, open)
@@ -633,6 +646,28 @@ func (s *messagixSession) unacceptedLocked(key int64) bool {
 		return false
 	}
 	return s.spamMark[key] || !s.marketplaceLocked(key)
+}
+
+// requestStateLocked is the thread's request fact: 1 while it carries a request
+// mark, -1 once a clearing row (a status 0, or a non-request folder) was seen after
+// a mark, 0 when unknown. The caller holds s.mu.
+func (s *messagixSession) requestStateLocked(key int64) int {
+	switch {
+	case s.requestMarkedLocked(key):
+		return 1
+	case s.requestCleared[key]:
+		return -1
+	}
+	return 0
+}
+
+// requestFact is a request state as the wire carries it: true, false, or absent.
+func requestFact(state int) *bool {
+	if state == 0 {
+		return nil
+	}
+	v := state > 0
+	return &v
 }
 
 // requestMarkedLocked reports whether a facebook thread carries a request mark

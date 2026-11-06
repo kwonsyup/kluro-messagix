@@ -534,19 +534,31 @@ func TestRequestMarkArrivingMidHistoryStopsEverySend(t *testing.T) {
 	}
 }
 
+// fact is the wire request fact of a frame: "true", "false", or "" when absent.
+func fact(th *Thread) string {
+	switch {
+	case th == nil || th.Request == nil:
+		return ""
+	case *th.Request:
+		return "true"
+	}
+	return "false"
+}
+
 // The thread frame says when a thread carries a request mark, typed (a pending Marketplace thread) or inert, so the
-// connector can keep it out of history across restarts; an accepted thread says nothing.
+// connector can keep it out of history across restarts. A thread with no request seen says nothing (unknown); one
+// whose request a later row cleared says false.
 func TestThreadFrameCarriesTheRequestFact(t *testing.T) {
 	s := newTestSession()
 	frames := s.handleTableFrames(joinTables(marketThread(3005, -1, folderPending), marketThread(3009, -1, folderSpam), marketThread(3003, -1, "inbox")))
-	if th := lastThread(frames, "3005"); th == nil || !th.Request || !th.Typed {
-		t.Fatalf("pending Marketplace frame = %+v, want typed with request", th)
+	if th := lastThread(frames, "3005"); fact(th) != "true" || !th.Typed {
+		t.Fatalf("pending Marketplace frame = %+v, want typed with request true", th)
 	}
-	if th := lastThread(frames, "3009"); th == nil || !th.Request || th.Typed {
-		t.Fatalf("spam frame = %+v, want inert with request", th)
+	if th := lastThread(frames, "3009"); fact(th) != "true" || th.Typed {
+		t.Fatalf("spam frame = %+v, want inert with request true", th)
 	}
-	if th := lastThread(frames, "3003"); th == nil || th.Request {
-		t.Fatalf("accepted frame = %+v, want no request", th)
+	if th := lastThread(frames, "3003"); fact(th) != "" {
+		t.Fatalf("a thread with no request seen = %q, want unknown (absent)", fact(th))
 	}
 	b, _ := json.Marshal(lastThread(frames, "3005"))
 	if !strings.Contains(string(b), `"request":true`) {
@@ -554,10 +566,39 @@ func TestThreadFrameCarriesTheRequestFact(t *testing.T) {
 	}
 	b, _ = json.Marshal(lastThread(frames, "3003"))
 	if strings.Contains(string(b), `"request"`) {
-		t.Fatalf("an accepted thread's wire names request: %s", b)
+		t.Fatalf("an unknown request fact must be absent on the wire: %s", b)
 	}
 	frames = s.handleTableFrames(&table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 3005, ThreadType: table.MARKETPLACE, FolderName: "inbox"}}})
-	if th := lastThread(frames, "3005"); th == nil || th.Request {
-		t.Fatalf("accepted later = %+v, want the request fact cleared", th)
+	if th := lastThread(frames, "3005"); fact(th) != "false" {
+		t.Fatalf("accepted later = %q, want an explicit false", fact(th))
+	}
+	b, _ = json.Marshal(lastThread(frames, "3005"))
+	if !strings.Contains(string(b), `"request":false`) {
+		t.Fatalf("wire = %s", b)
+	}
+}
+
+// Round 4, item 1: a status-only request row on an imported Marketplace thread (which stays typed and accepted for
+// listing) still re-emits the thread with the new request fact: true on status 1, then an explicit false on status 0.
+func TestStatusOnlyRowsReemitAMarketplaceThreadsRequestFact(t *testing.T) {
+	s := newTestSession()
+	frames := s.handleTableFrames(marketThread(3005, -1, "inbox"))
+	if th := lastThread(frames, "3005"); th == nil || fact(th) != "" {
+		t.Fatalf("premise: imported with an unknown request fact: %+v", th)
+	}
+	status := func(v int64) *table.LSTable {
+		return &table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 3005, MessageRequestStatus: v}}}
+	}
+	frames = s.handleTableFrames(status(1))
+	if th := lastThread(frames, "3005"); th == nil || fact(th) != "true" || !th.Typed {
+		t.Fatalf("status 1 alone: frame = %+v, want a typed frame with request true", th)
+	}
+	frames = s.handleTableFrames(status(1))
+	if th := lastThread(frames, "3005"); th != nil {
+		t.Fatalf("an unchanged fact re-emitted: %+v", th)
+	}
+	frames = s.handleTableFrames(status(0))
+	if th := lastThread(frames, "3005"); th == nil || fact(th) != "false" {
+		t.Fatalf("status 0 alone: frame = %+v, want request false", th)
 	}
 }
