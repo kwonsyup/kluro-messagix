@@ -23,16 +23,29 @@ const sendTimeout = 75 * time.Second
 // Send sends one text to exactly the named thread. It never retries: a send
 // whose outcome is not known is answered "unknown" so the connector reconciles
 // by reading the thread, never by sending again.
-func (s *messagixSession) Send(ctx context.Context, thread, otid, text string) (*Sent, error) {
+func (s *messagixSession) Send(ctx context.Context, thread, otid, text string, expect []string) (*Sent, error) {
 	enc, key, ok := parseWire(thread)
 	if !ok || text == "" {
 		return nil, errCode("bad_request")
 	}
+	// The roster check is the last step before the provider call: on the open
+	// path, the only one a guarded send reaches (an encrypted thread is never
+	// complete), nothing between them takes a lock or waits. s.mu cannot be held
+	// across the call: table rows reach handleTable on the socket's single frame
+	// goroutine, which also delivers this call's reply, so a held lock would
+	// stall both until the reply times out and the send reads "unknown".
 	s.mu.Lock()
 	cli, ecli := s.client, s.e2ee
+	var rosterErr error
+	if cli != nil && expect != nil {
+		rosterErr = s.expectLocked(thread, expect)
+	}
 	s.mu.Unlock()
 	if cli == nil {
 		return nil, errCode("not_started")
+	}
+	if rosterErr != nil {
+		return nil, rosterErr
 	}
 	sctx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
@@ -80,6 +93,34 @@ func (s *messagixSession) Send(ctx context.Context, thread, otid, text string) (
 		}
 	}
 	return sent, nil
+}
+
+// expectLocked is nil only for an open group with a complete roster whose
+// fresh others (seen in this connection epoch) are exactly expect, in any
+// order. An empty expect names no recipient and is refused. The caller holds
+// s.mu.
+func (s *messagixSession) expectLocked(thread string, expect []string) error {
+	t := s.threads[thread]
+	if t == nil || len(expect) == 0 || !s.membersCompleteLocked(t) {
+		return errCode("roster_changed")
+	}
+	have := s.freshOthersLocked(t)
+	if len(have) != len(expect) {
+		return errCode("roster_changed")
+	}
+	want := map[string]bool{}
+	for _, e := range expect {
+		want[e] = true
+	}
+	if len(want) != len(expect) {
+		return errCode("roster_changed")
+	}
+	for _, h := range have {
+		if !want[h] {
+			return errCode("roster_changed")
+		}
+	}
+	return nil
 }
 
 // mapSendErr is the code of a failed provider call. A call that may have

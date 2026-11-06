@@ -433,6 +433,9 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 		task.AdditionalPagesToFetch = 0
 		task.Cursor = cli.GetCursor(group)
 		task.SyncGroup = group
+		s.mu.Lock()
+		issued := s.connEpoch
+		s.mu.Unlock()
 		tbl, err := cli.ExecuteTasks(ctx, &task)
 		if err != nil {
 			return "", 0, pages, mapSendErr(err)
@@ -441,7 +444,9 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 			return gapInboxIncomplete, 1, pages, nil
 		}
 		pages++
-		s.handleTableEmit(tbl, func(f Frame) int64 {
+		// The reply's roster rows date from the request: a reconnect while it
+		// was in flight leaves them stale.
+		s.handleTableEmitAt(tbl, issued, func(f Frame) int64 {
 			if ctx.Err() != nil {
 				return 0
 			}

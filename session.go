@@ -72,8 +72,8 @@ type messagixSession struct {
 
 	inboxResume *inboxResumeRef // where the next inbox walk resumes after one hit the page bound (memory only; guarded by mu)
 
-	threads        map[string]*threadInfo // by wire id
-	participants   map[int64][]int64      // participant rows waiting for their thread
+	threads        map[string]*threadInfo         // by wire id
+	participants   map[int64][]pendingParticipant // participant rows waiting for their thread
 	names          map[int64]string
 	cutover        map[int64]int64                                                                                    // encrypted chat id -> its pre-encryption (open) thread key
 	fbToWA         map[int64]int64                                                                                    // facebook thread key -> encrypted chat id (hybrid threads)
@@ -97,6 +97,11 @@ type messagixSession struct {
 	stopped        bool
 	logoutOnly     bool
 	platform       string
+	rosterLogged   map[string]int64 // thread -> epoch its roster diagnostic was logged in
+	rosterLogN     int64            // diagnostics logged in rosterLogEpoch
+	rosterLogEpoch int64
+	connEpoch      int64 // bumped on (re)connect, disconnect and offline sync completion; starts at 1
+	linkDown       bool  // from Start or a socket disconnect until the next connected event: no roster is complete
 
 	lastState       time.Time
 	lastStateBlob   []byte
@@ -114,6 +119,23 @@ type threadInfo struct {
 	Title        string
 	LastActivity int64
 	Participants []int64 // ordered, deduplicated
+	// MemberCount and RosterEpoch come only from a DeleteThenInsertThread row
+	// with a count. A member delta clears RosterEpoch: the roster is then not
+	// known complete until a new snapshot row.
+	MemberCount int64
+	RawType     int64 // provider thread type, for the roster diagnostic
+	RosterEpoch int64 // connEpoch the snapshot was taken in; 0 means none
+	// Seen is the connEpoch of each participant's latest participant row. Only
+	// participants seen in the current epoch count toward a complete roster: an
+	// identity from an older epoch may have left while the stream was down.
+	Seen map[int64]int64
+}
+
+// pendingParticipant is a participant row that arrived before its thread, with
+// the connEpoch it arrived in.
+type pendingParticipant struct {
+	ID    int64
+	Epoch int64
 }
 
 // wireID is the thread id on the protocol: the facebook thread key, or "e:" and
@@ -135,8 +157,9 @@ func parseWire(id string) (enc bool, key int64, ok bool) {
 
 func newSession() *messagixSession {
 	return &messagixSession{
+		connEpoch:    1,
 		threads:      map[string]*threadInfo{},
-		participants: map[int64][]int64{},
+		participants: map[int64][]pendingParticipant{},
 		names:        map[int64]string{},
 		cutover:      map[int64]int64{},
 		fbToWA:       map[int64]int64{},
@@ -224,6 +247,7 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 	}
 	s.mu.Lock()
 	s.client = cli
+	s.linkDown = true // until the socket's first sync completes
 	s.mu.Unlock()
 
 	var currentUser types.UserInfo
@@ -848,7 +872,7 @@ func (s *messagixSession) Logout(ctx context.Context) error {
 	s.waDeviceJID, s.waSnap = "", nil
 	s.histDev, s.histBak = nil, nil
 	s.threads = map[string]*threadInfo{}
-	s.participants = map[int64][]int64{}
+	s.participants = map[int64][]pendingParticipant{}
 	s.names = map[int64]string{}
 	s.cutover = map[int64]int64{}
 	s.fbToWA = map[int64]int64{}
@@ -919,14 +943,19 @@ func (s *messagixSession) handleMetaEvent(ctx context.Context, rawEvt any) {
 	case *table.LSTable:
 		s.handleTable(evt)
 	case *messagix.ConnectedEvent, *messagix.ReconnectedEvent:
+		// messagix emits these after the socket's sync, so rows from before
+		// it, and from the sync itself, belong to an ended epoch.
+		s.setLinkDown(false)
 		s.markStateDirty()
 		s.scheduleE2EE()
 	case *messagix.TransientDisconnectEvent:
+		s.setLinkDown(true)
 		logCode("info", "transient_disconnect")
 		if errors.Is(evt.Err, messagix.ErrFatalSocketSyncError) {
 			s.fullReconnect()
 		}
 	case *messagix.PermanentErrorEvent:
+		s.setLinkDown(true)
 		if dgwCloseStatus(evt.Err) == dgw.CloseStatusUnauthorized {
 			logCode("warn", "auth_invalid")
 			s.emit(Frame{T: TAuth, Auth: AuthInvalid})
