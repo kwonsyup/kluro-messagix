@@ -216,8 +216,12 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 		t := s.thread(enc, key)
 		s.takePendingLocked(t, originalKey)
 		// Typing is a certification input too: a stale reply keeps the type the live
-		// rows gave the thread.
+		// rows gave the thread, and a live row that changes the type records the
+		// thread's mutation sequence (a pending thread's eligibility depends on it).
 		if typ != table.UNKNOWN_THREAD_TYPE && !stale(originalKey) {
+			if !t.Typed || t.RawType != int64(typ) {
+				mutate(originalKey)
+			}
 			t.Typed = true
 			t.RawType = int64(typ)
 			if typ.IsOneToOne() {
@@ -619,14 +623,22 @@ func (s *messagixSession) wireThread(t *threadInfo) Thread {
 // folder or with request status 1, never one in spam. A new Marketplace buyer's
 // first message can arrive as a request; it is listed typed, with its roster, so it
 // is imported and can be certified like any other two-person group. Nothing here
-// accepts it on Meta's side: the helper never sends a mark-read or an accept task.
+// accepts it on Meta's side: the helper never sends a mark-read or an accept task,
+// and never reads its history (see lightspeedHistory) while it is marked.
 // Only the user's own Send, still behind membersCompleteLocked, replies to it, and
 // Meta treats that reply as accepting the request.
 func (s *messagixSession) unacceptedLocked(key int64) bool {
-	if !s.folderMark[key] && !s.statusMark[key] {
+	if !s.requestMarkedLocked(key) {
 		return false
 	}
 	return s.spamMark[key] || !s.marketplaceLocked(key)
+}
+
+// requestMarkedLocked reports whether a facebook thread carries a request mark
+// (pending or spam folder, or request status 1), whatever its type: such a thread
+// is never read through History. The caller holds s.mu.
+func (s *messagixSession) requestMarkedLocked(key int64) bool {
+	return s.folderMark[key] || s.statusMark[key]
 }
 
 // marketplaceLocked reports whether the open thread under key is typed Marketplace.

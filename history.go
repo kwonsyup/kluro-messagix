@@ -51,10 +51,20 @@ func (s *messagixSession) History(ctx context.Context, thread, cursor string, co
 
 // lightspeedHistory pages a pre-encryption thread. The answer arrives as table
 // rows, gathered by a collector, exactly as the web client receives them.
+//
+// A thread marked as a message request (pending folder or request status 1, the
+// pending Marketplace threads the listing types included) is not read: no
+// CreateThreadTask (209) and no FetchMessagesTask is sent for it, since what the
+// server does with a thread open on a request is not established. It answers
+// "unavailable", a retry, and is read once a later row clears the mark. Until then
+// the thread holds only what the listing's own replies carried.
 func (s *messagixSession) lightspeedHistory(ctx context.Context, thread string, key int64, cursor string, count int) (*Page, error) {
 	s.mu.Lock()
-	cli := s.client
-	if _, busy := s.collectors[key]; busy || cli == nil {
+	var cli threadPager = s.historyPager
+	if cli == nil && s.client != nil {
+		cli = s.client
+	}
+	if _, busy := s.collectors[key]; busy || cli == nil || s.requestMarkedLocked(key) {
 		s.mu.Unlock()
 		return nil, errCode("unavailable")
 	}
@@ -365,6 +375,10 @@ type listingDone struct {
 // was nothing more (no range row in a reply, no progress, or the page bound).
 const gapInboxIncomplete = "inbox_incomplete"
 
+// gapRequestsIncomplete says the inbox walk was complete but a first-page request of
+// another scope (a folder, or message requests) failed or had no answer.
+const gapRequestsIncomplete = "requests_incomplete"
+
 // Threads lists every thread: the ones already known, then the rest of the main
 // inbox (sync group 1), walked page by page with the requests the web client scrolls
 // it with, then the first page of every other scope (see scanScopes): the other
@@ -403,12 +417,19 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit
 	if err != nil {
 		return listingDone{}, err
 	}
+	s.mu.Lock()
+	s.scopeFolders = maps.Clone(tally.folders)
+	s.mu.Unlock()
 	parents := scopeParents(cli, tally.folders)
-	_, failed, err := s.scanScopes(ctx, walker, counted, parents, nil)
+	scopePages, failed, err := s.scanScopes(ctx, walker, counted, parents, nil)
 	if err != nil {
 		return listingDone{}, err
 	}
-	s.logScopes(tally, parents, failed)
+	s.logScopes(tally, parents, failed > 0)
+	if failed > 0 && gap == "" {
+		// The inbox is complete but a scope went unread: not a clean listing.
+		gap = gapRequestsIncomplete
+	}
 	known, unlisted := s.encryptedCounts()
 	stats := s.listingStats(known, len(emitted), unlisted)
 	stats["inbox_stop"], stats["inbox_pages"] = stop, pages
@@ -417,6 +438,7 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit
 	stats["inbox_rows_parent0_more"] = rows.parent0More
 	stats["inbox_rows_parent0_end"] = rows.parent0End
 	stats["inbox_rows_other_parent"] = rows.other
+	stats["scope_parents"], stats["scope_pages"], stats["scope_failed"] = len(parents), scopePages, failed
 	return listingDone{Stats: stats, Gap: gap}, nil
 }
 
@@ -579,22 +601,26 @@ func scopeParents(cli threadPager, seen map[int64]bool) []int64 {
 }
 
 // scanScopes asks for the first page of every scope the inbox walk does not cover:
-// each other group-1 parent in parents (a folder such as Marketplace), then the message
-// requests (sync group 95) of the inbox and of each of those parents. These are the
+// the message requests (sync group 95) of the inbox first, then each other group-1
+// parent in parents (a folder such as Marketplace), then the requests of each of those
+// parents. These are the
 // first-page requests the library's own connect sends for every parent key and both
 // groups (socket.go sendInitialThreadFetch), whose replies it drops. Group 95 is asked
 // without a cursor, as the library does. Only the first page: a new thread is the
 // newest of its scope. Each reply goes through fetchPage, so the stale-reply fence and
 // the request marks apply to it as to the inbox walk. It is a read: FetchThreadsTask
-// only, never a mark-read or an accept. A failed request ends the scan and is reported
-// as failed, not as an error; only a cancel is an error. done is checked after each
-// page, as in walkInbox. At most 2*len(parents)+1 requests, threadBatchDelay apart.
-func (s *messagixSession) scanScopes(ctx context.Context, cli threadPager, emit emitFunc, parents []int64, done func() bool) (pages int, failed bool, err error) {
+// only, never a mark-read or an accept. Each scope is asked once per scan, never
+// retried: a failed request, or one with no answer, is counted in failed and the scan
+// goes on to the next scope, so one failing folder cannot hide the others. Only a
+// cancel is an error. done is checked after each page, as in walkInbox. At most
+// 2*len(parents)+1 requests, threadBatchDelay apart.
+func (s *messagixSession) scanScopes(ctx context.Context, cli threadPager, emit emitFunc, parents []int64, done func() bool) (pages, failed int, err error) {
 	scopes := make([]socket.FetchThreadsTask, 0, 2*len(parents)+1)
+	scopes = append(scopes, socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, SyncGroup: requestSyncGroup})
 	for _, p := range parents {
 		scopes = append(scopes, socket.FetchThreadsTask{ParentThreadKey: p, SyncGroup: 1})
 	}
-	for _, p := range append([]int64{inboxParentKey}, parents...) {
+	for _, p := range parents {
 		scopes = append(scopes, socket.FetchThreadsTask{ParentThreadKey: p, SyncGroup: requestSyncGroup})
 	}
 	for _, task := range scopes {
@@ -611,12 +637,11 @@ func (s *messagixSession) scanScopes(ctx context.Context, cli threadPager, emit 
 		if err := ctx.Err(); err != nil {
 			return pages, failed, err
 		}
-		if err != nil {
-			return pages, true, nil
+		if err != nil || tbl == nil {
+			failed++
+			continue
 		}
-		if tbl != nil {
-			pages++
-		}
+		pages++
 		if done != nil && done() {
 			return pages, failed, nil
 		}

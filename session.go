@@ -77,6 +77,7 @@ type messagixSession struct {
 	refreshLast   time.Time          // when the last refresh started (guarded by mu)
 	afterRefresh  func()             // test seam: runs when a refresh goroutine ends
 	refreshPager  threadPager        // test seam: the refresh's client; nil means the messagix client
+	historyPager  threadPager        // test seam: History's client; nil means the messagix client
 	inboxResume   *inboxResumeRef    // where the next inbox walk resumes after one hit the page bound (memory only; guarded by mu)
 
 	threads        map[string]*threadInfo         // by wire id
@@ -87,6 +88,7 @@ type messagixSession struct {
 	folderMark     map[int64]bool                                                                                     // facebook thread keys whose latest non-empty folder is pending or spam (memory only)
 	statusMark     map[int64]bool                                                                                     // ... whose latest message request status row is 1 (memory only)
 	spamMark       map[int64]bool                                                                                     // ... whose latest non-empty folder is spam (memory only)
+	scopeFolders   map[int64]bool                                                                                     // group-1 parents the last listing's range rows named (guarded by mu)
 	scopeLogged    string                                                                                             // the last thread scope diagnostic logged (guarded by mu)
 	e2eeOffline    int                                                                                                // queued E2EE messages the server said it would flush at connect (OfflineSyncPreview), count only
 	e2eeOfflineEnd bool                                                                                               // OfflineSyncCompleted seen

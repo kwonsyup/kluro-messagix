@@ -210,7 +210,7 @@ func TestScopeScanNeverAcceptsOrMarksRead(t *testing.T) {
 }
 
 // The scan is bounded: at most scopeParentCap folders, the first page of each scope only (even when a scope says
-// there is more), every request from the top, and a failed scope request ends the scan without failing the listing.
+// there is more), every request from the top, and each scope asked once even when every one of them fails.
 func TestScopeScanIsBoundedToFirstPages(t *testing.T) {
 	keys := []int64{-1, 0}
 	for k := int64(1); k <= 10; k++ {
@@ -235,18 +235,23 @@ func TestScopeScanIsBoundedToFirstPages(t *testing.T) {
 		seen[k] = true
 	}
 
-	failing := &failingScopes{}
+	failing := &failingScopes{fail: func(socket.FetchThreadsTask) bool { return true }}
 	_, res, err, done = listGap(t, newTestSession(), failing, context.Background(), 5*time.Second)
-	if !done || err != nil || res.Gap != "" || res.Stats == nil {
+	if !done || err != nil || res.Stats == nil {
 		t.Fatalf("a failed scope request must not fail the listing: done=%v err=%v res=%+v", done, err, res)
 	}
-	if failing.scopeCalls != 1 {
-		t.Fatalf("scope requests after a failure = %d, want the scan to stop at 1", failing.scopeCalls)
+	if len(failing.scopes) != 3 || res.Stats["scope_failed"] != 3 || res.Gap != gapRequestsIncomplete {
+		t.Fatalf("every scope asked once, each failure counted: requests=%d stats=%v gap=%q", len(failing.scopes), res.Stats, res.Gap)
 	}
 }
 
-// failingScopes answers the inbox with one complete page and fails every other scope.
-type failingScopes struct{ scopeCalls int }
+// failingScopes answers the inbox with one complete page, fails the scopes fail picks, and answers the others from
+// scope (or empty).
+type failingScopes struct {
+	fail   func(socket.FetchThreadsTask) bool
+	scope  map[scopeKey]*table.LSTable
+	scopes []socket.FetchThreadsTask
+}
 
 func (f *failingScopes) GetCursor(int64) string { return "" }
 func (f *failingScopes) DumpState() (json.RawMessage, error) {
@@ -254,10 +259,144 @@ func (f *failingScopes) DumpState() (json.RawMessage, error) {
 }
 func (f *failingScopes) ExecuteTasks(_ context.Context, tasks ...socket.Task) (*table.LSTable, error) {
 	if !isInboxTask(tasks[0]) {
-		f.scopeCalls++
-		return nil, errors.New("boom")
+		task := *tasks[0].(*socket.FetchThreadsTask)
+		f.scopes = append(f.scopes, task)
+		if f.fail(task) {
+			return nil, errors.New("boom")
+		}
+		if tbl := f.scope[scopeKey{int64(task.SyncGroup), task.ParentThreadKey}]; tbl != nil {
+			return tbl, nil
+		}
+		return &table.LSTable{}, nil
 	}
 	return page(101, rangeRow(false, -1, 1, 1)), nil
+}
+
+// Sol P2a: a folder whose request always fails does not hide the other scopes. The message requests of the inbox
+// and of that folder are still asked, a buyer there still certifies, and the listing says it is incomplete
+// (requests_incomplete, scope_failed 1) instead of reporting a clean, complete listing.
+func TestFailingFolderDoesNotStarveRequestsAndMarksTheListingIncomplete(t *testing.T) {
+	failing := &failingScopes{
+		fail: func(task socket.FetchThreadsTask) bool {
+			return task.SyncGroup == 1 && task.ParentThreadKey == marketFolder
+		},
+		scope: map[scopeKey]*table.LSTable{{requestSyncGroup, -1}: marketThread(3005, -1, folderPending)},
+	}
+	s := newTestSession()
+	frames, res, err, done := listGap(t, s, failing, context.Background(), 5*time.Second)
+	if !done || err != nil {
+		t.Fatalf("done=%v err=%v", done, err)
+	}
+	asked := map[scopeKey]bool{}
+	for _, task := range failing.scopes {
+		asked[scopeKey{int64(task.SyncGroup), task.ParentThreadKey}] = true
+	}
+	if !asked[scopeKey{requestSyncGroup, -1}] || !asked[scopeKey{requestSyncGroup, marketFolder}] || !asked[scopeKey{1, marketFolder}] {
+		t.Fatalf("scopes asked = %v, want the failing folder and both request scopes", asked)
+	}
+	if res.Gap != gapRequestsIncomplete || res.Stats["scope_failed"] != 1 || res.Stats["scope_pages"] != 2 || res.Stats["scope_parents"] != 1 {
+		t.Fatalf("gap=%q stats=%v, want requests_incomplete with one failed scope", res.Gap, res.Stats)
+	}
+	certifiable(t, s, frames, "3005", "3006")
+}
+
+// Sol P1: a live row that changes a pending Marketplace thread's type (here to a plain group, folder unchanged)
+// while a scope request is in flight is a certification input: the reply issued before it, still saying type 5
+// with a two-member roster, must neither restore Marketplace eligibility nor certify the request.
+func TestStaleScopeReplyDoesNotUndoLiveTypeChange(t *testing.T) {
+	s := newTestSession()
+	s.handleTableFrames(marketThread(3005, -1, folderPending))
+	mustComplete(t, s, "3005", true, "premise: a pending Marketplace thread certifies")
+	s.mu.Lock()
+	mark := s.issueMarkLocked()
+	s.mu.Unlock()
+	s.handleTableFrames(&table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 3005, ThreadType: table.GROUP_THREAD}}})
+	mustComplete(t, s, "3005", false, "a pending plain group")
+	s.handleReplyEmit(marketThread(3005, -1, folderPending), mark, func(Frame) int64 { return 0 })
+	mustComplete(t, s, "3005", false, "stale type-5 reply over a live type change")
+	if err := expectErr(s, "3005", "3006"); err == nil {
+		t.Fatal("send allowed on a pending non-Marketplace thread")
+	}
+	s.mu.Lock()
+	raw, unaccepted := s.threads["3005"].RawType, s.unacceptedLocked(3005)
+	s.mu.Unlock()
+	if raw != int64(table.GROUP_THREAD) || !unaccepted {
+		t.Fatalf("type = %d unaccepted = %v, want the live plain group, still a request", raw, unaccepted)
+	}
+	// a fresh reply, issued after the live change, still applies
+	s.mu.Lock()
+	mark = s.issueMarkLocked()
+	s.mu.Unlock()
+	s.handleReplyEmit(marketThread(3005, -1, folderPending), mark, func(Frame) int64 { return 0 })
+	mustComplete(t, s, "3005", true, "a reply issued after the live change")
+}
+
+// Sol P2b: a buyer under a folder named only by a range row (not by the page config) is re-certified by the reconnect
+// refresh, which collects the parents its own inbox walk's range rows name.
+func TestRefreshRecertifiesARangeOnlyFolderTarget(t *testing.T) {
+	h := newRefreshHarness(t, &refreshFake{})
+	r := &pager{
+		pages: []*table.LSTable{page(101, rangeRow(false, -1, 90, 5000), rangeRow(true, 888, 1, 1))},
+		scope: map[scopeKey]*table.LSTable{{1, 888}: marketThread(3003, 888, "inbox")},
+	}
+	h.s.refreshPager = r
+	h.s.handleTableFrames(marketThread(3003, 888, "inbox"))
+	mustComplete(t, h.s, "3003", true, "premise")
+	h.drop()
+	h.reconnect()
+	h.waitRefresh(t)
+	mustComplete(t, h.s, "3003", true, "after the refresh")
+	asked := false
+	for _, task := range r.scopes {
+		if ft := task.(*socket.FetchThreadsTask); ft.SyncGroup == 1 && ft.ParentThreadKey == 888 {
+			asked = true
+		}
+	}
+	if !asked {
+		t.Fatalf("the refresh never asked the range-only folder: %+v", r.scopes)
+	}
+}
+
+// Meta side effect: History never reads a thread that carries a request mark. A pending Marketplace thread (typed
+// and imported by the listing) gets "unavailable" and no task at all, in particular no CreateThreadTask (209), with
+// or without a cursor. Once a row clears the mark, History reads it with the usual first-page task.
+func TestPendingThreadHistorySendsNoTask(t *testing.T) {
+	if socket.TaskLabels["CreateThreadTask"] != "209" || socket.TaskLabels["FetchMessagesTask"] != "228" {
+		t.Fatalf("task labels moved: %v", socket.TaskLabels)
+	}
+	for name, pending := range map[string]*table.LSTable{
+		"pending folder": marketThread(3005, -1, folderPending),
+		"status 1": func() *table.LSTable {
+			tbl := marketThread(3005, -1, "")
+			tbl.LSDeleteThenInsertMessageRequest = []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 3005, MessageRequestStatus: 1}}
+			return tbl
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newTestSession()
+			rec := &recordingPager{}
+			s.historyPager = rec
+			s.handleTableFrames(pending)
+			mustComplete(t, s, "3005", true, "premise: listed typed and certified")
+			for _, cursor := range []string{"", "77:mid.1"} {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				_, err := s.History(ctx, "3005", cursor, 20)
+				cancel()
+				if codeOf(err) != "unavailable" || len(rec.all) != 0 {
+					t.Fatalf("cursor %q: err=%v tasks=%d, want unavailable and no task", cursor, err, len(rec.all))
+				}
+			}
+			// accepted: the first page is read with the usual task
+			s.handleTableFrames(&table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 3005, MessageRequestStatus: 0}}})
+			s.handleTableFrames(&table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 3005, ThreadType: table.MARKETPLACE, FolderName: "inbox"}}})
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			_, _ = s.History(ctx, "3005", "", 20)
+			cancel()
+			if len(rec.all) == 0 || rec.all[0].GetLabel() != "209" {
+				t.Fatalf("after acceptance History must read the thread: tasks=%v", rec.all)
+			}
+		})
+	}
 }
 
 // The stale-reply fence covers scope replies: a request reply issued before a live move to spam carries the old
