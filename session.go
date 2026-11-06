@@ -97,6 +97,10 @@ type messagixSession struct {
 	stopped        bool
 	logoutOnly     bool
 	platform       string
+	rosterLogged   map[string]int64 // thread -> epoch its roster diagnostic was logged in
+	rosterLogN     int64            // diagnostics logged in rosterLogEpoch
+	rosterLogEpoch int64
+	connEpoch      int64 // bumped on (re)connect and offline sync completion; starts at 1
 
 	lastState       time.Time
 	lastStateBlob   []byte
@@ -114,6 +118,12 @@ type threadInfo struct {
 	Title        string
 	LastActivity int64
 	Participants []int64 // ordered, deduplicated
+	// MemberCount and RosterEpoch come only from a DeleteThenInsertThread row
+	// with a count. A member delta clears RosterEpoch: the roster is then not
+	// known complete until a new snapshot row.
+	MemberCount int64
+	RawType     int64 // provider thread type, for the roster diagnostic
+	RosterEpoch int64 // connEpoch the snapshot was taken in; 0 means none
 }
 
 // wireID is the thread id on the protocol: the facebook thread key, or "e:" and
@@ -135,6 +145,7 @@ func parseWire(id string) (enc bool, key int64, ok bool) {
 
 func newSession() *messagixSession {
 	return &messagixSession{
+		connEpoch:    1,
 		threads:      map[string]*threadInfo{},
 		participants: map[int64][]int64{},
 		names:        map[int64]string{},
@@ -919,6 +930,7 @@ func (s *messagixSession) handleMetaEvent(ctx context.Context, rawEvt any) {
 	case *table.LSTable:
 		s.handleTable(evt)
 	case *messagix.ConnectedEvent, *messagix.ReconnectedEvent:
+		s.bumpConnEpoch()
 		s.markStateDirty()
 		s.scheduleE2EE()
 	case *messagix.TransientDisconnectEvent:

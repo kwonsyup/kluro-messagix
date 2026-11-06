@@ -38,8 +38,10 @@ type backend interface {
 	Threads(ctx context.Context, emit emitFunc) (listingDone, error)
 	// History returns one page of a thread, newest first.
 	History(ctx context.Context, thread, cursor string, count int) (*Page, error)
-	// Send sends one text; it never retries internally.
-	Send(ctx context.Context, thread, otid, text string) (*Sent, error)
+	// Send sends one text; it never retries internally. A non-nil expect is
+	// the group's other participants; a different or unknown roster is refused
+	// "roster_changed" before any provider call.
+	Send(ctx context.Context, thread, otid, text string, expect []string) (*Sent, error)
 	// Logout ends the session for good: best-effort provider sign-out and
 	// local device deletion, then everything in memory is wiped. Messenger
 	// clients have no server-side device de-registration operation.
@@ -215,7 +217,7 @@ func run(r io.Reader, w io.Writer, mkBackend func() backend) int {
 			}
 			started = true
 			logoutOnly = f.Mode == "logout_only"
-			em.emit(Frame{T: TReady, ID: f.ID, Self: ready.Self, Name: ready.Name, History: ready.History})
+			em.emit(Frame{T: TReady, ID: f.ID, Self: ready.Self, Name: ready.Name, History: ready.History, Features: []string{"send_expect"}})
 			if initial != nil {
 				initial(func(evt Frame) int64 {
 					evt.ID = 0
@@ -278,7 +280,7 @@ func run(r io.Reader, w io.Writer, mkBackend func() backend) int {
 				em.emit(Frame{T: TError, ID: f.ID, Err: "not_started"})
 				return -1
 			}
-			sent, err := b.Send(ctx, f.Thread, f.OTID, f.Text)
+			sent, err := b.Send(ctx, f.Thread, f.OTID, f.Text, f.Expect)
 			if err != nil {
 				em.emit(Frame{T: TError, ID: f.ID, Err: codeOf(err)})
 				return -1

@@ -100,6 +100,8 @@ type Thread struct {
 	Predecessor  string   `json:"predecessor,omitempty"`
 	Participants []Person `json:"participants,omitempty"`
 	LastActivity int64    `json:"last_activity_ms,omitempty"`
+	// MembersComplete: participants are the whole roster of an open group.
+	MembersComplete bool `json:"members_complete,omitempty"`
 }
 
 type Person struct {
@@ -180,10 +182,14 @@ type Frame struct {
 	Count    int               `json:"count,omitempty"`
 	OTID     string            `json:"otid,omitempty"`
 	Text     string            `json:"text,omitempty"`
+	// Expect, on send, is the other participants the connector believes the
+	// group has; nil means no check.
+	Expect []string `json:"expect,omitempty"`
 
 	// events
 	Self      string         `json:"self,omitempty"`
 	Name      string         `json:"name,omitempty"`
+	Features  []string       `json:"features,omitempty"` // ready: optional commands this helper understands
 	History   HistoryState   `json:"history,omitempty"`
 	ThreadEvt *Thread        `json:"thread_evt,omitempty"`
 	Message   *Message       `json:"message,omitempty"`

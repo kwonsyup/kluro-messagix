@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"sync"
 
@@ -155,6 +156,7 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []F
 		delete(s.participants, originalKey)
 		if typ != table.UNKNOWN_THREAD_TYPE {
 			t.Typed = true
+			t.RawType = int64(typ)
 			if typ.IsOneToOne() {
 				t.Kind = "user"
 				t.addParticipant(key)
@@ -188,6 +190,24 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []F
 		} else {
 			s.participants[p.ThreadKey] = append(s.participants[p.ThreadKey], p.ContactId)
 		}
+	}
+	// A snapshot row with a count marks the roster as taken in this epoch; a
+	// delta after it (same table or later) leaves the roster unknown.
+	for _, th := range tbl.LSDeleteThenInsertThread {
+		key, enc := s.mapKey(th.ThreadKey)
+		if t := s.threads[wireID(enc, key)]; t != nil {
+			// A snapshot without a count replaces the old one: unknown.
+			t.MemberCount, t.RosterEpoch = th.MemberCount, 0
+			if th.MemberCount > 0 {
+				t.RosterEpoch = s.connEpoch
+			}
+		}
+	}
+	for _, d := range tbl.LSAddToMemberCount {
+		s.clearRosterLocked(d.ThreadKey, touched)
+	}
+	for _, d := range tbl.LSRemoveParticipantFromThread {
+		s.clearRosterLocked(d.ThreadKey, touched)
 	}
 	for _, n := range tbl.LSSyncUpdateThreadName {
 		key, enc := s.mapKey(n.ThreadKey)
@@ -294,6 +314,70 @@ func (t *threadInfo) addParticipant(id int64) {
 	t.Participants = append(t.Participants, id)
 }
 
+// clearRosterLocked marks a thread's roster unknown after a member delta.
+func (s *messagixSession) clearRosterLocked(threadKey int64, touched map[string]bool) {
+	key, enc := s.mapKey(threadKey)
+	if t := s.threads[wireID(enc, key)]; t != nil && t.RosterEpoch != 0 {
+		t.RosterEpoch = 0
+		touched[wireID(enc, key)] = true
+	}
+}
+
+const rosterLogCap = 200
+
+// logRosterLocked logs counts only, once per typed group thread per epoch and
+// at most rosterLogCap lines per epoch: roster.t<type>.mc<count>.p<others>.c<0|1>,
+// counts capped at 9.
+func (s *messagixSession) logRosterLocked(t *threadInfo, complete bool) {
+	if t.Enc || !t.Typed || t.Kind != "group" {
+		return
+	}
+	if s.rosterLogEpoch != s.connEpoch {
+		s.rosterLogEpoch, s.rosterLogN = s.connEpoch, 0
+	}
+	if s.rosterLogged == nil {
+		s.rosterLogged = map[string]int64{}
+	}
+	id := wireID(false, t.Key)
+	if s.rosterLogged[id] == s.connEpoch || s.rosterLogN >= rosterLogCap {
+		return
+	}
+	s.rosterLogged[id] = s.connEpoch
+	s.rosterLogN++
+	c := 0
+	if complete {
+		c = 1
+	}
+	logCode("info", fmt.Sprintf("roster.t%d.mc%d.p%d.c%d", min(t.RawType, 99), min(t.MemberCount, 9), min(len(s.othersLocked(t)), 9), c))
+}
+
+// bumpConnEpoch ends every roster snapshot taken so far.
+func (s *messagixSession) bumpConnEpoch() {
+	s.mu.Lock()
+	s.connEpoch++
+	s.mu.Unlock()
+}
+
+// othersLocked is the thread's participants other than self, as wire ids.
+func (s *messagixSession) othersLocked(t *threadInfo) []string {
+	var out []string
+	for _, p := range t.Participants {
+		if p != s.selfID {
+			out = append(out, strconv.FormatInt(p, 10))
+		}
+	}
+	return out
+}
+
+// membersCompleteLocked reports whether the participants are known to be the
+// whole roster: an open typed group whose snapshot count matches self plus the
+// others, taken in this connection epoch with no delta since.
+func (s *messagixSession) membersCompleteLocked(t *threadInfo) bool {
+	return !t.Enc && t.Typed && t.Kind == "group" && !s.unacceptedLocked(t.Key) &&
+		t.MemberCount > 0 && t.RosterEpoch != 0 && t.RosterEpoch == s.connEpoch &&
+		t.MemberCount == int64(1+len(s.othersLocked(t)))
+}
+
 func threadFrame(t Thread) Frame { return Frame{T: TThread, ThreadEvt: &t} }
 
 // wireThreadLocked builds the protocol thread. A one-to-one thread names the
@@ -313,6 +397,8 @@ func (s *messagixSession) wireThreadLocked(t *threadInfo) Thread {
 			out.Predecessor = wireID(false, open)
 		}
 	}
+	out.MembersComplete = s.membersCompleteLocked(t)
+	s.logRosterLocked(t, out.MembersComplete)
 	self := strconv.FormatInt(s.selfID, 10)
 	out.Participants = append(out.Participants, Person{ID: self, Name: s.selfName, Self: true})
 	for _, p := range t.Participants {
@@ -475,6 +561,7 @@ func (s *messagixSession) handleWAEvent(raw any) bool {
 	case *events.OfflineSyncCompleted:
 		s.mu.Lock()
 		s.e2eeOfflineEnd = true
+		s.connEpoch++
 		s.mu.Unlock()
 		s.markStateDirty()
 	case *events.Connected:

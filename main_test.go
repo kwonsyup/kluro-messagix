@@ -72,6 +72,7 @@ func stderrLinesAreLevelAndCode(buf *bytes.Buffer) bool {
 // fakeBackend scripts the loop's backend.
 type fakeBackend struct {
 	sentText      string
+	sentExpect    []string
 	sendErr       error
 	histories     map[string]*Page
 	stopped       bool
@@ -115,8 +116,8 @@ func (f *fakeBackend) History(_ context.Context, thread, cursor string, count in
 	}
 	return nil, errCode("not_enrolled")
 }
-func (f *fakeBackend) Send(_ context.Context, thread, otid, text string) (*Sent, error) {
-	f.sentText = text
+func (f *fakeBackend) Send(_ context.Context, thread, otid, text string, expect []string) (*Sent, error) {
+	f.sentText, f.sentExpect = text, expect
 	if f.sendErr != nil {
 		return nil, f.sendErr
 	}
