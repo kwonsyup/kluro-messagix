@@ -64,7 +64,7 @@ func TestMembersInvalidatedAtDisconnectUntilReconnected(t *testing.T) {
 	mustComplete(t, s, "2002", true, "premise")
 	s.handleMetaEvent(ctx, &messagix.TransientDisconnectEvent{Err: errors.New("closed")})
 	mustComplete(t, s, "2002", false, "after disconnect")
-	if err := expectErr(s, "2002", "7"); codeOf(err) != "roster_changed" {
+	if err := expectErr(s, "2002", "7"); codeOf(err) != "roster_unconfirmed" {
 		t.Fatalf("expect while disconnected: %v", err)
 	}
 	// Rows of the new socket's sync arrive before its connected event.
@@ -114,7 +114,7 @@ func TestListingReplyIssuedBeforeReconnectNotFresh(t *testing.T) {
 		t.Fatalf("listing: done=%v err=%v", done, err)
 	}
 	mustComplete(t, s, "2002", false, "reply issued before the reconnect")
-	if err := expectErr(s, "2002", "7"); codeOf(err) != "roster_changed" {
+	if err := expectErr(s, "2002", "7"); codeOf(err) != "roster_unconfirmed" {
 		t.Fatalf("expect on a stale reply: %v", err)
 	}
 }
@@ -132,7 +132,7 @@ func TestMembersBulkResetClearsRoster(t *testing.T) {
 	if got := othersOf(wireOf(t, s, "2002")); len(got) != 0 {
 		t.Fatalf("others after reset = %v", got)
 	}
-	if err := expectErr(s, "2002", "7"); codeOf(err) != "roster_changed" {
+	if err := expectErr(s, "2002", "7"); codeOf(err) != "roster_unconfirmed" {
 		t.Fatalf("expect [7] after reset: %v", err)
 	}
 	// Replacement rows in the same table as the reset apply after it.
@@ -169,7 +169,7 @@ func TestMembersSupersededPlainThreadNotCertified(t *testing.T) {
 		mustComplete(t, s, "2002", true, name+": premise")
 		frames := s.handleTableFrames(mapping)
 		mustComplete(t, s, "2002", false, name+": superseded")
-		if err := expectErr(s, "2002", "7"); codeOf(err) != "roster_changed" {
+		if err := expectErr(s, "2002", "7"); codeOf(err) != "roster_unconfirmed" {
 			t.Fatalf("%s: expect on a superseded thread: %v", name, err)
 		}
 		reemitted := false
@@ -205,15 +205,15 @@ func TestSendExpectEmptyStaysPresentAndIsRefused(t *testing.T) {
 	if out, _ := json.Marshal(g); strings.Contains(string(out), "expect") {
 		t.Fatalf("absent expect appeared: %s", out)
 	}
-	// A self-only group is complete with no others; an empty expect still
-	// names no recipient.
+	// An empty expect names no recipient: a bad request, refused as
+	// unconfirmed even on a complete roster.
 	s := newTestSession()
-	s.handleTableFrames(groupRows(1))
-	mustComplete(t, s, "2002", true, "premise: self-only group")
+	s.handleTableFrames(groupRows(2, 7))
+	mustComplete(t, s, "2002", true, "premise")
 	s.mu.Lock()
 	err := s.expectLocked("2002", []string{})
 	s.mu.Unlock()
-	if codeOf(err) != "roster_changed" {
+	if codeOf(err) != "roster_unconfirmed" {
 		t.Fatalf("empty expect: %v", err)
 	}
 	fb := &fakeBackend{}
@@ -223,5 +223,33 @@ func TestSendExpectEmptyStaysPresentAndIsRefused(t *testing.T) {
 		`{"t":"stop"}`)
 	if fb.sentExpect == nil || len(fb.sentExpect) != 0 {
 		t.Fatalf("present empty expect reached the backend as %#v", fb.sentExpect)
+	}
+}
+
+// The two refusal codes: roster_unconfirmed while the roster is not known
+// complete now (stale epoch, link down), roster_changed only when a complete
+// roster differs from expect. Both refuse before any provider call: the zero
+// client would panic on a write.
+func TestSendExpectUnconfirmedVersusChanged(t *testing.T) {
+	ctx := context.Background()
+	s := liveTestSession()
+	s.client = &messagix.Client{}
+	s.handleTableFrames(groupRows(2, 7))
+	if err := sendWith(s, "2002", []string{"9"}); codeOf(err) != "roster_changed" {
+		t.Fatalf("complete but mismatched: %v", err)
+	}
+	if err := expectErr(s, "2002", "7"); err != nil {
+		t.Fatalf("two-member happy path: %v", err)
+	}
+	s.bumpConnEpoch()
+	if err := sendWith(s, "2002", []string{"7"}); codeOf(err) != "roster_unconfirmed" {
+		t.Fatalf("stale epoch: %v", err)
+	}
+	s.handleTableFrames(groupRows(2, 7))
+	s.handleMetaEvent(ctx, &messagix.TransientDisconnectEvent{Err: errors.New("closed")})
+	for _, expect := range []string{"7", "9"} {
+		if err := sendWith(s, "2002", []string{expect}); codeOf(err) != "roster_unconfirmed" {
+			t.Fatalf("link down, expect [%s]: %v", expect, err)
+		}
 	}
 }
