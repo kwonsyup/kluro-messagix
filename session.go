@@ -88,6 +88,8 @@ type messagixSession struct {
 	folderMark     map[int64]bool                                                                                     // facebook thread keys whose latest non-empty folder is pending or spam (memory only)
 	statusMark     map[int64]bool                                                                                     // ... whose latest message request status row is 1 (memory only)
 	requestSeen    map[int64]bool                                                                                     // facebook thread keys that carried a request mark this run (memory only)
+	statusZero     map[int64]bool                                                                                     // ... with an explicit request status 0 row since their last mark (memory only)
+	plainFolder    map[int64]bool                                                                                     // ... with an explicit non-request folder row since their last mark (memory only)
 	requestCleared map[int64]bool                                                                                     // ... whose mark a later row cleared: positive evidence they are not requests
 	spamMark       map[int64]bool                                                                                     // ... whose latest non-empty folder is spam (memory only)
 	scopeFolders   map[int64]bool                                                                                     // group-1 parents the last listing's range rows named (guarded by mu)
@@ -186,6 +188,8 @@ func newSession() *messagixSession {
 		spamMark:       map[int64]bool{},
 		requestSeen:    map[int64]bool{},
 		requestCleared: map[int64]bool{},
+		statusZero:     map[int64]bool{},
+		plainFolder:    map[int64]bool{},
 		rowKeys:        map[int64]bool{},
 		encRowKeys:     map[int64]bool{},
 		msgIndex:       map[string]string{},

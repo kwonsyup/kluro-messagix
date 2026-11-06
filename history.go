@@ -91,6 +91,12 @@ func (s *messagixSession) lightspeedHistory(ctx context.Context, thread string, 
 	}
 	// Every send rechecks the request marks: a row that marks the thread while
 	// this call waits stops the re-request and any further page.
+	//
+	// Accepted residual: this narrows, it does not close. A mark applied between
+	// this check and the socket write (the library sends and waits in one call,
+	// on the loop that applies marks, so no lock can span both), or a thread read
+	// before any request fact reached the helper, can still be fetched. Do not
+	// promise zero fetches or bounded request-fact arrival time.
 	request := func(ts int64, id string) error {
 		s.mu.Lock()
 		marked := s.requestMarkedLocked(key)

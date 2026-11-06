@@ -602,3 +602,59 @@ func TestStatusOnlyRowsReemitAMarketplaceThreadsRequestFact(t *testing.T) {
 		t.Fatalf("status 0 alone: frame = %+v, want request false", th)
 	}
 }
+
+// P2 (round 4 regression): a restarted helper has seen no request mark, yet an explicit request status 0 together with
+// an explicit non-request folder is proof on its own that the thread is not a request: the frame says false, so the
+// connector can clear a request it stored before the restart and reopen backfill. Either row alone, or a row with no
+// status or no folder, leaves the fact absent. The change frame goes out once; a mark later starts over.
+func TestStatusZeroAndInboxFolderClearWithoutAMarkSeen(t *testing.T) {
+	status := func(v int64) *table.LSTable {
+		return &table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 3005, MessageRequestStatus: v}}}
+	}
+	folder := func(f string) *table.LSTable {
+		return &table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 3005, ThreadType: table.MARKETPLACE, FolderName: f}}}
+	}
+	for name, steps := range map[string][]*table.LSTable{
+		"one table":          {joinTables(marketThread(3005, -1, "inbox"), status(0))},
+		"status, then inbox": {marketThread(3005, -1, ""), status(0), folder("inbox")},
+		"inbox, then status": {marketThread(3005, -1, "inbox"), status(0)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newTestSession() // a restarted helper: no mark seen
+			var frames []Frame
+			for _, tbl := range steps {
+				frames = append(frames, s.handleTableFrames(tbl)...)
+			}
+			if th := lastThread(frames, "3005"); fact(th) != "false" || !th.Typed {
+				t.Fatalf("frame = %+v, want typed with request false", th)
+			}
+			if again := s.handleTableFrames(status(0)); lastThread(again, "3005") != nil {
+				t.Fatal("the clearing frame went out again with nothing changed")
+			}
+			// marked again, then cleared again: a new false
+			if th := lastThread(s.handleTableFrames(status(1)), "3005"); fact(th) != "true" {
+				t.Fatalf("marked again = %q", fact(th))
+			}
+			if th := lastThread(s.handleTableFrames(status(0)), "3005"); fact(th) != "false" {
+				t.Fatalf("cleared again = %q", fact(th))
+			}
+		})
+	}
+	for name, steps := range map[string][]*table.LSTable{
+		"inbox, no status row":           {marketThread(3005, -1, "inbox")},
+		"status 0, no folder":            {marketThread(3005, -1, ""), status(0)},
+		"status 0, pending folder":       {marketThread(3005, -1, folderPending), status(0)},
+		"status 0 then a folderless row": {status(0), marketThread(3005, -1, "")},
+	} {
+		t.Run("absent: "+name, func(t *testing.T) {
+			s := newTestSession()
+			var frames []Frame
+			for _, tbl := range steps {
+				frames = append(frames, s.handleTableFrames(tbl)...)
+			}
+			if th := lastThread(frames, "3005"); th == nil || fact(th) == "false" {
+				t.Fatalf("frame = %+v (fact %q), want no false without both explicit rows", th, fact(th))
+			}
+		})
+	}
+}
