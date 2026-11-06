@@ -86,6 +86,8 @@ type messagixSession struct {
 	fbToWA         map[int64]int64                                                                                    // facebook thread key -> encrypted chat id (hybrid threads)
 	folderMark     map[int64]bool                                                                                     // facebook thread keys whose latest non-empty folder is pending or spam (memory only)
 	statusMark     map[int64]bool                                                                                     // ... whose latest message request status row is 1 (memory only)
+	spamMark       map[int64]bool                                                                                     // ... whose latest non-empty folder is spam (memory only)
+	scopeLogged    string                                                                                             // the last thread scope diagnostic logged (guarded by mu)
 	e2eeOffline    int                                                                                                // queued E2EE messages the server said it would flush at connect (OfflineSyncPreview), count only
 	e2eeOfflineEnd bool                                                                                               // OfflineSyncCompleted seen
 	e2eeReceived   int                                                                                                // encrypted message events that reached deliverEncrypted, count only
@@ -177,6 +179,7 @@ func newSession() *messagixSession {
 		fbToWA:       map[int64]int64{},
 		folderMark:   map[int64]bool{},
 		statusMark:   map[int64]bool{},
+		spamMark:     map[int64]bool{},
 		rowKeys:      map[int64]bool{},
 		encRowKeys:   map[int64]bool{},
 		msgIndex:     map[string]string{},

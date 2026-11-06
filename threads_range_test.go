@@ -19,19 +19,43 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 )
 
-// pager is the thread listing's client: ExecuteTasks answers a group-1 page from a script and records the request.
-// With no script it answers one page, from group1 if set, whose range row says there is nothing more.
+// pager is the thread listing's client: ExecuteTasks answers a main-inbox page (group 1, parent -1) from a script
+// and records the request in tasks. With no script it answers one page, from group1 if set, whose range row says
+// there is nothing more. Every other scope's first-page request (scanScopes) is recorded in scopes instead and
+// answered from scope, or with an empty table; dump is what DumpState returns.
 type pager struct {
 	group1 *table.LSTable
 	pages  []*table.LSTable
 	cursor string
 	err    error
 	tasks  []socket.FetchThreadsTask
+	scope  map[scopeKey]*table.LSTable
+	scopes []socket.Task
+	dump   json.RawMessage
 }
 
 func (r *pager) GetCursor(int64) string { return r.cursor }
 
+func (r *pager) DumpState() (json.RawMessage, error) { return r.dump, nil }
+
+// isInboxTask says whether a request is one of the main inbox walk's.
+func isInboxTask(task socket.Task) bool {
+	ft, ok := task.(*socket.FetchThreadsTask)
+	return ok && ft.SyncGroup == 1 && ft.ParentThreadKey == -1
+}
+
 func (r *pager) ExecuteTasks(_ context.Context, tasks ...socket.Task) (*table.LSTable, error) {
+	if !isInboxTask(tasks[0]) {
+		r.scopes = append(r.scopes, tasks...)
+		if r.err != nil {
+			return nil, r.err
+		}
+		ft, _ := tasks[0].(*socket.FetchThreadsTask)
+		if ft != nil && r.scope[scopeKey{int64(ft.SyncGroup), ft.ParentThreadKey}] != nil {
+			return r.scope[scopeKey{int64(ft.SyncGroup), ft.ParentThreadKey}], nil
+		}
+		return &table.LSTable{}, nil
+	}
 	task := tasks[0].(*socket.FetchThreadsTask)
 	r.tasks = append(r.tasks, *task)
 	if r.err != nil {
@@ -216,8 +240,9 @@ func TestListingTalksToTheLibraryOnlyThroughPlainRequests(t *testing.T) {
 	}
 }
 
-// Message requests (sync group 95) are never listed: every request is for sync group 1, with the group-1 cursor.
-func TestListingNeverTouchesGroup95(t *testing.T) {
+// The main inbox walk asks sync group 1 with the group-1 cursor. Message requests (sync group 95) are asked once
+// per listing, first page only, with no cursor, as the library's own connect asks them.
+func TestListingAsksGroup95OnlyForItsFirstPage(t *testing.T) {
 	r := &pager{cursor: "cur-1"}
 	_, res, err, done := listGap(t, newTestSession(), r, context.Background(), 3*time.Second)
 	if !done || err != nil || res.Stats == nil || res.Gap != "" {
@@ -230,6 +255,10 @@ func TestListingNeverTouchesGroup95(t *testing.T) {
 		if task.SyncGroup != 1 || task.Cursor != "cur-1" {
 			t.Fatalf("listing asked %+v", task)
 		}
+	}
+	want := socket.FetchThreadsTask{ParentThreadKey: -1, ReferenceActivityTimestamp: 9999999999999, SyncGroup: 95}
+	if len(r.scopes) != 1 || *r.scopes[0].(*socket.FetchThreadsTask) != want {
+		t.Fatalf("scope requests = %+v, want only %+v", r.scopes, want)
 	}
 }
 
@@ -1033,6 +1062,9 @@ func (p *stableInbox) minTS(i int) int64      { return int64(90000 - i) }
 func (p *stableInbox) GetCursor(int64) string { return "" }
 
 func (p *stableInbox) ExecuteTasks(_ context.Context, tasks ...socket.Task) (*table.LSTable, error) {
+	if !isInboxTask(tasks[0]) {
+		return &table.LSTable{}, nil // another scope's first page: nothing there
+	}
 	task := tasks[0].(*socket.FetchThreadsTask)
 	if task.ParentThreadKey != -1 || task.SyncGroup != 1 {
 		return nil, errors.New("wrong parent or group")

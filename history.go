@@ -3,8 +3,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	waTypes "go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 
+	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
@@ -364,9 +367,10 @@ const gapInboxIncomplete = "inbox_incomplete"
 
 // Threads lists every thread: the ones already known, then the rest of the main
 // inbox (sync group 1), walked page by page with the requests the web client scrolls
-// it with. Message requests (sync group 95) are never listed: they are not imported
-// until the user accepts them in Messenger. The counts and any gap it returns go out
-// on threads_done.
+// it with, then the first page of every other scope (see scanScopes): the other
+// group-1 parents (folders such as Marketplace) and the message requests (sync group
+// 95). A message request is listed but stays inert unless it is a Marketplace thread
+// (see unacceptedLocked). The counts and any gap it returns go out on threads_done.
 func (s *messagixSession) Threads(ctx context.Context, emit emitFunc) (listingDone, error) {
 	s.mu.Lock()
 	cli := s.client
@@ -393,10 +397,18 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit
 		return listingDone{}, err
 	}
 	rows := inboxRowCounts{}
-	gap, stop, pages, err := s.pageThreads(ctx, cli, counted, &rows)
+	tally := &scopeTally{}
+	walker := tallyPager{threadPager: cli, tally: tally}
+	gap, stop, pages, err := s.pageThreads(ctx, walker, counted, &rows)
 	if err != nil {
 		return listingDone{}, err
 	}
+	parents := scopeParents(cli, tally.folders)
+	_, failed, err := s.scanScopes(ctx, walker, counted, parents, nil)
+	if err != nil {
+		return listingDone{}, err
+	}
+	s.logScopes(tally, parents, failed)
 	known, unlisted := s.encryptedCounts()
 	stats := s.listingStats(known, len(emitted), unlisted)
 	stats["inbox_stop"], stats["inbox_pages"] = stop, pages
@@ -455,29 +467,16 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 			return "", 0, pages, ref, err
 		}
 		task := ref
-		task.IsAfter = 0
-		task.AdditionalPagesToFetch = 0
 		task.Cursor = cli.GetCursor(group)
 		task.SyncGroup = group
-		s.mu.Lock()
-		mark := s.issueMarkLocked()
-		s.mu.Unlock()
-		tbl, err := cli.ExecuteTasks(ctx, &task)
+		tbl, err := s.fetchPage(ctx, cli, emit, task)
 		if err != nil {
-			return "", 0, pages, ref, mapSendErr(err)
+			return "", 0, pages, ref, err
 		}
 		if tbl == nil {
 			return gapInboxIncomplete, 1, pages, ref, nil
 		}
 		pages++
-		// The reply's roster rows date from the request: a reconnect while it
-		// was in flight leaves them stale.
-		s.handleReplyEmit(tbl, mark, func(f Frame) int64 {
-			if ctx.Err() != nil {
-				return 0
-			}
-			return emit(f)
-		})
 		if err := ctx.Err(); err != nil {
 			return "", 0, pages, ref, err
 		}
@@ -508,9 +507,277 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 // inboxResumeRef is the range position the next walk requests after a walk hit the page bound.
 type inboxResumeRef struct{ threadKey, activityMS int64 }
 
+// fetchPage issues one thread-list request and applies its reply through the normal
+// table path. The reply's roster rows date from the request: a reconnect, or a live
+// roster or mark change, while it was in flight leaves them stale. A nil table is
+// returned as is, unapplied.
+func (s *messagixSession) fetchPage(ctx context.Context, cli threadPager, emit emitFunc, task socket.FetchThreadsTask) (*table.LSTable, error) {
+	task.IsAfter = 0
+	task.AdditionalPagesToFetch = 0
+	s.mu.Lock()
+	mark := s.issueMarkLocked()
+	s.mu.Unlock()
+	tbl, err := cli.ExecuteTasks(ctx, &task)
+	if err != nil {
+		return nil, mapSendErr(err)
+	}
+	if tbl == nil {
+		return nil, nil
+	}
+	s.handleReplyEmit(tbl, mark, func(f Frame) int64 {
+		if ctx.Err() != nil {
+			return 0
+		}
+		return emit(f)
+	})
+	return tbl, nil
+}
+
 // inboxParentKey is the parent thread key of the main inbox: the only parent the walk
-// requests. Other parent keys of sync group 1 (configs.ParentThreadKeys) are not walked.
+// pages through. Every other scope gets its first page only (see scanScopes).
 const inboxParentKey = -1
+
+// requestSyncGroup is the sync group of message requests ("pending").
+const requestSyncGroup = 95
+
+// scopeParentCap bounds how many group-1 parents besides the inbox one listing looks into.
+const scopeParentCap = 8
+
+// stateDumper is the library's public read of its own state, which carries the page's
+// parent thread keys (configs.ParentThreadKeys, from the page's threadsRangesQuery rows).
+type stateDumper interface {
+	DumpState() (json.RawMessage, error)
+}
+
+var _ stateDumper = (*messagix.Client)(nil)
+
+// scopeParents is the group-1 parents a listing looks into besides the main inbox: the
+// library's configs.ParentThreadKeys and any parent a group-1 range row of this walk
+// named, without the inbox (-1) and the group-wide parent 0, ascending, at most
+// scopeParentCap. A state that cannot be read adds nothing.
+func scopeParents(cli threadPager, seen map[int64]bool) []int64 {
+	set := map[int64]bool{}
+	if d, ok := cli.(stateDumper); ok {
+		if blob, err := d.DumpState(); err == nil && len(blob) > 0 {
+			var st struct {
+				Configs struct{ ParentThreadKeys []int64 }
+			}
+			if json.Unmarshal(blob, &st) == nil {
+				for _, k := range st.Configs.ParentThreadKeys {
+					set[k] = true
+				}
+			}
+		}
+	}
+	for k := range seen {
+		set[k] = true
+	}
+	delete(set, inboxParentKey)
+	delete(set, 0)
+	keys := slices.Sorted(maps.Keys(set))
+	return keys[:min(len(keys), scopeParentCap)]
+}
+
+// scanScopes asks for the first page of every scope the inbox walk does not cover:
+// each other group-1 parent in parents (a folder such as Marketplace), then the message
+// requests (sync group 95) of the inbox and of each of those parents. These are the
+// first-page requests the library's own connect sends for every parent key and both
+// groups (socket.go sendInitialThreadFetch), whose replies it drops. Group 95 is asked
+// without a cursor, as the library does. Only the first page: a new thread is the
+// newest of its scope. Each reply goes through fetchPage, so the stale-reply fence and
+// the request marks apply to it as to the inbox walk. It is a read: FetchThreadsTask
+// only, never a mark-read or an accept. A failed request ends the scan and is reported
+// as failed, not as an error; only a cancel is an error. done is checked after each
+// page, as in walkInbox. At most 2*len(parents)+1 requests, threadBatchDelay apart.
+func (s *messagixSession) scanScopes(ctx context.Context, cli threadPager, emit emitFunc, parents []int64, done func() bool) (pages int, failed bool, err error) {
+	scopes := make([]socket.FetchThreadsTask, 0, 2*len(parents)+1)
+	for _, p := range parents {
+		scopes = append(scopes, socket.FetchThreadsTask{ParentThreadKey: p, SyncGroup: 1})
+	}
+	for _, p := range append([]int64{inboxParentKey}, parents...) {
+		scopes = append(scopes, socket.FetchThreadsTask{ParentThreadKey: p, SyncGroup: requestSyncGroup})
+	}
+	for _, task := range scopes {
+		select {
+		case <-time.After(threadBatchDelay):
+		case <-ctx.Done():
+			return pages, failed, ctx.Err()
+		}
+		task.ReferenceThreadKey, task.ReferenceActivityTimestamp = inboxTop.ReferenceThreadKey, inboxTop.ReferenceActivityTimestamp
+		if task.SyncGroup == 1 {
+			task.Cursor = cli.GetCursor(1)
+		}
+		tbl, err := s.fetchPage(ctx, cli, emit, task)
+		if err := ctx.Err(); err != nil {
+			return pages, failed, err
+		}
+		if err != nil {
+			return pages, true, nil
+		}
+		if tbl != nil {
+			pages++
+		}
+		if done != nil && done() {
+			return pages, failed, nil
+		}
+	}
+	return pages, failed, nil
+}
+
+// tallyPager passes every request through and counts its reply for the scope
+// diagnostic (see logScopes). It changes nothing it passes on.
+type tallyPager struct {
+	threadPager
+	tally *scopeTally
+}
+
+func (p tallyPager) ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error) {
+	tbl, err := p.threadPager.ExecuteTasks(ctx, tasks...)
+	if err == nil && tbl != nil && len(tasks) == 1 {
+		if task, ok := tasks[0].(*socket.FetchThreadsTask); ok {
+			p.tally.add(task, tbl)
+		}
+	}
+	return tbl, err
+}
+
+// scopeKey is one request scope: a sync group and a parent thread key.
+type scopeKey struct{ group, parent int64 }
+
+// scopeRow is what the diagnostic keeps of one thread row: no id, no name.
+type scopeRow struct {
+	folder      string
+	marketplace bool
+	otherParent bool // the row's own parent is not the one requested
+}
+
+// scopeTally is one listing's thread rows by request scope, and the group-1 parents
+// its range rows named. Counts only ever leave it.
+type scopeTally struct {
+	threads map[scopeKey]map[int64]scopeRow
+	folders map[int64]bool
+}
+
+func (t *scopeTally) add(task *socket.FetchThreadsTask, tbl *table.LSTable) {
+	if t.threads == nil {
+		t.threads, t.folders = map[scopeKey]map[int64]scopeRow{}, map[int64]bool{}
+	}
+	key := scopeKey{int64(task.SyncGroup), task.ParentThreadKey}
+	rows := t.threads[key]
+	if rows == nil {
+		rows = map[int64]scopeRow{}
+		t.threads[key] = rows
+	}
+	see := func(thread int64, typ table.ThreadType, folder string, parent int64) {
+		rows[thread] = scopeRow{folder: folder, marketplace: typ == table.MARKETPLACE, otherParent: parent != 0 && parent != task.ParentThreadKey}
+	}
+	for _, th := range tbl.LSDeleteThenInsertThread {
+		see(th.ThreadKey, th.ThreadType, th.FolderName, th.ParentThreadKey)
+	}
+	for _, th := range tbl.LSUpdateOrInsertThread {
+		see(th.ThreadKey, th.ThreadType, th.FolderName, th.ParentThreadKey)
+	}
+	for _, r := range tbl.LSUpsertSyncGroupThreadsRange {
+		if r.SyncGroup == 1 && r.ParentThreadKey != inboxParentKey && r.ParentThreadKey != 0 {
+			t.folders[r.ParentThreadKey] = true
+		}
+	}
+}
+
+// folderLetters names the diagnostic's folder buckets, in folderBucket's order.
+const folderLetters = "iposaex"
+
+// folderBucket is a thread row's folder as an index into folderLetters: inbox, pending,
+// other, spam, archived, none, anything else.
+func folderBucket(folder string) int {
+	switch folder {
+	case "inbox":
+		return 0
+	case folderPending:
+		return 1
+	case "other":
+		return 2
+	case folderSpam:
+		return 3
+	case "archived":
+		return 4
+	case "":
+		return 5
+	}
+	return 6
+}
+
+// logScopes logs scopeCode at info, only when it differs from the last one logged.
+func (s *messagixSession) logScopes(t *scopeTally, parents []int64, failed bool) {
+	code := scopeCode(t, parents, failed)
+	s.mu.Lock()
+	same := code == s.scopeLogged
+	s.scopeLogged = code
+	s.mu.Unlock()
+	if !same {
+		logCode("info", code)
+	}
+}
+
+// scopeCode is the diagnostic's counts-only code: k<other parents>, then one segment
+// per scope that answered: "in" (the inbox walk), "f<n>" (group-1 parent n of parents,
+// 1-based; "fx" past the cap), "r0" (requests of the inbox), "r<n>" (requests of
+// parent n); then its threads by folder (i inbox, p pending, o other, s spam,
+// a archived, e none, x anything else), m Marketplace (type 5) threads and q threads
+// whose own parent is not the requested one; ".err" when the scope scan failed.
+// Counts are capped at 999. Parent keys themselves are never logged.
+func scopeCode(t *scopeTally, parents []int64, failed bool) string {
+	label := func(k scopeKey) string {
+		prefix := "f"
+		if k.group == requestSyncGroup {
+			prefix = "r"
+		}
+		if k.parent == inboxParentKey {
+			if k.group == 1 {
+				return "in"
+			}
+			return prefix + "0"
+		}
+		if i := slices.Index(parents, k.parent); i >= 0 {
+			return prefix + strconv.Itoa(i+1)
+		}
+		return prefix + "x"
+	}
+	var segs []string
+	for k, rows := range t.threads {
+		var folder [len(folderLetters)]int
+		var m, q int
+		for _, r := range rows {
+			folder[folderBucket(r.folder)]++
+			if r.marketplace {
+				m++
+			}
+			if r.otherParent {
+				q++
+			}
+		}
+		seg := label(k)
+		for i, n := range folder {
+			if n > 0 {
+				seg += fmt.Sprintf("_%c%d", folderLetters[i], min(n, 999))
+			}
+		}
+		seg += fmt.Sprintf("_m%d", min(m, 999))
+		if q > 0 {
+			seg += fmt.Sprintf("_q%d", min(q, 999))
+		}
+		segs = append(segs, seg)
+	}
+	slices.Sort(segs)
+	code := fmt.Sprintf("thread_scopes.k%d", len(parents))
+	for _, seg := range segs {
+		code += "." + seg
+	}
+	if failed {
+		code += ".err"
+	}
+	return code
+}
 
 // inboxRowCounts accumulates only group-1 row categories for one walk.
 type inboxRowCounts struct {

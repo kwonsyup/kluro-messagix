@@ -109,7 +109,8 @@ func (s *messagixSession) rosterTargetsLocked() []*threadInfo {
 }
 
 // rosterRefresh walks the inbox from the top, at most rosterRefreshPages requests,
-// until every target group is certified again. It never touches inboxResume, and
+// then the first page of every other scope (scanScopes) if a target is still
+// unconfirmed, until every target group is certified again. It never touches inboxResume, and
 // never re-emits known threads as incomplete (the connector's listing does that).
 // Frames go out through emit as a normal walk's do; each page's rows are stamped
 // with the epoch the page was issued in, so a reply that outlives a further
@@ -147,6 +148,13 @@ func (s *messagixSession) rosterRefresh(ctx context.Context, cli threadPager, em
 	}
 	rows := inboxRowCounts{}
 	_, stop, pages, _, err := s.walkInbox(ctx, cli, emit, &rows, inboxTop, rosterRefreshPages, done)
+	if err == nil && stop != 5 && !done() {
+		// A target outside the main inbox (a Marketplace folder or request) is
+		// only re-seen on its own scope's first page.
+		var scoped int
+		scoped, _, err = s.scanScopes(ctx, cli, emit, scopeParents(cli, nil), done)
+		pages += scoped
+	}
 	if ctx.Err() != nil {
 		return // superseded by a newer reconnect or stopping: it logs for itself
 	}

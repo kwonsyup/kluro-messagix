@@ -146,7 +146,8 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 	}
 
 	// A thread row in the "pending" or "spam" folder, or a message request row with
-	// status 1, marks the thread unaccepted: it is emitted with Typed=false whatever
+	// status 1, marks the thread unaccepted (one exception: a pending Marketplace
+	// thread, see unacceptedLocked): it is emitted with Typed=false whatever
 	// its type, so the connector qualifies nothing from it. Any other non-empty
 	// folder, or a request status other than 1, clears the mark and re-emits the
 	// thread typed; an empty folder does neither. The mark is memory only: after a
@@ -180,8 +181,10 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 		case "":
 		case folderPending, folderSpam:
 			set(s.folderMark, key, true)
+			set(s.spamMark, key, folder == folderSpam)
 		default:
 			set(s.folderMark, key, false)
+			set(s.spamMark, key, false)
 		}
 	}
 	for _, th := range tbl.LSDeleteThenInsertThread {
@@ -571,7 +574,8 @@ func threadFrame(t Thread) Frame { return Frame{T: TThread, ThreadEvt: &t} }
 // other person; an encrypted thread names the open thread it continues.
 func (s *messagixSession) wireThreadLocked(t *threadInfo) Thread {
 	if !t.Enc && s.unacceptedLocked(t.Key) {
-		// A message request qualifies for nothing: the connector imports any
+		// A message request (other than a pending Marketplace thread, see
+		// unacceptedLocked) qualifies for nothing: the connector imports any
 		// one-to-one thread that names another person, typed or not, so the frame
 		// carries no kind, no type, no participants and no title (usually the
 		// stranger's name). The real ones stay in
@@ -610,8 +614,26 @@ func (s *messagixSession) wireThread(t *threadInfo) Thread {
 
 // unacceptedLocked reports whether a facebook thread is a message request or
 // spam by either source. The caller holds s.mu.
+//
+// One kind of request is accepted here: a Marketplace thread (type 5) in the pending
+// folder or with request status 1, never one in spam. A new Marketplace buyer's
+// first message can arrive as a request; it is listed typed, with its roster, so it
+// is imported and can be certified like any other two-person group. Nothing here
+// accepts it on Meta's side: the helper never sends a mark-read or an accept task.
+// Only the user's own Send, still behind membersCompleteLocked, replies to it, and
+// Meta treats that reply as accepting the request.
 func (s *messagixSession) unacceptedLocked(key int64) bool {
-	return s.folderMark[key] || s.statusMark[key]
+	if !s.folderMark[key] && !s.statusMark[key] {
+		return false
+	}
+	return s.spamMark[key] || !s.marketplaceLocked(key)
+}
+
+// marketplaceLocked reports whether the open thread under key is typed Marketplace.
+// The caller holds s.mu.
+func (s *messagixSession) marketplaceLocked(key int64) bool {
+	t := s.threads[wireID(false, key)]
+	return t != nil && t.Typed && t.RawType == int64(table.MARKETPLACE)
 }
 
 // emitKnownThreads emits a thread frame for every thread the helper knows. Each
