@@ -90,13 +90,14 @@ func (s *messagixSession) Send(ctx context.Context, thread, otid, text string, e
 }
 
 // expectLocked is nil only for an open group with a complete roster whose
-// others are exactly expect, in any order. The caller holds s.mu.
+// fresh others (seen in this connection epoch) are exactly expect, in any
+// order. The caller holds s.mu.
 func (s *messagixSession) expectLocked(thread string, expect []string) error {
 	t := s.threads[thread]
 	if t == nil || !s.membersCompleteLocked(t) {
 		return errCode("roster_changed")
 	}
-	have := s.othersLocked(t)
+	have := s.freshOthersLocked(t)
 	if len(have) != len(expect) {
 		return errCode("roster_changed")
 	}

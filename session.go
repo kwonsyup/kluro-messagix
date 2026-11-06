@@ -72,8 +72,8 @@ type messagixSession struct {
 
 	inboxResume *inboxResumeRef // where the next inbox walk resumes after one hit the page bound (memory only; guarded by mu)
 
-	threads        map[string]*threadInfo // by wire id
-	participants   map[int64][]int64      // participant rows waiting for their thread
+	threads        map[string]*threadInfo         // by wire id
+	participants   map[int64][]pendingParticipant // participant rows waiting for their thread
 	names          map[int64]string
 	cutover        map[int64]int64                                                                                    // encrypted chat id -> its pre-encryption (open) thread key
 	fbToWA         map[int64]int64                                                                                    // facebook thread key -> encrypted chat id (hybrid threads)
@@ -124,6 +124,17 @@ type threadInfo struct {
 	MemberCount int64
 	RawType     int64 // provider thread type, for the roster diagnostic
 	RosterEpoch int64 // connEpoch the snapshot was taken in; 0 means none
+	// Seen is the connEpoch of each participant's latest participant row. Only
+	// participants seen in the current epoch count toward a complete roster: an
+	// identity from an older epoch may have left while the stream was down.
+	Seen map[int64]int64
+}
+
+// pendingParticipant is a participant row that arrived before its thread, with
+// the connEpoch it arrived in.
+type pendingParticipant struct {
+	ID    int64
+	Epoch int64
 }
 
 // wireID is the thread id on the protocol: the facebook thread key, or "e:" and
@@ -147,7 +158,7 @@ func newSession() *messagixSession {
 	return &messagixSession{
 		connEpoch:    1,
 		threads:      map[string]*threadInfo{},
-		participants: map[int64][]int64{},
+		participants: map[int64][]pendingParticipant{},
 		names:        map[int64]string{},
 		cutover:      map[int64]int64{},
 		fbToWA:       map[int64]int64{},
@@ -859,7 +870,7 @@ func (s *messagixSession) Logout(ctx context.Context) error {
 	s.waDeviceJID, s.waSnap = "", nil
 	s.histDev, s.histBak = nil, nil
 	s.threads = map[string]*threadInfo{}
-	s.participants = map[int64][]int64{}
+	s.participants = map[int64][]pendingParticipant{}
 	s.names = map[int64]string{}
 	s.cutover = map[int64]int64{}
 	s.fbToWA = map[int64]int64{}

@@ -204,3 +204,174 @@ func TestRosterDiagnosticCodeOnlyOncePerEpoch(t *testing.T) {
 		}
 	}
 }
+
+// othersOf is the non-self participant ids on the wire frame.
+func othersOf(th Thread) []string {
+	var out []string
+	for _, p := range th.Participants {
+		if !p.Self {
+			out = append(out, p.ID)
+		}
+	}
+	return out
+}
+
+func expectErr(s *messagixSession, thread string, expect ...string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.expectLocked(thread, expect)
+}
+
+// Codex P1: self plus 7 and 8, reconnect after 8 is replaced by 9, then a
+// count-3 snapshot naming only 7. The cached 8 is from an older epoch and must
+// not fill the count.
+func TestMembersStaleIdentityAfterReconnectNotComplete(t *testing.T) {
+	s := newTestSession()
+	s.client = &messagix.Client{}
+	s.handleTableFrames(groupRows(3, 7, 8))
+	if !wireOf(t, s, "2002").MembersComplete {
+		t.Fatal("premise: fresh full roster not complete")
+	}
+	s.bumpConnEpoch()
+	s.handleTableFrames(groupRows(3, 7))
+	if wireOf(t, s, "2002").MembersComplete {
+		t.Fatal("stale participant 8 certified a new snapshot")
+	}
+	for _, expect := range [][]string{{"7", "8"}, {"7", "9"}, {"7"}} {
+		if err := sendWith(s, "2002", expect); codeOf(err) != "roster_changed" {
+			t.Fatalf("expect %v: err %v", expect, err)
+		}
+	}
+	// The new member's row arrives in this epoch: the roster is 7 and 9 only.
+	s.handleTableFrames(groupRows(3, 9))
+	th := wireOf(t, s, "2002")
+	if !th.MembersComplete || strings.Join(othersOf(th), ",") != "7,9" {
+		t.Fatalf("complete=%v others=%v", th.MembersComplete, othersOf(th))
+	}
+	if err := sendWith(s, "2002", []string{"7", "8"}); codeOf(err) != "roster_changed" {
+		t.Fatalf("stale expect: %v", err)
+	}
+	if err := expectErr(s, "2002", "9", "7"); err != nil {
+		t.Fatalf("fresh expect refused: %v", err)
+	}
+}
+
+// The Marketplace shape: self plus 7, reconnect after 7 is replaced by 9.
+func TestMembersTwoPersonReplacedAcrossReconnect(t *testing.T) {
+	s := newTestSession()
+	s.client = &messagix.Client{}
+	s.handleTableFrames(&table.LSTable{
+		LSDeleteThenInsertThread:        []*table.LSDeleteThenInsertThread{{ThreadKey: 2002, ThreadType: table.MARKETPLACE, MemberCount: 2}},
+		LSAddParticipantIdToGroupThread: []*table.LSAddParticipantIdToGroupThread{{ThreadKey: 2002, ContactId: 7}},
+	})
+	if !wireOf(t, s, "2002").MembersComplete {
+		t.Fatal("premise: two-person roster not complete")
+	}
+	s.bumpConnEpoch()
+	// A count-2 snapshot with no participant row: only the stale 7 is known.
+	snap := &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 2002, ThreadType: table.MARKETPLACE, MemberCount: 2}}}
+	s.handleTableFrames(snap)
+	if wireOf(t, s, "2002").MembersComplete {
+		t.Fatal("stale participant 7 certified a count-2 snapshot")
+	}
+	if err := sendWith(s, "2002", []string{"7"}); codeOf(err) != "roster_changed" {
+		t.Fatalf("stale expect: %v", err)
+	}
+	// 9 is seen fresh in this epoch.
+	s.handleTableFrames(&table.LSTable{LSAddParticipantIdToGroupThread: []*table.LSAddParticipantIdToGroupThread{{ThreadKey: 2002, ContactId: 9}}})
+	th := wireOf(t, s, "2002")
+	if !th.MembersComplete || strings.Join(othersOf(th), ",") != "9" {
+		t.Fatalf("complete=%v others=%v", th.MembersComplete, othersOf(th))
+	}
+	if err := sendWith(s, "2002", []string{"7"}); codeOf(err) != "roster_changed" {
+		t.Fatalf("expect [7] after replacement: %v", err)
+	}
+	if err := expectErr(s, "2002", "9"); err != nil {
+		t.Fatalf("expect [9] refused: %v", err)
+	}
+	// Another reconnect makes 9 stale too until it is seen again.
+	s.bumpConnEpoch()
+	s.handleTableFrames(snap)
+	if wireOf(t, s, "2002").MembersComplete {
+		t.Fatal("9 from an older epoch certified the roster")
+	}
+	if err := sendWith(s, "2002", []string{"9"}); codeOf(err) != "roster_changed" {
+		t.Fatalf("expect [9] with a stale roster: %v", err)
+	}
+}
+
+// A participant row buffered before its thread keeps the epoch it arrived in.
+func TestMembersBufferedParticipantKeepsItsEpoch(t *testing.T) {
+	early := &table.LSTable{LSAddParticipantIdToGroupThread: []*table.LSAddParticipantIdToGroupThread{{ThreadKey: 2002, ContactId: 7}}}
+	s := newTestSession()
+	s.handleTableFrames(early)
+	s.bumpConnEpoch()
+	s.handleTableFrames(groupRows(2))
+	if wireOf(t, s, "2002").MembersComplete {
+		t.Fatal("buffered row from an older epoch certified the roster")
+	}
+	s = newTestSession()
+	s.handleTableFrames(early)
+	s.handleTableFrames(groupRows(2))
+	if !wireOf(t, s, "2002").MembersComplete {
+		t.Fatal("buffered row from this epoch not counted")
+	}
+}
+
+func TestMembersRemovalRowRemovesParticipant(t *testing.T) {
+	s := newTestSession()
+	s.handleTableFrames(groupRows(3, 7, 8))
+	s.handleTableFrames(&table.LSTable{LSRemoveParticipantFromThread: []*table.LSRemoveParticipantFromThread{{ThreadKey: 2002, ParticipantId: 8}}})
+	th := wireOf(t, s, "2002")
+	if th.MembersComplete || strings.Join(othersOf(th), ",") != "7" {
+		t.Fatalf("after removal complete=%v others=%v", th.MembersComplete, othersOf(th))
+	}
+	// A new count-2 snapshot in the same epoch is complete with 7 alone.
+	s.handleTableFrames(groupRows(2))
+	th = wireOf(t, s, "2002")
+	if !th.MembersComplete || strings.Join(othersOf(th), ",") != "7" {
+		t.Fatalf("after snapshot complete=%v others=%v", th.MembersComplete, othersOf(th))
+	}
+	if err := expectErr(s, "2002", "7", "8"); codeOf(err) != "roster_changed" {
+		t.Fatalf("removed participant still expected: %v", err)
+	}
+	// A removal for a thread not yet known drops the buffered row.
+	s.handleTableFrames(&table.LSTable{LSAddParticipantIdToGroupThread: []*table.LSAddParticipantIdToGroupThread{{ThreadKey: 3003, ContactId: 5}}})
+	s.handleTableFrames(&table.LSTable{LSRemoveParticipantFromThread: []*table.LSRemoveParticipantFromThread{{ThreadKey: 3003, ParticipantId: 5}}})
+	s.handleTableFrames(&table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 3003, ThreadType: table.GROUP_THREAD, MemberCount: 2}}})
+	if th := wireOf(t, s, "3003"); th.MembersComplete || len(othersOf(th)) != 0 {
+		t.Fatalf("removed buffered row survived: %+v", th)
+	}
+}
+
+func TestMembersFreshTwoPersonHappyPath(t *testing.T) {
+	s := newTestSession()
+	s.handleTableFrames(&table.LSTable{
+		LSDeleteThenInsertThread:        []*table.LSDeleteThenInsertThread{{ThreadKey: 2002, ThreadType: table.MARKETPLACE, MemberCount: 2}},
+		LSAddParticipantIdToGroupThread: []*table.LSAddParticipantIdToGroupThread{{ThreadKey: 2002, ContactId: 1}, {ThreadKey: 2002, ContactId: 9}},
+	})
+	th := wireOf(t, s, "2002")
+	if !th.MembersComplete || strings.Join(othersOf(th), ",") != "9" {
+		t.Fatalf("complete=%v others=%v", th.MembersComplete, othersOf(th))
+	}
+	if err := expectErr(s, "2002", "9"); err != nil {
+		t.Fatalf("expect [9] refused: %v", err)
+	}
+}
+
+// The diagnostic's p<n> counts fresh others only.
+func TestRosterDiagnosticCountsFreshOthers(t *testing.T) {
+	var buf bytes.Buffer
+	old := stderr
+	stderr = &buf
+	defer func() { stderr = old }()
+	s := newTestSession()
+	s.handleTableFrames(groupRows(2, 7))
+	wireOf(t, s, "2002")
+	s.bumpConnEpoch()
+	s.handleTableFrames(groupRows(2))
+	wireOf(t, s, "2002")
+	if got := buf.String(); !strings.Contains(got, `"roster.t2.mc2.p1.c1"`) || !strings.Contains(got, `"roster.t2.mc2.p0.c0"`) {
+		t.Fatalf("log = %q", got)
+	}
+}

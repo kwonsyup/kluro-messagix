@@ -150,10 +150,7 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []F
 			return
 		}
 		t := s.thread(enc, key)
-		for _, id := range s.participants[originalKey] {
-			t.addParticipant(id)
-		}
-		delete(s.participants, originalKey)
+		s.takePendingLocked(t, originalKey)
 		if typ != table.UNKNOWN_THREAD_TYPE {
 			t.Typed = true
 			t.RawType = int64(typ)
@@ -185,10 +182,10 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []F
 	for _, p := range tbl.LSAddParticipantIdToGroupThread {
 		key, enc := s.mapKey(p.ThreadKey)
 		if t := s.threads[wireID(enc, key)]; t != nil {
-			t.addParticipant(p.ContactId)
+			t.seeParticipant(p.ContactId, s.connEpoch)
 			touched[wireID(enc, key)] = true
 		} else {
-			s.participants[p.ThreadKey] = append(s.participants[p.ThreadKey], p.ContactId)
+			s.participants[p.ThreadKey] = append(s.participants[p.ThreadKey], pendingParticipant{p.ContactId, s.connEpoch})
 		}
 	}
 	// A snapshot row with a count marks the roster as taken in this epoch; a
@@ -207,6 +204,7 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable) (frames []F
 		s.clearRosterLocked(d.ThreadKey, touched)
 	}
 	for _, d := range tbl.LSRemoveParticipantFromThread {
+		s.removeParticipantLocked(d.ThreadKey, d.ParticipantId, touched)
 		s.clearRosterLocked(d.ThreadKey, touched)
 	}
 	for _, n := range tbl.LSSyncUpdateThreadName {
@@ -295,11 +293,56 @@ func (s *messagixSession) thread(enc bool, key int64) *threadInfo {
 		t = &threadInfo{Key: key, Enc: enc, Kind: "group"}
 		s.threads[id] = t
 	}
+	s.takePendingLocked(t, key)
+	return t
+}
+
+// takePendingLocked moves the participant rows buffered under key onto t,
+// keeping the epoch each row arrived in.
+func (s *messagixSession) takePendingLocked(t *threadInfo, key int64) {
 	for _, p := range s.participants[key] {
-		t.addParticipant(p)
+		t.seeParticipant(p.ID, p.Epoch)
 	}
 	delete(s.participants, key)
-	return t
+}
+
+// seeParticipant records a participant row seen in epoch.
+func (t *threadInfo) seeParticipant(id, epoch int64) {
+	if id == 0 {
+		return
+	}
+	t.addParticipant(id)
+	if t.Seen == nil {
+		t.Seen = map[int64]int64{}
+	}
+	t.Seen[id] = max(t.Seen[id], epoch)
+}
+
+// removeParticipantLocked applies a removal row: the participant leaves the
+// thread and any buffered row for it is dropped.
+func (s *messagixSession) removeParticipantLocked(threadKey, id int64, touched map[string]bool) {
+	if pend := s.participants[threadKey]; pend != nil {
+		kept := pend[:0]
+		for _, p := range pend {
+			if p.ID != id {
+				kept = append(kept, p)
+			}
+		}
+		s.participants[threadKey] = kept
+	}
+	key, enc := s.mapKey(threadKey)
+	t := s.threads[wireID(enc, key)]
+	if t == nil {
+		return
+	}
+	delete(t.Seen, id)
+	for i, p := range t.Participants {
+		if p == id {
+			t.Participants = append(t.Participants[:i], t.Participants[i+1:]...)
+			touched[wireID(enc, key)] = true
+			return
+		}
+	}
 }
 
 func (t *threadInfo) addParticipant(id int64) {
@@ -348,7 +391,7 @@ func (s *messagixSession) logRosterLocked(t *threadInfo, complete bool) {
 	if complete {
 		c = 1
 	}
-	logCode("info", fmt.Sprintf("roster.t%d.mc%d.p%d.c%d", min(t.RawType, 99), min(t.MemberCount, 9), min(len(s.othersLocked(t)), 9), c))
+	logCode("info", fmt.Sprintf("roster.t%d.mc%d.p%d.c%d", min(t.RawType, 99), min(t.MemberCount, 9), min(len(s.freshOthersLocked(t)), 9), c))
 }
 
 // bumpConnEpoch ends every roster snapshot taken so far.
@@ -358,24 +401,28 @@ func (s *messagixSession) bumpConnEpoch() {
 	s.mu.Unlock()
 }
 
-// othersLocked is the thread's participants other than self, as wire ids.
-func (s *messagixSession) othersLocked(t *threadInfo) []string {
+// freshOthersLocked is the thread's participants other than self whose latest
+// participant row arrived in the current connection epoch, as wire ids. A
+// participant last seen in an older epoch is left out: it may have been
+// replaced while the stream was down.
+func (s *messagixSession) freshOthersLocked(t *threadInfo) []string {
 	var out []string
 	for _, p := range t.Participants {
-		if p != s.selfID {
+		if p != s.selfID && t.Seen[p] == s.connEpoch {
 			out = append(out, strconv.FormatInt(p, 10))
 		}
 	}
 	return out
 }
 
-// membersCompleteLocked reports whether the participants are known to be the
-// whole roster: an open typed group whose snapshot count matches self plus the
-// others, taken in this connection epoch with no delta since.
+// membersCompleteLocked reports whether the fresh others are known to be the
+// whole roster: an open typed group whose snapshot count, taken in this
+// connection epoch with no delta since, equals self plus the others seen in
+// this epoch. Identities from an older epoch never count.
 func (s *messagixSession) membersCompleteLocked(t *threadInfo) bool {
 	return !t.Enc && t.Typed && t.Kind == "group" && !s.unacceptedLocked(t.Key) &&
 		t.MemberCount > 0 && t.RosterEpoch != 0 && t.RosterEpoch == s.connEpoch &&
-		t.MemberCount == int64(1+len(s.othersLocked(t)))
+		t.MemberCount == int64(1+len(s.freshOthersLocked(t)))
 }
 
 func threadFrame(t Thread) Frame { return Frame{T: TThread, ThreadEvt: &t} }
@@ -403,6 +450,11 @@ func (s *messagixSession) wireThreadLocked(t *threadInfo) Thread {
 	out.Participants = append(out.Participants, Person{ID: self, Name: s.selfName, Self: true})
 	for _, p := range t.Participants {
 		if p == s.selfID {
+			continue
+		}
+		if out.MembersComplete && t.Seen[p] != s.connEpoch {
+			// A complete roster lists exactly the fresh others; an identity
+			// from an older epoch is not a member the count vouches for.
 			continue
 		}
 		out.Participants = append(out.Participants, Person{ID: strconv.FormatInt(p, 10), Name: s.names[p]})
