@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"maps"
 	"time"
 )
 
@@ -109,7 +110,8 @@ func (s *messagixSession) rosterTargetsLocked() []*threadInfo {
 }
 
 // rosterRefresh walks the inbox from the top, at most rosterRefreshPages requests,
-// until every target group is certified again. It never touches inboxResume, and
+// then the first page of every other scope (scanScopes) if a target is still
+// unconfirmed, until every target group is certified again. It never touches inboxResume, and
 // never re-emits known threads as incomplete (the connector's listing does that).
 // Frames go out through emit as a normal walk's do; each page's rows are stamped
 // with the epoch the page was issued in, so a reply that outlives a further
@@ -146,7 +148,23 @@ func (s *messagixSession) rosterRefresh(ctx context.Context, cli threadPager, em
 		return down || missing() == 0
 	}
 	rows := inboxRowCounts{}
-	_, stop, pages, _, err := s.walkInbox(ctx, cli, emit, &rows, inboxTop, rosterRefreshPages, done)
+	tally := &scopeTally{}
+	_, stop, pages, _, err := s.walkInbox(ctx, tallyPager{threadPager: cli, tally: tally}, emit, &rows, inboxTop, rosterRefreshPages, done)
+	if err == nil && stop != 5 && !done() {
+		// A target outside the main inbox (a Marketplace folder or request) is
+		// only re-seen on its own scope's first page. The folders are the page
+		// config's, and those named by range rows of this walk or the last listing.
+		s.mu.Lock()
+		folders := maps.Clone(s.scopeFolders)
+		s.mu.Unlock()
+		if folders == nil {
+			folders = map[int64]bool{}
+		}
+		maps.Copy(folders, tally.folders)
+		var scoped int
+		scoped, _, err = s.scanScopes(ctx, cli, emit, scopeParents(cli, folders), done)
+		pages += scoped
+	}
 	if ctx.Err() != nil {
 		return // superseded by a newer reconnect or stopping: it logs for itself
 	}

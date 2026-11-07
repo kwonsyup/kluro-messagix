@@ -102,6 +102,11 @@ type Thread struct {
 	LastActivity int64    `json:"last_activity_ms,omitempty"`
 	// MembersComplete: participants are the whole roster of an open group.
 	MembersComplete bool `json:"members_complete,omitempty"`
+	// Request: the thread carries a message request mark (pending folder, spam
+	// folder or request status 1); its history is never read while it does, and
+	// the connector stores the fact. Only the positive fact is sent: absent says
+	// nothing, and the helper never infers acceptance from Meta's rows.
+	Request bool `json:"request,omitempty"`
 }
 
 type Person struct {

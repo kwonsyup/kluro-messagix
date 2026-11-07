@@ -263,6 +263,7 @@ type refreshFake struct {
 	overlapped  bool
 	tasks       []socket.FetchThreadsTask
 	startedAt   []time.Time
+	scopes      int                        // first-page requests of other scopes (scanScopes), answered empty
 	reply       func(n int) *table.LSTable // page n, 1-based; nil means an empty page
 	more        func(n int) bool           // whether page n says there is more before it
 	during      func(n int)                // runs while request n is in flight
@@ -277,6 +278,13 @@ func (r *refreshFake) ExecuteTasks(_ context.Context, tasks ...socket.Task) (*ta
 	r.inflight++
 	if r.inflight > 1 {
 		r.overlapped = true
+	}
+	if !isInboxTask(tasks[0]) {
+		// Another scope's first page: it holds none of the inbox's threads.
+		r.scopes++
+		r.inflight--
+		r.mu.Unlock()
+		return &table.LSTable{}, nil
 	}
 	r.tasks = append(r.tasks, *tasks[0].(*socket.FetchThreadsTask))
 	r.startedAt = append(r.startedAt, time.Now())

@@ -146,7 +146,8 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 	}
 
 	// A thread row in the "pending" or "spam" folder, or a message request row with
-	// status 1, marks the thread unaccepted: it is emitted with Typed=false whatever
+	// status 1, marks the thread unaccepted (one exception: a pending Marketplace
+	// thread, see unacceptedLocked): it is emitted with Typed=false whatever
 	// its type, so the connector qualifies nothing from it. Any other non-empty
 	// folder, or a request status other than 1, clears the mark and re-emits the
 	// thread typed; an empty folder does neither. The mark is memory only: after a
@@ -165,14 +166,32 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 		if marks[key] != on {
 			mutate(key)
 		}
-		before := s.unacceptedLocked(key)
+		before, beforeReq := s.unacceptedLocked(key), s.requestMarkedLocked(key)
 		if on {
 			marks[key] = true
 		} else {
 			delete(marks, key)
 		}
-		if s.unacceptedLocked(key) != before && s.threads[wireID(false, key)] != nil {
-			touched[wireID(false, key)] = true
+		// Re-emit whenever what the frame says changes: its acceptance or its
+		// request fact (a status-only row on a Marketplace thread changes only
+		// the latter).
+		if s.unacceptedLocked(key) != before || s.requestMarkedLocked(key) != beforeReq {
+			// The open thread, an encrypted thread this key maps or cuts over to,
+			// and an encrypted thread under the key itself.
+			ids := []string{wireID(false, key), wireID(true, key)}
+			if wa, ok := s.fbToWA[key]; ok {
+				ids = append(ids, wireID(true, wa))
+			}
+			for arm, open := range s.cutover {
+				if open == key {
+					ids = append(ids, wireID(true, arm))
+				}
+			}
+			for _, id := range ids {
+				if s.threads[id] != nil {
+					touched[id] = true
+				}
+			}
 		}
 	}
 	markFolder := func(key int64, folder string) {
@@ -180,8 +199,10 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 		case "":
 		case folderPending, folderSpam:
 			set(s.folderMark, key, true)
+			set(s.spamMark, key, folder == folderSpam)
 		default:
 			set(s.folderMark, key, false)
+			set(s.spamMark, key, false)
 		}
 	}
 	for _, th := range tbl.LSDeleteThenInsertThread {
@@ -213,8 +234,12 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 		t := s.thread(enc, key)
 		s.takePendingLocked(t, originalKey)
 		// Typing is a certification input too: a stale reply keeps the type the live
-		// rows gave the thread.
+		// rows gave the thread, and a live row that changes the type records the
+		// thread's mutation sequence (a pending thread's eligibility depends on it).
 		if typ != table.UNKNOWN_THREAD_TYPE && !stale(originalKey) {
+			if !t.Typed || t.RawType != int64(typ) {
+				mutate(originalKey)
+			}
 			t.Typed = true
 			t.RawType = int64(typ)
 			if typ.IsOneToOne() {
@@ -571,14 +596,21 @@ func threadFrame(t Thread) Frame { return Frame{T: TThread, ThreadEvt: &t} }
 // other person; an encrypted thread names the open thread it continues.
 func (s *messagixSession) wireThreadLocked(t *threadInfo) Thread {
 	if !t.Enc && s.unacceptedLocked(t.Key) {
-		// A message request qualifies for nothing: the connector imports any
+		// A message request (other than a pending Marketplace thread, see
+		// unacceptedLocked) qualifies for nothing: the connector imports any
 		// one-to-one thread that names another person, typed or not, so the frame
 		// carries no kind, no type, no participants and no title (usually the
 		// stranger's name). The real ones stay in
 		// memory and go out when a later row accepts the thread.
-		return Thread{ID: wireID(false, t.Key), LastActivity: t.LastActivity}
+		return Thread{ID: wireID(false, t.Key), LastActivity: t.LastActivity, Request: true}
+	}
+	if t.Enc && s.encMarkedLocked(t.Key, s.requestMarkedLocked) {
+		// An encrypted thread with a request or spam mark is inert as well (and is
+		// never read through History, see historyBlockedLocked).
+		return Thread{ID: wireID(true, t.Key), Encrypted: true, LastActivity: t.LastActivity, Request: true}
 	}
 	out := Thread{ID: wireID(t.Enc, t.Key), Kind: t.Kind, Typed: t.Typed, Title: t.Title, Encrypted: t.Enc, LastActivity: t.LastActivity}
+	out.Request = !t.Enc && s.requestMarkedLocked(t.Key)
 	if t.Enc {
 		if open, ok := s.cutover[t.Key]; ok {
 			out.Predecessor = wireID(false, open)
@@ -610,8 +642,60 @@ func (s *messagixSession) wireThread(t *threadInfo) Thread {
 
 // unacceptedLocked reports whether a facebook thread is a message request or
 // spam by either source. The caller holds s.mu.
+//
+// One kind of request is accepted here: a Marketplace thread (type 5) in the pending
+// folder or with request status 1, never one in spam. A new Marketplace buyer's
+// first message can arrive as a request; it is listed typed, with its roster, so it
+// is imported and can be certified like any other two-person group. Nothing here
+// accepts it on Meta's side: the helper never sends a mark-read or an accept task,
+// and never reads its history (see lightspeedHistory) while it is marked.
+// Only the user's own Send, still behind membersCompleteLocked, replies to it, and
+// Meta treats that reply as accepting the request.
 func (s *messagixSession) unacceptedLocked(key int64) bool {
+	if !s.requestMarkedLocked(key) {
+		return false
+	}
+	return s.spamMark[key] || !s.marketplaceLocked(key)
+}
+
+// requestMarkedLocked reports whether a facebook thread carries a request mark
+// (pending or spam folder, or request status 1), whatever its type: such a thread
+// is never read through History. The caller holds s.mu.
+func (s *messagixSession) requestMarkedLocked(key int64) bool {
 	return s.folderMark[key] || s.statusMark[key]
+}
+
+// encMarkedLocked reports whether pred holds for an encrypted thread's own key, for
+// the open thread a cutover names as its predecessor, or for a facebook key that a
+// hybrid mapping sends to it: the marks of an encrypted thread live under those keys.
+func (s *messagixSession) encMarkedLocked(key int64, pred func(int64) bool) bool {
+	if pred(key) {
+		return true
+	}
+	if open, ok := s.cutover[key]; ok && pred(open) {
+		return true
+	}
+	for fb, wa := range s.fbToWA {
+		if wa == key && pred(fb) {
+			return true
+		}
+	}
+	return false
+}
+
+// threadMarkedLocked reports whether the thread (open or encrypted) carries a request or spam mark.
+func (s *messagixSession) threadMarkedLocked(enc bool, key int64) bool {
+	if enc {
+		return s.encMarkedLocked(key, s.requestMarkedLocked)
+	}
+	return s.requestMarkedLocked(key)
+}
+
+// marketplaceLocked reports whether the open thread under key is typed Marketplace.
+// The caller holds s.mu.
+func (s *messagixSession) marketplaceLocked(key int64) bool {
+	t := s.threads[wireID(false, key)]
+	return t != nil && t.Typed && t.RawType == int64(table.MARKETPLACE)
 }
 
 // emitKnownThreads emits a thread frame for every thread the helper knows. Each
