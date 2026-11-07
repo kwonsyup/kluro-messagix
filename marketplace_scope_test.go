@@ -534,127 +534,56 @@ func TestRequestMarkArrivingMidHistoryStopsEverySend(t *testing.T) {
 	}
 }
 
-// fact is the wire request fact of a frame: "true", "false", or "" when absent.
-func fact(th *Thread) string {
-	switch {
-	case th == nil || th.Request == nil:
-		return ""
-	case *th.Request:
-		return "true"
-	}
-	return "false"
-}
-
-// The thread frame says when a thread carries a request mark, typed (a pending Marketplace thread) or inert, so the
-// connector can keep it out of history across restarts. A thread with no request seen says nothing (unknown); one
-// whose request a later row cleared says false.
+// The thread frame says only the positive request fact: true while the thread carries a request mark, typed (a
+// pending Marketplace thread) or inert; otherwise the field is absent, including after a row clears the mark. The
+// helper never infers acceptance from Meta's rows.
 func TestThreadFrameCarriesTheRequestFact(t *testing.T) {
 	s := newTestSession()
 	frames := s.handleTableFrames(joinTables(marketThread(3005, -1, folderPending), marketThread(3009, -1, folderSpam), marketThread(3003, -1, "inbox")))
-	if th := lastThread(frames, "3005"); fact(th) != "true" || !th.Typed {
-		t.Fatalf("pending Marketplace frame = %+v, want typed with request true", th)
+	if th := lastThread(frames, "3005"); th == nil || !th.Request || !th.Typed {
+		t.Fatalf("pending Marketplace frame = %+v, want typed with request", th)
 	}
-	if th := lastThread(frames, "3009"); fact(th) != "true" || th.Typed {
-		t.Fatalf("spam frame = %+v, want inert with request true", th)
+	if th := lastThread(frames, "3009"); th == nil || !th.Request || th.Typed {
+		t.Fatalf("spam frame = %+v, want inert with request", th)
 	}
-	if th := lastThread(frames, "3003"); fact(th) != "" {
-		t.Fatalf("a thread with no request seen = %q, want unknown (absent)", fact(th))
+	if th := lastThread(frames, "3003"); th == nil || th.Request {
+		t.Fatalf("accepted frame = %+v, want no request", th)
 	}
 	b, _ := json.Marshal(lastThread(frames, "3005"))
 	if !strings.Contains(string(b), `"request":true`) {
 		t.Fatalf("wire = %s", b)
 	}
-	b, _ = json.Marshal(lastThread(frames, "3003"))
-	if strings.Contains(string(b), `"request"`) {
-		t.Fatalf("an unknown request fact must be absent on the wire: %s", b)
-	}
-	frames = s.handleTableFrames(&table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 3005, ThreadType: table.MARKETPLACE, FolderName: "inbox"}}})
-	if th := lastThread(frames, "3005"); fact(th) != "false" {
-		t.Fatalf("accepted later = %q, want an explicit false", fact(th))
-	}
-	b, _ = json.Marshal(lastThread(frames, "3005"))
-	if !strings.Contains(string(b), `"request":false`) {
-		t.Fatalf("wire = %s", b)
+	frames = s.handleTableFrames(&table.LSTable{
+		LSUpdateOrInsertThread:           []*table.LSUpdateOrInsertThread{{ThreadKey: 3005, ThreadType: table.MARKETPLACE, FolderName: "inbox"}},
+		LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 3005, MessageRequestStatus: 0}},
+	})
+	th := lastThread(frames, "3005")
+	b, _ = json.Marshal(th)
+	if th == nil || th.Request || strings.Contains(string(b), `"request"`) {
+		t.Fatalf("a cleared mark must leave the field absent, never false: %s", b)
 	}
 }
 
-// Round 4, item 1: a status-only request row on an imported Marketplace thread (which stays typed and accepted for
-// listing) still re-emits the thread with the new request fact: true on status 1, then an explicit false on status 0.
+// A status-only request row on an imported Marketplace thread (which stays typed and accepted for listing) still
+// re-emits the thread when its request fact changes: request true on status 1, the field absent once status 0
+// drops the mark; an unchanged fact is not re-emitted.
 func TestStatusOnlyRowsReemitAMarketplaceThreadsRequestFact(t *testing.T) {
 	s := newTestSession()
 	frames := s.handleTableFrames(marketThread(3005, -1, "inbox"))
-	if th := lastThread(frames, "3005"); th == nil || fact(th) != "" {
-		t.Fatalf("premise: imported with an unknown request fact: %+v", th)
+	if th := lastThread(frames, "3005"); th == nil || th.Request {
+		t.Fatalf("premise: imported with no request: %+v", th)
 	}
 	status := func(v int64) *table.LSTable {
 		return &table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 3005, MessageRequestStatus: v}}}
 	}
 	frames = s.handleTableFrames(status(1))
-	if th := lastThread(frames, "3005"); th == nil || fact(th) != "true" || !th.Typed {
-		t.Fatalf("status 1 alone: frame = %+v, want a typed frame with request true", th)
+	if th := lastThread(frames, "3005"); th == nil || !th.Request || !th.Typed {
+		t.Fatalf("status 1 alone: frame = %+v, want a typed frame with request", th)
 	}
-	frames = s.handleTableFrames(status(1))
-	if th := lastThread(frames, "3005"); th != nil {
-		t.Fatalf("an unchanged fact re-emitted: %+v", th)
+	if frames = s.handleTableFrames(status(1)); lastThread(frames, "3005") != nil {
+		t.Fatal("an unchanged fact re-emitted")
 	}
-	frames = s.handleTableFrames(status(0))
-	if th := lastThread(frames, "3005"); th == nil || fact(th) != "false" {
-		t.Fatalf("status 0 alone: frame = %+v, want request false", th)
-	}
-}
-
-// P2 (round 4 regression): a restarted helper has seen no request mark, yet an explicit request status 0 together with
-// an explicit non-request folder is proof on its own that the thread is not a request: the frame says false, so the
-// connector can clear a request it stored before the restart and reopen backfill. Either row alone, or a row with no
-// status or no folder, leaves the fact absent. The change frame goes out once; a mark later starts over.
-func TestStatusZeroAndInboxFolderClearWithoutAMarkSeen(t *testing.T) {
-	status := func(v int64) *table.LSTable {
-		return &table.LSTable{LSDeleteThenInsertMessageRequest: []*table.LSDeleteThenInsertMessageRequest{{ThreadKey: 3005, MessageRequestStatus: v}}}
-	}
-	folder := func(f string) *table.LSTable {
-		return &table.LSTable{LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 3005, ThreadType: table.MARKETPLACE, FolderName: f}}}
-	}
-	for name, steps := range map[string][]*table.LSTable{
-		"one table":          {joinTables(marketThread(3005, -1, "inbox"), status(0))},
-		"status, then inbox": {marketThread(3005, -1, ""), status(0), folder("inbox")},
-		"inbox, then status": {marketThread(3005, -1, "inbox"), status(0)},
-	} {
-		t.Run(name, func(t *testing.T) {
-			s := newTestSession() // a restarted helper: no mark seen
-			var frames []Frame
-			for _, tbl := range steps {
-				frames = append(frames, s.handleTableFrames(tbl)...)
-			}
-			if th := lastThread(frames, "3005"); fact(th) != "false" || !th.Typed {
-				t.Fatalf("frame = %+v, want typed with request false", th)
-			}
-			if again := s.handleTableFrames(status(0)); lastThread(again, "3005") != nil {
-				t.Fatal("the clearing frame went out again with nothing changed")
-			}
-			// marked again, then cleared again: a new false
-			if th := lastThread(s.handleTableFrames(status(1)), "3005"); fact(th) != "true" {
-				t.Fatalf("marked again = %q", fact(th))
-			}
-			if th := lastThread(s.handleTableFrames(status(0)), "3005"); fact(th) != "false" {
-				t.Fatalf("cleared again = %q", fact(th))
-			}
-		})
-	}
-	for name, steps := range map[string][]*table.LSTable{
-		"inbox, no status row":           {marketThread(3005, -1, "inbox")},
-		"status 0, no folder":            {marketThread(3005, -1, ""), status(0)},
-		"status 0, pending folder":       {marketThread(3005, -1, folderPending), status(0)},
-		"status 0 then a folderless row": {status(0), marketThread(3005, -1, "")},
-	} {
-		t.Run("absent: "+name, func(t *testing.T) {
-			s := newTestSession()
-			var frames []Frame
-			for _, tbl := range steps {
-				frames = append(frames, s.handleTableFrames(tbl)...)
-			}
-			if th := lastThread(frames, "3005"); th == nil || fact(th) == "false" {
-				t.Fatalf("frame = %+v (fact %q), want no false without both explicit rows", th, fact(th))
-			}
-		})
+	if th := lastThread(s.handleTableFrames(status(0)), "3005"); th == nil || th.Request {
+		t.Fatalf("status 0 alone: frame = %+v, want the field absent", th)
 	}
 }

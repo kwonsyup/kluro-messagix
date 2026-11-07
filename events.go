@@ -166,29 +166,16 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 		if marks[key] != on {
 			mutate(key)
 		}
-		before, beforeReq := s.unacceptedLocked(key), s.requestStateLocked(key)
+		before, beforeReq := s.unacceptedLocked(key), s.requestMarkedLocked(key)
 		if on {
 			marks[key] = true
 		} else {
 			delete(marks, key)
 		}
-		// The request fact on the frame: true while marked; false only on
-		// positive evidence: a clearing row after a mark seen this run, or, with
-		// no mark seen (a restarted helper), both an explicit request status 0
-		// and an explicit non-request folder; else unknown. Evidence counts only
-		// once it postdates the last mark.
-		if s.requestMarkedLocked(key) {
-			s.requestSeen[key] = true
-			delete(s.requestCleared, key)
-			delete(s.statusZero, key)
-			delete(s.plainFolder, key)
-		} else if !on && (s.requestSeen[key] || (s.statusZero[key] && s.plainFolder[key])) {
-			s.requestCleared[key] = true
-		}
 		// Re-emit whenever what the frame says changes: its acceptance or its
 		// request fact (a status-only row on a Marketplace thread changes only
 		// the latter).
-		if (s.unacceptedLocked(key) != before || s.requestStateLocked(key) != beforeReq) && s.threads[wireID(false, key)] != nil {
+		if (s.unacceptedLocked(key) != before || s.requestMarkedLocked(key) != beforeReq) && s.threads[wireID(false, key)] != nil {
 			touched[wireID(false, key)] = true
 		}
 	}
@@ -199,9 +186,6 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 			set(s.folderMark, key, true)
 			set(s.spamMark, key, folder == folderSpam)
 		default:
-			if !stale(key) {
-				s.plainFolder[key] = true
-			}
 			set(s.folderMark, key, false)
 			set(s.spamMark, key, false)
 		}
@@ -217,9 +201,6 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 	}
 	for _, r := range tbl.LSDeleteThenInsertMessageRequest {
 		// MessageRequestStatus 1 means the thread is in the pending folder.
-		if r.MessageRequestStatus == 0 && !stale(r.ThreadKey) {
-			s.statusZero[r.ThreadKey] = true
-		}
 		set(s.statusMark, r.ThreadKey, r.MessageRequestStatus == 1)
 	}
 	upsertThread := func(key int64, typ table.ThreadType, name string, last int64) {
@@ -606,12 +587,10 @@ func (s *messagixSession) wireThreadLocked(t *threadInfo) Thread {
 		// carries no kind, no type, no participants and no title (usually the
 		// stranger's name). The real ones stay in
 		// memory and go out when a later row accepts the thread.
-		return Thread{ID: wireID(false, t.Key), LastActivity: t.LastActivity, Request: requestFact(1)}
+		return Thread{ID: wireID(false, t.Key), LastActivity: t.LastActivity, Request: true}
 	}
 	out := Thread{ID: wireID(t.Enc, t.Key), Kind: t.Kind, Typed: t.Typed, Title: t.Title, Encrypted: t.Enc, LastActivity: t.LastActivity}
-	if !t.Enc {
-		out.Request = requestFact(s.requestStateLocked(t.Key))
-	}
+	out.Request = !t.Enc && s.requestMarkedLocked(t.Key)
 	if t.Enc {
 		if open, ok := s.cutover[t.Key]; ok {
 			out.Predecessor = wireID(false, open)
@@ -657,29 +636,6 @@ func (s *messagixSession) unacceptedLocked(key int64) bool {
 		return false
 	}
 	return s.spamMark[key] || !s.marketplaceLocked(key)
-}
-
-// requestStateLocked is the thread's request fact: 1 while it carries a request
-// mark; -1 on positive evidence that it is not one (a clearing row after a mark
-// seen this run, or an explicit status 0 together with an explicit non-request
-// folder); 0 when unknown. The caller holds s.mu.
-func (s *messagixSession) requestStateLocked(key int64) int {
-	switch {
-	case s.requestMarkedLocked(key):
-		return 1
-	case s.requestCleared[key]:
-		return -1
-	}
-	return 0
-}
-
-// requestFact is a request state as the wire carries it: true, false, or absent.
-func requestFact(state int) *bool {
-	if state == 0 {
-		return nil
-	}
-	v := state > 0
-	return &v
 }
 
 // requestMarkedLocked reports whether a facebook thread carries a request mark

@@ -87,10 +87,6 @@ type messagixSession struct {
 	fbToWA         map[int64]int64                                                                                    // facebook thread key -> encrypted chat id (hybrid threads)
 	folderMark     map[int64]bool                                                                                     // facebook thread keys whose latest non-empty folder is pending or spam (memory only)
 	statusMark     map[int64]bool                                                                                     // ... whose latest message request status row is 1 (memory only)
-	requestSeen    map[int64]bool                                                                                     // facebook thread keys that carried a request mark this run (memory only)
-	statusZero     map[int64]bool                                                                                     // ... with an explicit request status 0 row since their last mark (memory only)
-	plainFolder    map[int64]bool                                                                                     // ... with an explicit non-request folder row since their last mark (memory only)
-	requestCleared map[int64]bool                                                                                     // ... whose mark a later row cleared: positive evidence they are not requests
 	spamMark       map[int64]bool                                                                                     // ... whose latest non-empty folder is spam (memory only)
 	scopeFolders   map[int64]bool                                                                                     // group-1 parents the last listing's range rows named (guarded by mu)
 	scopeLogged    string                                                                                             // the last thread scope diagnostic logged (guarded by mu)
@@ -175,25 +171,21 @@ func parseWire(id string) (enc bool, key int64, ok bool) {
 
 func newSession() *messagixSession {
 	return &messagixSession{
-		connEpoch:      1,
-		rosterMut:      map[int64]int64{},
-		walkSem:        make(chan struct{}, 1),
-		threads:        map[string]*threadInfo{},
-		participants:   map[int64][]pendingParticipant{},
-		names:          map[int64]string{},
-		cutover:        map[int64]int64{},
-		fbToWA:         map[int64]int64{},
-		folderMark:     map[int64]bool{},
-		statusMark:     map[int64]bool{},
-		spamMark:       map[int64]bool{},
-		requestSeen:    map[int64]bool{},
-		requestCleared: map[int64]bool{},
-		statusZero:     map[int64]bool{},
-		plainFolder:    map[int64]bool{},
-		rowKeys:        map[int64]bool{},
-		encRowKeys:     map[int64]bool{},
-		msgIndex:       map[string]string{},
-		collectors:     map[int64]*pageCollector{},
+		connEpoch:    1,
+		rosterMut:    map[int64]int64{},
+		walkSem:      make(chan struct{}, 1),
+		threads:      map[string]*threadInfo{},
+		participants: map[int64][]pendingParticipant{},
+		names:        map[int64]string{},
+		cutover:      map[int64]int64{},
+		fbToWA:       map[int64]int64{},
+		folderMark:   map[int64]bool{},
+		statusMark:   map[int64]bool{},
+		spamMark:     map[int64]bool{},
+		rowKeys:      map[int64]bool{},
+		encRowKeys:   map[int64]bool{},
+		msgIndex:     map[string]string{},
+		collectors:   map[int64]*pageCollector{},
 	}
 }
 
