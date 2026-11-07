@@ -361,7 +361,7 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 	}
 	for _, e := range tbl.LSEditMessage {
 		thread, ok := s.msgIndex[e.MessageID]
-		if !ok || s.withheldLocked(thread) {
+		if !ok {
 			continue
 		}
 		// The edit row names no editor, and the msgIndex holds only the thread:
@@ -373,9 +373,6 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 		thread := wireID(enc, key)
 		if indexed := s.msgIndex[d.MessageId]; indexed != "" {
 			thread = indexed
-		}
-		if s.withheldLocked(thread) {
-			continue
 		}
 		// By may name only the actor from the unsend event itself; the delete
 		// row carries none (LSDeleteMessage is just thread key and message id),
@@ -613,9 +610,6 @@ func (s *messagixSession) wireThreadLocked(t *threadInfo) Thread {
 		return Thread{ID: wireID(true, t.Key), Encrypted: true, LastActivity: t.LastActivity, Request: true}
 	}
 	out := Thread{ID: wireID(t.Enc, t.Key), Kind: t.Kind, Typed: t.Typed, Title: t.Title, Encrypted: t.Enc, LastActivity: t.LastActivity}
-	if t.Typed {
-		t.qualified = true
-	}
 	out.Request = !t.Enc && s.requestMarkedLocked(t.Key)
 	if t.Enc {
 		if open, ok := s.cutover[t.Key]; ok {
@@ -689,31 +683,12 @@ func (s *messagixSession) encMarkedLocked(key int64, pred func(int64) bool) bool
 	return false
 }
 
-func (s *messagixSession) spamMarkedLocked(key int64) bool { return s.spamMark[key] }
-
 // threadMarkedLocked reports whether the thread (open or encrypted) carries a request or spam mark.
 func (s *messagixSession) threadMarkedLocked(enc bool, key int64) bool {
 	if enc {
 		return s.encMarkedLocked(key, s.requestMarkedLocked)
 	}
 	return s.requestMarkedLocked(key)
-}
-
-// withheldLocked reports whether a thread's message, edit and unsend events must not
-// go out: the thread is spam-marked, or inert after the connector was given it typed.
-// The production connector keeps a thread's earlier qualified state across a later inert
-// frame, so it would keep importing its messages. Nothing is dropped from helper state:
-// the event is only not emitted (live frames carry no ack wait; an encrypted message is
-// acknowledged to the server, and History reads it again once the mark clears).
-func (s *messagixSession) withheldLocked(thread string) bool {
-	t := s.threads[thread]
-	if t == nil {
-		return false
-	}
-	if t.Enc {
-		return s.encMarkedLocked(t.Key, s.spamMarkedLocked) || (t.qualified && s.encMarkedLocked(t.Key, s.requestMarkedLocked))
-	}
-	return s.spamMark[t.Key] || (t.qualified && s.unacceptedLocked(t.Key))
 }
 
 // marketplaceLocked reports whether the open thread under key is typed Marketplace.
@@ -807,9 +782,6 @@ func (s *messagixSession) messageFrameLocked(m *table.WrappedMessage) []Frame {
 	msg.Thread = thread
 	msg.Out = m.SenderId == s.selfID
 	s.indexMessageLocked(msg.ID, thread)
-	if s.withheldLocked(thread) {
-		return nil
-	}
 	// The thread must be known before its first message.
 	var frames []Frame
 	if s.threads[thread] == nil {
@@ -1007,16 +979,12 @@ func (s *messagixSession) waMessageFrames(evt *events.FBMessage) []Frame {
 	}
 	thread := wireID(true, chatID)
 	waID := "wa:" + evt.Info.ID
-	withheld := s.withheldLocked(thread)
 
 	if app != nil {
 		// Both edit and unsend name the actor: senderID is the event's own
 		// sender, never the original message's author from the msgIndex.
 		switch content := app.GetPayload().GetContent().GetContent().(type) {
 		case *waConsumerApplication.ConsumerApplication_Content_EditMessage:
-			if withheld {
-				return frames
-			}
 			target := "wa:" + content.EditMessage.GetKey().GetID()
 			text := content.EditMessage.GetMessage().GetText()
 			return append(frames, Frame{T: TEdit, Edit: &Edit{Thread: thread, ID: target, Text: text, By: strconv.FormatInt(senderID, 10), AtMS: content.EditMessage.GetTimestampMS()}})
@@ -1024,9 +992,6 @@ func (s *messagixSession) waMessageFrames(evt *events.FBMessage) []Frame {
 			return frames
 		}
 		if rev := app.GetPayload().GetApplicationData().GetRevoke(); rev != nil {
-			if withheld {
-				return frames
-			}
 			target := "wa:" + rev.GetKey().GetID()
 			return append(frames, Frame{T: TUnsend, Unsend: &Unsend{Thread: thread, ID: target, By: strconv.FormatInt(senderID, 10)}})
 		}
@@ -1040,9 +1005,6 @@ func (s *messagixSession) waMessageFrames(evt *events.FBMessage) []Frame {
 		Text: text, Media: media, ReplyTo: reply, SentMS: evt.Info.Timestamp.UnixMilli(), Encrypted: true,
 	}
 	s.indexMessageLocked(waID, thread)
-	if withheld {
-		return frames
-	}
 	return append(frames, Frame{T: TMessage, Message: &msg})
 }
 

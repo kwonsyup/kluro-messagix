@@ -92,13 +92,15 @@ func (s *messagixSession) lightspeedHistory(ctx context.Context, thread string, 
 	// Every send rechecks the request marks: a row that marks the thread while
 	// this call waits stops the re-request and any further page.
 	//
-	// Accepted residuals, narrower than before: (1) the check-to-dispatch window: a
-	// mark applied between this check and the socket write (the library sends and
-	// waits in one call, on the loop that applies marks, so no lock can span both)
-	// can still be fetched; (2) after a restart, a request thread beyond the first
-	// page of every request scope is not seen by the scan, so once the scan has
-	// completed cleanly it reads as an ordinary unseen thread. Do not promise zero
-	// fetches.
+	// Accepted residuals: (1) the check-to-dispatch window: a mark applied between
+	// this check and the socket write (the library sends and waits in one call,
+	// on the loop that applies marks, so no lock can span both) can still be
+	// fetched. (2) After a restart, a request thread beyond a request scope's
+	// first page, or on a parent omitted by the 8-parent cap, can receive
+	// REPEATED fetches (there is no one-fetch bound) until a mark is learned.
+	// (3) A pending thread moved to spam keeps importing live messages, because
+	// the connector keeps its earlier qualified state; this is pre-existing
+	// connector behaviour, with no Meta-side effect.
 	request := func(ts int64, id string) error {
 		s.mu.Lock()
 		marked := s.historyBlockedLocked(false, key)

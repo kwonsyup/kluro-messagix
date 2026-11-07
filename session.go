@@ -127,13 +127,10 @@ type messagixSession struct {
 
 // threadInfo is the merged view of one thread; the wire Thread is built from it.
 type threadInfo struct {
-	Key   int64 // facebook thread key, or the encrypted chat id
-	Enc   bool
-	Kind  string // "user" or "group"
-	Typed bool
-	// qualified: a non-inert typed frame went out for this thread, so the connector
-	// may hold it as qualified (it keeps that state across a later inert frame).
-	qualified    bool
+	Key          int64 // facebook thread key, or the encrypted chat id
+	Enc          bool
+	Kind         string // "user" or "group"
+	Typed        bool
 	Title        string
 	LastActivity int64
 	Participants []int64 // ordered, deduplicated
