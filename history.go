@@ -66,7 +66,7 @@ func (s *messagixSession) lightspeedHistory(ctx context.Context, thread string, 
 	if cli == nil && s.client != nil {
 		cli = s.client
 	}
-	if _, busy := s.collectors[key]; busy || cli == nil || s.requestMarkedLocked(key) {
+	if _, busy := s.collectors[key]; busy || cli == nil || s.historyBlockedLocked(false, key) {
 		s.mu.Unlock()
 		return nil, errCode("unavailable")
 	}
@@ -92,14 +92,16 @@ func (s *messagixSession) lightspeedHistory(ctx context.Context, thread string, 
 	// Every send rechecks the request marks: a row that marks the thread while
 	// this call waits stops the re-request and any further page.
 	//
-	// Accepted residual: this narrows, it does not close. A mark applied between
-	// this check and the socket write (the library sends and waits in one call,
-	// on the loop that applies marks, so no lock can span both), or a thread read
-	// before any request fact reached the helper, can still be fetched. Do not
-	// promise zero fetches or bounded request-fact arrival time.
+	// Accepted residuals, narrower than before: (1) the check-to-dispatch window: a
+	// mark applied between this check and the socket write (the library sends and
+	// waits in one call, on the loop that applies marks, so no lock can span both)
+	// can still be fetched; (2) after a restart, a request thread beyond the first
+	// page of every request scope is not seen by the scan, so once the scan has
+	// completed cleanly it reads as an ordinary unseen thread. Do not promise zero
+	// fetches.
 	request := func(ts int64, id string) error {
 		s.mu.Lock()
-		marked := s.requestMarkedLocked(key)
+		marked := s.historyBlockedLocked(false, key)
 		s.mu.Unlock()
 		if marked {
 			return errRequestMarked
@@ -154,6 +156,35 @@ func (s *messagixSession) lightspeedHistory(ctx context.Context, thread string, 
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
+}
+
+// historyBlockedLocked reports whether History must not read the thread now: it
+// carries a request or spam mark (open or encrypted alike), or this session has not
+// observed it (a row of the inbox walk, a scope scan or a live table) and the first
+// scope scan has not yet completed with every request scope answered. Until then a
+// thread the connector imported before a restart may be a request whose mark this
+// session has not learned. A thread seen without a mark is readable at once; once a
+// clean scan has finished, an unseen thread is, by elimination, not on a request
+// scope's first page. Evaluated before every dispatch, not only at entry. If the scan
+// keeps failing, unseen threads stay unavailable. The connector gives up on a thread
+// after five unavailable answers, but that count is per run and in memory only
+// (kluro-agent 0d212504 messenger_runner.go:2378), so a runner restart tries again.
+// The caller holds s.mu.
+func (s *messagixSession) historyBlockedLocked(enc bool, key int64) bool {
+	if s.threadMarkedLocked(enc, key) {
+		return true
+	}
+	if s.scopeScanClean || s.rowKeys[key] || s.encRowKeys[key] {
+		return false
+	}
+	if enc {
+		for fb, wa := range s.fbToWA {
+			if wa == key && s.rowKeys[fb] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // errRequestMarked is a History send withheld because the thread carries a
@@ -213,8 +244,9 @@ func (s *messagixSession) encryptedHistory(ctx context.Context, thread string, k
 	cli := s.client
 	t := s.threads[thread]
 	open, linked := s.cutover[key]
+	blocked := s.historyBlockedLocked(true, key)
 	s.mu.Unlock()
-	if cli == nil {
+	if cli == nil || blocked {
 		return nil, errCode("unavailable")
 	}
 	if dev == nil || dev.ID == "" {
@@ -230,6 +262,13 @@ func (s *messagixSession) encryptedHistory(ctx context.Context, thread string, k
 	}
 	isGroup := t != nil && t.Kind == "group"
 	chatUser := strconv.FormatInt(key, 10)
+	// Recheck right before the dispatch, as the open-thread path does.
+	s.mu.Lock()
+	blocked = s.historyBlockedLocked(true, key)
+	s.mu.Unlock()
+	if blocked {
+		return nil, errCode("unavailable")
+	}
 	archive, err := cli.GetSecureHistoryClient().FetchMessages(ctx, dev, chatUser, true, timestamp, count)
 	if err != nil {
 		return nil, mapAuthOrUnknown(err)
@@ -672,6 +711,13 @@ func (s *messagixSession) scanScopes(ctx context.Context, cli threadPager, emit 
 		if done != nil && done() {
 			return pages, failed, nil
 		}
+	}
+	if failed == 0 {
+		// Every request scope answered: History may now read a thread this session
+		// has not seen (see historyBlockedLocked).
+		s.mu.Lock()
+		s.scopeScanClean = true
+		s.mu.Unlock()
 	}
 	return pages, failed, nil
 }

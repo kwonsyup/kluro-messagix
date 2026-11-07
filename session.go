@@ -88,6 +88,7 @@ type messagixSession struct {
 	folderMark     map[int64]bool                                                                                     // facebook thread keys whose latest non-empty folder is pending or spam (memory only)
 	statusMark     map[int64]bool                                                                                     // ... whose latest message request status row is 1 (memory only)
 	spamMark       map[int64]bool                                                                                     // ... whose latest non-empty folder is spam (memory only)
+	scopeScanClean bool                                                                                               // a scope scan of this session finished with every request scope answered (guarded by mu)
 	scopeFolders   map[int64]bool                                                                                     // group-1 parents the last listing's range rows named (guarded by mu)
 	scopeLogged    string                                                                                             // the last thread scope diagnostic logged (guarded by mu)
 	e2eeOffline    int                                                                                                // queued E2EE messages the server said it would flush at connect (OfflineSyncPreview), count only
@@ -126,10 +127,13 @@ type messagixSession struct {
 
 // threadInfo is the merged view of one thread; the wire Thread is built from it.
 type threadInfo struct {
-	Key          int64 // facebook thread key, or the encrypted chat id
-	Enc          bool
-	Kind         string // "user" or "group"
-	Typed        bool
+	Key   int64 // facebook thread key, or the encrypted chat id
+	Enc   bool
+	Kind  string // "user" or "group"
+	Typed bool
+	// qualified: a non-inert typed frame went out for this thread, so the connector
+	// may hold it as qualified (it keeps that state across a later inert frame).
+	qualified    bool
 	Title        string
 	LastActivity int64
 	Participants []int64 // ordered, deduplicated

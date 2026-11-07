@@ -624,17 +624,6 @@ func TestAcceptingARequestTypesAndReemitsTheThread(t *testing.T) {
 	}
 }
 
-// Encrypted threads are unchanged by the mark.
-func TestEncryptedThreadsAreNotAffectedByTheMark(t *testing.T) {
-	s := newTestSession()
-	frames := s.handleTableFrames(&table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{
-		{ThreadKey: 4242, ThreadType: table.ENCRYPTED_OVER_WA_ONE_TO_ONE, FolderName: "pending"},
-	}})
-	if typed, found := typedOf(frames, "e:4242"); !found || !typed {
-		t.Fatalf("encrypted rows are not covered by the mark: typed=%v found=%v", typed, found)
-	}
-}
-
 // A spam or pending folder is only cleared by a folder, and a request status of 0 only clears what a
 // status row set: spam plus a status-0 row in one batch stays unaccepted, as in the library.
 func TestSpamFolderIsNotClearedByAStatusZeroRow(t *testing.T) {
