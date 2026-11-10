@@ -418,9 +418,19 @@ var _ = waTypes.MessengerServer
 // at the 500 ms delay a walk makes at most 50 requests over about 25 s. Reaching the cap
 // ends the walk incomplete with inbox_stop 4 and saves its continuation (see pageThreads),
 // so an inbox longer than the cap is covered over several walks.
+//
+// inboxRangeWait bounds how long one page waits for its range on a later frame when its
+// reply carried none (see awaitInboxRange). A row that arrives ends the wait at once, so
+// the full bound is paid only by a page that gets no range, and that page ends the walk
+// (stop 2): at most once per walk, about 3% of the connector's 5-minute relist, and the
+// longest the walk slot (History, the roster refresh) is held beyond today. 10 s is
+// twice the library's own ack timeout (dgw AckTimeout, 5 s) and a third of the time it
+// gives a one-off request's data frame (dgw ResponseTimeout, 30 s): a range the server
+// sends for the same request that comes later than that is treated as never sent.
 var (
 	threadBatchLimit = 50
 	threadBatchDelay = 500 * time.Millisecond
+	inboxRangeWait   = 10 * time.Second
 )
 
 // threadPager is the part of the messagix client the thread listing uses. The listing
@@ -506,18 +516,24 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit
 	stats["inbox_rows_parent0_more"] = rows.parent0More
 	stats["inbox_rows_parent0_end"] = rows.parent0End
 	stats["inbox_rows_other_parent"] = rows.other
+	stats["inbox_rows_inbox_table"] = rows.inboxTable
+	stats["inbox_rows_v2"] = rows.v2
+	stats["inbox_rows_late"] = rows.late
+	stats["inbox_pages_late"] = rows.latePages
 	stats["scope_parents"], stats["scope_pages"], stats["scope_failed"] = len(parents), scopePages, failed
 	return listingDone{Stats: stats, Gap: gap}, nil
 }
 
 // pageThreads walks sync group 1 from its first page. Each reply goes through the
 // normal table path; the next page is addressed by the group-1 range row of that
-// same reply (its minimum thread key and minimum activity time); the requested parent
-// stays fixed. The walk is complete only when a reply says there is nothing more before.
-// A reply with no deciding range row, a range that does not move, or the page bound ends it
+// same reply (its minimum thread key and minimum activity time), or, when the reply
+// has none, of a later frame within inboxRangeWait (see walkInbox); the requested
+// parent stays fixed. The walk is complete only when a range row says there is nothing
+// more before. No range row, a range that does not move, or the page bound ends it
 // incomplete. The group-1 cursor is read from the library once per request, as its
 // own page fetch does; nothing is written to the library.
-// Inbox stop codes: 0 complete, 1 no table, 2 no range, 3 no movement, 4 page bound.
+// Inbox stop codes: 0 complete, 1 no table, 2 no range (none in the reply nor on a
+// later frame within inboxRangeWait), 3 no movement, 4 page bound.
 //
 // A walk that ends at the page bound keeps its continuation position in s.inboxResume,
 // and the next walk of this session resumes there, so an inbox longer than the cap is
@@ -550,8 +566,15 @@ var inboxTop = socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, Referenc
 // shared walk state: pageThreads keeps inboxResume, and the roster refresh passes its
 // own start, limit and done. When done is set it is checked after each page is
 // applied; true ends the walk with stop code 5 (nothing more wanted).
+//
+// A page's range is read from its reply first. When the reply decides nothing, the
+// page waits up to inboxRangeWait for a range row that a later frame carries to the
+// live table path (see awaitInboxRange), as upstream waits for the range after each
+// page (connector/threadbackfill.go). The watch is opened before the request is sent,
+// so a live row that overtakes the reply is kept. No range in that window is stop 2.
 func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit emitFunc, rows *inboxRowCounts, ref socket.FetchThreadsTask, limit int, done func() bool) (gap string, stop, pages int, next socket.FetchThreadsTask, err error) {
 	const group = 1
+	defer s.watchRanges(nil)
 	for batch := 0; batch < limit; batch++ {
 		if err := ctx.Err(); err != nil {
 			return "", 0, pages, ref, err
@@ -559,6 +582,8 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 		task := ref
 		task.Cursor = cli.GetCursor(group)
 		task.SyncGroup = group
+		watch := newRangeWatch()
+		s.watchRanges(watch)
 		tbl, err := s.fetchPage(ctx, cli, emit, task)
 		if err != nil {
 			return "", 0, pages, ref, err
@@ -573,14 +598,20 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 		if done != nil && done() {
 			return "", 5, pages, ref, nil
 		}
-		rng := group1Range(tbl, inboxParentKey, rows)
+		rng := replyRange(tbl, rows)
+		if rng == nil {
+			if rng, err = s.awaitInboxRange(ctx, watch, ref, rows); err != nil {
+				return "", 0, pages, ref, err
+			}
+		}
+		s.watchRanges(nil)
 		if rng == nil {
 			return gapInboxIncomplete, 2, pages, ref, nil
 		}
-		if !rng.HasMoreBefore {
+		if !rng.more {
 			return "", 0, pages, ref, nil
 		}
-		next := socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, ReferenceThreadKey: rng.MinThreadKey, ReferenceActivityTimestamp: rng.MinLastActivityTimestampMS}
+		next := socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, ReferenceThreadKey: rng.minKey, ReferenceActivityTimestamp: rng.minTS}
 		if next.ParentThreadKey == ref.ParentThreadKey && next.ReferenceThreadKey == ref.ReferenceThreadKey && next.ReferenceActivityTimestamp == ref.ReferenceActivityTimestamp {
 			return gapInboxIncomplete, 3, pages, ref, nil
 		}
@@ -879,39 +910,215 @@ func scopeCode(t *scopeTally, parents []int64, failed bool) string {
 	return code
 }
 
-// inboxRowCounts accumulates only group-1 row categories for one walk.
+// inboxRowCounts accumulates the range rows one walk read, counts only. The first five
+// are the group-1 LSUpsertSyncGroupThreadsRange rows of the replies, by category, as
+// before; inboxTable and v2 count the other two range tables' rows, in replies and
+// later frames alike; late counts the range rows (any of the three tables) that later
+// frames carried while a page waited, and latePages the pages a later frame decided.
 type inboxRowCounts struct {
 	total, inbox, parent0More, parent0End, other int
+	inboxTable, v2, late, latePages              int
 }
 
-// group1Range retains the last inbox or parent-0 end decision. If neither is
-// present, the last parent-0 more row supplies a cursor. Other parents never
-// decide the walk. The request parent remains fixed at inboxParentKey.
-func group1Range(tbl *table.LSTable, parent int64, counts *inboxRowCounts) *table.LSUpsertSyncGroupThreadsRange {
-	var out, fallback *table.LSUpsertSyncGroupThreadsRange
-	for _, r := range tbl.LSUpsertSyncGroupThreadsRange {
-		if r.SyncGroup != 1 {
-			continue
+// walkRange is one page's range decision: more says whether the walk goes on, and
+// from where (the minimum thread key and activity time of what the page held).
+type walkRange struct {
+	more          bool
+	minKey, minTS int64
+}
+
+// rangeRows is the inbox range rows of one or more tables, from the three tables the
+// server writes a thread range to (upstream logs the same three, connector
+// handlemeta.go). Sync-group and inbox rows are kept for sync group 1 only; the V2
+// table carries no sync group, so all its rows are kept.
+type rangeRows struct {
+	sync  []*table.LSUpsertSyncGroupThreadsRange
+	inbox []*table.LSUpsertInboxThreadsRange
+	v2    []*table.LSUpdateThreadsRangesV2
+}
+
+func rangeRowsOf(tbl *table.LSTable) rangeRows {
+	var r rangeRows
+	if tbl == nil {
+		return r
+	}
+	for _, row := range tbl.LSUpsertSyncGroupThreadsRange {
+		if row.SyncGroup == 1 {
+			r.sync = append(r.sync, row)
 		}
+	}
+	for _, row := range tbl.LSUpsertInboxThreadsRange {
+		if row.SyncGroup == 1 {
+			r.inbox = append(r.inbox, row)
+		}
+	}
+	r.v2 = append(r.v2, tbl.LSUpdateThreadsRangesV2...)
+	return r
+}
+
+func (r rangeRows) len() int { return len(r.sync) + len(r.inbox) + len(r.v2) }
+
+func (r *rangeRows) add(o rangeRows) {
+	r.sync = append(r.sync, o.sync...)
+	r.inbox = append(r.inbox, o.inbox...)
+	r.v2 = append(r.v2, o.v2...)
+}
+
+// answering keeps the rows that can answer a request at ref: a page holds threads
+// before its reference, so a row whose minimum activity is newer than ref's is another
+// request's; and a row that says more at exactly ref's position would not move the
+// walk. Applied to rows from later frames only, which carry no request id: the window,
+// the sync group, the parent and this position are what tie such a row to the page.
+func (r rangeRows) answering(ref socket.FetchThreadsTask) rangeRows {
+	ok := func(more bool, key, ts int64) bool {
+		if ts > ref.ReferenceActivityTimestamp {
+			return false
+		}
+		return !more || key != ref.ReferenceThreadKey || ts != ref.ReferenceActivityTimestamp
+	}
+	var out rangeRows
+	for _, row := range r.sync {
+		if ok(row.HasMoreBefore, row.MinThreadKey, row.MinLastActivityTimestampMS) {
+			out.sync = append(out.sync, row)
+		}
+	}
+	for _, row := range r.inbox {
+		if ok(row.HasMoreBefore, row.MinThreadKey, row.MinLastActivityTimestampMs) {
+			out.inbox = append(out.inbox, row)
+		}
+	}
+	for _, row := range r.v2 {
+		if ok(true, row.MinThreadKey, row.MinLastActivityTimestampMs) {
+			out.v2 = append(out.v2, row)
+		}
+	}
+	return out
+}
+
+// replyRange counts a reply's range rows and decides the page from them.
+func replyRange(tbl *table.LSTable, counts *inboxRowCounts) *walkRange {
+	r := rangeRowsOf(tbl)
+	for _, row := range r.sync {
 		counts.total++
 		switch {
-		case r.ParentThreadKey == parent:
+		case row.ParentThreadKey == inboxParentKey:
 			counts.inbox++
-			out = r
-		case r.ParentThreadKey == 0 && r.HasMoreBefore:
+		case row.ParentThreadKey == 0 && row.HasMoreBefore:
 			counts.parent0More++
-			fallback = r
-		case r.ParentThreadKey == 0:
+		case row.ParentThreadKey == 0:
 			counts.parent0End++
-			out = r
 		default:
 			counts.other++
 		}
 	}
-	if out == nil {
-		return fallback
+	counts.inboxTable += len(r.inbox)
+	counts.v2 += len(r.v2)
+	return decideRange(r)
+}
+
+// decideRange is a page's range, from the strongest source present:
+//  1. the last group-1 sync-group row for the inbox parent, or a parent-0 end row
+//     (the library ends a sync group only on a parent-0 no-more row,
+//     syncManager.go updateThreadRanges), whichever comes last;
+//  2. else the last group-1 inbox range row (LSUpsertInboxThreadsRange: a sync group
+//     and a has-more flag, no parent, so it is the inbox's own);
+//  3. else the last parent-0 more row, as a cursor;
+//  4. else the last V2 row for the inbox parent, as a cursor only: that table has no
+//     has-more flag, so it can continue the walk but never complete it.
+//
+// Rows for any other parent decide nothing. nil means no range.
+func decideRange(r rangeRows) *walkRange {
+	var decide, fallback *table.LSUpsertSyncGroupThreadsRange
+	for _, row := range r.sync {
+		switch {
+		case row.ParentThreadKey == inboxParentKey:
+			decide = row
+		case row.ParentThreadKey == 0 && row.HasMoreBefore:
+			fallback = row
+		case row.ParentThreadKey == 0:
+			decide = row
+		}
 	}
-	return out
+	if decide != nil {
+		return &walkRange{more: decide.HasMoreBefore, minKey: decide.MinThreadKey, minTS: decide.MinLastActivityTimestampMS}
+	}
+	if n := len(r.inbox); n > 0 {
+		row := r.inbox[n-1]
+		return &walkRange{more: row.HasMoreBefore, minKey: row.MinThreadKey, minTS: row.MinLastActivityTimestampMs}
+	}
+	if fallback != nil {
+		return &walkRange{more: true, minKey: fallback.MinThreadKey, minTS: fallback.MinLastActivityTimestampMS}
+	}
+	for i := len(r.v2) - 1; i >= 0; i-- {
+		if row := r.v2[i]; row.ParentThreadKey == inboxParentKey {
+			return &walkRange{more: true, minKey: row.MinThreadKey, minTS: row.MinLastActivityTimestampMs}
+		}
+	}
+	return nil
+}
+
+// rangeWatch gathers the range rows of live tables (frames that are not the reply to
+// the helper's own request) while one inbox page is outstanding. Its rows are guarded
+// by s.mu; ready is signalled, never blocking, each time rows are added.
+type rangeWatch struct {
+	rows  rangeRows
+	ready chan struct{}
+}
+
+func newRangeWatch() *rangeWatch { return &rangeWatch{ready: make(chan struct{}, 1)} }
+
+// offerLocked adds a live table's range rows. The caller holds s.mu.
+func (w *rangeWatch) offerLocked(tbl *table.LSTable) {
+	r := rangeRowsOf(tbl)
+	if r.len() == 0 {
+		return
+	}
+	w.rows.add(r)
+	select {
+	case w.ready <- struct{}{}:
+	default:
+	}
+}
+
+// watchRanges sets the one open watch (nil closes it). Walks hold the walk slot, so
+// at most one page watches at a time.
+func (s *messagixSession) watchRanges(w *rangeWatch) {
+	s.mu.Lock()
+	s.rangeWatch = w
+	s.mu.Unlock()
+}
+
+// awaitInboxRange waits, at most inboxRangeWait, for a later frame to carry a range
+// row that answers the page requested at ref, and decides the page from the rows
+// gathered so far each time one arrives. nil without an error means none arrived in
+// the window: the walk stops as before (stop 2). Only a cancel is an error.
+func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, ref socket.FetchThreadsTask, counts *inboxRowCounts) (*walkRange, error) {
+	timer := time.NewTimer(inboxRangeWait)
+	defer timer.Stop()
+	var gathered rangeRows
+	for {
+		s.mu.Lock()
+		got := w.rows
+		w.rows = rangeRows{}
+		s.mu.Unlock()
+		if got.len() > 0 {
+			counts.late += got.len()
+			counts.inboxTable += len(got.inbox)
+			counts.v2 += len(got.v2)
+			gathered.add(got.answering(ref))
+			if rng := decideRange(gathered); rng != nil {
+				counts.latePages++
+				return rng, nil
+			}
+		}
+		select {
+		case <-w.ready:
+		case <-timer.C:
+			return nil, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
 
 func nowMS() int64 { return time.Now().UnixMilli() }

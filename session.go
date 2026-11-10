@@ -79,6 +79,7 @@ type messagixSession struct {
 	refreshPager  threadPager        // test seam: the refresh's client; nil means the messagix client
 	historyPager  threadPager        // test seam: History's client; nil means the messagix client
 	inboxResume   *inboxResumeRef    // where the next inbox walk resumes after one hit the page bound (memory only; guarded by mu)
+	rangeWatch    *rangeWatch        // the inbox page waiting for its range: live tables add their range rows to it (guarded by mu)
 
 	threads        map[string]*threadInfo         // by wire id
 	participants   map[int64][]pendingParticipant // participant rows waiting for their thread
