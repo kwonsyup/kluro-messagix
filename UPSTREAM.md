@@ -9,9 +9,10 @@ project. It is built against a modified fork of it. go.mod requires the upstream
 The fork is upstream commit `2e7f46f1597af0e538e96c35e918b91987a8bb40` plus one commit,
 `a349dea558a1853cda7856beb212bf92c3cab435` (2026-11-11), on the branch `kluro-request-id` of
 https://github.com/kwonsyup/mautrix-meta. That commit changes only `pkg/messagix/socket.go` and
-`pkg/messagix/threads.go`: it lets a caller read the request id and task ids that `pkg/messagix` sends with a request,
-and the request id of a live frame, without changing what is sent. The complete source of the modified library, under
-the same AGPL-3.0-or-later license, is on that branch and in the module archive listed in THIRD-PARTY.md.
+`pkg/messagix/threads.go`: it adds `Client.ExecuteTasksWithIDs`, which lets a caller read the request id and task ids
+that `pkg/messagix` sends with a request, and `FrameRequestID`, which reads the request id of a live frame, without
+changing what is sent. The complete source of the modified library, under the same AGPL-3.0-or-later license, is on that
+branch and in the module archive listed in THIRD-PARTY.md.
 
 The program imports the packages `pkg/messagix` and `pkg/messagix/securehistory` from the fork as a Go module
 dependency, verified by go.sum. Parts of `session.go` follow the structure of the upstream `pkg/connector` flows

@@ -14,6 +14,12 @@ FROM --platform=linux/amd64 golang:1.26.10@sha256:672c944cfd07599b5f1bb179869270
 ARG REVISION=unknown
 WORKDIR /src
 COPY go.mod go.sum ./
+# The mautrix-meta fork is fetched from its git repository at the commit go.mod
+# names, not through the public module proxy or checksum database; go.sum
+# holds its hash, and -mod=readonly refuses any change to go.mod or go.sum.
+ENV GONOPROXY=github.com/kwonsyup/mautrix-meta \
+    GONOSUMDB=github.com/kwonsyup/mautrix-meta \
+    GOFLAGS=-mod=readonly
 RUN go mod download
 COPY *.go ./
 RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w -buildid=${REVISION}" -o /kluro-messagix .

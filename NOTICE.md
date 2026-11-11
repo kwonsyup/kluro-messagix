@@ -9,11 +9,12 @@ for Kluro. It is licensed under the GNU Affero General Public License, version
 - `pkg/messagix/securehistory` (encrypted history archive)
 
 It uses a modified fork of mautrix-meta, pinned at commit
-`a349dea558a1853cda7856beb212bf92c3cab435`, which is upstream commit
-`2e7f46f1597af0e538e96c35e918b91987a8bb40` plus one change: `pkg/messagix` lets a
-caller read the ids of a request it sends and of a live frame it receives. The
-modified source is available, under AGPL-3.0-or-later, on the branch
-`kluro-request-id` of https://github.com/kwonsyup/mautrix-meta. See UPSTREAM.md.
+`a349dea558a1853cda7856beb212bf92c3cab435` (modified 2026-11-11), which is
+upstream commit `2e7f46f1597af0e538e96c35e918b91987a8bb40` plus one change:
+`pkg/messagix` lets a caller read the ids of a request it sends and of a live
+frame it receives. The modified source is available, under AGPL-3.0-or-later, on
+the branch `kluro-request-id` of https://github.com/kwonsyup/mautrix-meta. See
+UPSTREAM.md.
 
 It also uses go.mau.fi/whatsmeow (MPL-2.0) for the encrypted-chat transport.
 
