@@ -37,7 +37,7 @@ func (c *pageCollector) finish() { c.once.Do(func() { close(c.done) }) }
 // messages, edits and unsends. History pages requested through a collector are
 // routed to it instead.
 func (s *messagixSession) handleTable(tbl *table.LSTable) {
-	s.handleTableEmit(tbl, s.emit)
+	s.handleLiveTable(tbl, liveTag{})
 }
 
 // handleTableEmit builds the frames of a table and emits them inside one hold of
@@ -209,6 +209,14 @@ func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64
 		default:
 			set(s.folderMark, key, false)
 			set(s.spamMark, key, false)
+		}
+		// Counts only (msgKindLocked): not a certification input, so no mutation is recorded.
+		if folder != "" && !stale(key) {
+			if folder == "inbox" || folder == folderPending || folder == folderSpam {
+				delete(s.otherFolder, key)
+			} else {
+				s.otherFolder[key] = true
+			}
 		}
 	}
 	for _, th := range tbl.LSDeleteThenInsertThread {
@@ -790,10 +798,12 @@ func (s *messagixSession) messageFrameLocked(m *table.WrappedMessage) []Frame {
 	s.indexMessageLocked(msg.ID, thread)
 	// The thread must be known before its first message.
 	var frames []Frame
-	if s.threads[thread] == nil {
+	known := s.threads[thread] != nil
+	if !known {
 		t := s.thread(enc, key)
 		frames = append(frames, threadFrame(s.wireThreadLocked(t)))
 	}
+	s.countMsgLocked(enc, key, known)
 	return append(frames, Frame{T: TMessage, Message: &msg})
 }
 
@@ -1011,6 +1021,7 @@ func (s *messagixSession) waMessageFrames(evt *events.FBMessage) []Frame {
 		Text: text, Media: media, ReplyTo: reply, SentMS: evt.Info.Timestamp.UnixMilli(), Encrypted: true,
 	}
 	s.indexMessageLocked(waID, thread)
+	s.countMsgLocked(true, chatID, true) // the chat id names its own kind
 	return append(frames, Frame{T: TMessage, Message: &msg})
 }
 
@@ -1079,7 +1090,7 @@ func (s *messagixSession) listingStats(known, emitted, unlisted int) map[string]
 	if s.e2eeOfflineEnd {
 		offlineDone = 1
 	}
-	return map[string]int{
+	stats := map[string]int{
 		"group1_threads":        len(s.rowKeys),
 		"group1_encrypted_rows": len(s.encRowKeys),
 		"hybrid_mappings":       len(s.fbToWA),
@@ -1098,6 +1109,9 @@ func (s *messagixSession) listingStats(known, emitted, unlisted int) map[string]
 		"e2ee_emitted":               s.e2eeEmitted,
 		"e2ee_dropped_unparsed_chat": s.e2eeUnparsed,
 	}
+	s.startKinds.addStats(stats)
+	s.addMsgKindStats(stats)
+	return stats
 }
 
 // encryptedServer is the JID server an encrypted thread is addressed on. The

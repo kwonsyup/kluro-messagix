@@ -225,24 +225,26 @@ func TestConnectTimeFetchesBeforeFirstSyncAreNotAdopted(t *testing.T) {
 }
 
 // Late end rows still never conclude when the reply is empty and the frame carries the page's threads: only the reply
-// to the walk's own request can say there is nothing more.
+// to the walk's own request can say there is nothing more. An inbox-parent end row that is one for the page stops it 6
+// ("end not confirmed"), still incomplete; every other end row leaves it at stop 2.
 func TestEmptyReplyLateEndRowsNeverConclude(t *testing.T) {
 	page := [][2]int64{{120, 7000}, {90, 5000}}
 	for name, tc := range map[string]struct {
 		rows    *table.LSTable
 		counted string
+		stop    int
 	}{
-		"inbox end at the frame's floor": {rangeOnly(rangeRow(false, -1, 90, 5000)), "inbox_late_sync_inbox_end"},
-		"inbox end with no position":     {rangeOnly(rangeRow(false, -1, 0, 0)), "inbox_late_sync_inbox_end"},
-		"parent-0 end":                   {rangeOnly(rangeRow(false, 0, 90, 5000)), "inbox_late_sync_p0_end"},
-		"inbox-table end":                {inboxTable(inboxTableRow(false, 90, 5000)), "inbox_late_inbox_end"},
+		"inbox end at the frame's floor": {rangeOnly(rangeRow(false, -1, 90, 5000)), "inbox_late_sync_inbox_end", 6},
+		"inbox end with no position":     {rangeOnly(rangeRow(false, -1, 0, 0)), "inbox_late_sync_inbox_end", 2},
+		"parent-0 end":                   {rangeOnly(rangeRow(false, 0, 90, 5000)), "inbox_late_sync_p0_end", 2},
+		"inbox-table end":                {inboxTable(inboxTableRow(false, 90, 5000)), "inbox_late_inbox_end", 2},
 	} {
 		t.Run(name, func(t *testing.T) {
 			withRangeWait(t, 200*time.Millisecond)
 			s := connected(t)
 			p := &framedInbox{s: s, replies: []*table.LSTable{emptyReply}, later: [][]laterFrame{{late(20*time.Millisecond, threadsFrame(page, tc.rows))}}}
 			res, _ := runFramed(t, p)
-			checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 1})
+			checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: tc.stop, pages: 1})
 			wantLate(t, res.Stats, map[string]int{tc.counted: 1, "inbox_pages_late": 0, "inbox_late_rejected": 0})
 		})
 	}

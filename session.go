@@ -81,6 +81,9 @@ type messagixSession struct {
 	historyPager  threadPager        // test seam: History's client; nil means the messagix client
 	inboxResume   *inboxResumeRef    // where the next inbox walk resumes after one hit the page bound (memory only; guarded by mu)
 	rangeWatch    *rangeWatch        // the inbox page's open range watch: live tables add their range rows to it (guarded by mu)
+	liveTag       liveTag            // the frame tag of the live table being applied: set only inside handleLiveTable's hold of mu
+	startKinds    startKinds         // the kinds of rows in this start's page-load or resume-sync table, counts only (guarded by mu)
+	tablesLogged  string             // the last walk table-name code logged (guarded by mu)
 	oneoffExtra   atomic.Int64       // library warnings: a second data frame on a one-off stream (count only; see frameDropHook)
 	unknownStream atomic.Int64       // library warnings: a data frame for a stream it no longer has (count only)
 
@@ -92,6 +95,8 @@ type messagixSession struct {
 	folderMark     map[int64]bool                                                                                     // facebook thread keys whose latest non-empty folder is pending or spam (memory only)
 	statusMark     map[int64]bool                                                                                     // ... whose latest message request status row is 1 (memory only)
 	spamMark       map[int64]bool                                                                                     // ... whose latest non-empty folder is spam (memory only)
+	otherFolder    map[int64]bool                                                                                     // ... whose latest non-empty folder is another one than inbox, pending or spam (memory only; counts only)
+	msgKinds       [msgKindCount]int                                                                                  // messages emitted, by their thread's kind at the time (counts only; see msgKindLocked)
 	scopeScanClean bool                                                                                               // a scope scan of this session finished with every request scope answered (guarded by mu)
 	scopeFolders   map[int64]bool                                                                                     // group-1 parents the last listing's range rows named (guarded by mu)
 	scopeLogged    string                                                                                             // the last thread scope diagnostic logged (guarded by mu)
@@ -190,6 +195,7 @@ func newSession() *messagixSession {
 		folderMark:   map[int64]bool{},
 		statusMark:   map[int64]bool{},
 		spamMark:     map[int64]bool{},
+		otherFolder:  map[int64]bool{},
 		rowKeys:      map[int64]bool{},
 		encRowKeys:   map[int64]bool{},
 		msgIndex:     map[string]string{},
@@ -309,6 +315,7 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 	var initialFrames []Frame
 	if initial != nil {
 		initialFrames = s.handleTableFrames(initial)
+		s.setStartKinds(startSrcPageLoad, initial)
 	}
 	synced, err := s.openSocket(ctx, resumed, st.Messagix, cli.Connect)
 	if err != nil {
@@ -998,7 +1005,7 @@ func (s *messagixSession) webLogout(ctx context.Context, cli *messagix.Client) {
 func (s *messagixSession) handleMetaEvent(ctx context.Context, rawEvt any) {
 	switch evt := rawEvt.(type) {
 	case *table.LSTable:
-		s.handleTable(evt)
+		s.handleLiveTable(evt, tagOf(ctx))
 	case *messagix.ConnectedEvent, *messagix.ReconnectedEvent:
 		// messagix emits these after the socket's sync, so rows from before
 		// it, and from the sync itself, belong to an ended epoch.

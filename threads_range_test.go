@@ -177,11 +177,11 @@ func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
 	if got["7171"] != nil || got["e:7171"] != nil {
 		t.Fatal("a plain existence row must not create a thread")
 	}
-	wantStats(t, stats, map[string]int{
+	wantStats(t, stats, withProbeKeys(map[string]int{
 		"inbox_stop": 0, "inbox_pages": 1, "inbox_rows_total": 1, "inbox_rows_parent_inbox": 1, "inbox_rows_parent0_more": 0, "inbox_rows_parent0_end": 0, "inbox_rows_other_parent": 0, "inbox_rows_inbox_table": 0, "inbox_rows_v2": 0, "inbox_rows_late": 0, "inbox_pages_late": 0, "inbox_range_wait_ms": 0, "inbox_late_sync_inbox_more": 0, "inbox_late_sync_inbox_end": 0, "inbox_late_sync_p0_more": 0, "inbox_late_sync_p0_end": 0, "inbox_late_sync_other": 0, "inbox_late_inbox_more": 0, "inbox_late_inbox_end": 0, "inbox_late_v2_inbox": 0, "inbox_late_v2_other": 0, "inbox_late_other_epoch": 0, "inbox_late_rejected": 0, "inbox_late_rej_nofloor": 0, "inbox_late_rej_floor": 0, "inbox_late_rej_ceiling": 0, "inbox_late_rej_epoch": 0, "inbox_reply_threads": 2, "inbox_late_frames_threads": 0, "oneoff_extra_frames": 0, "oneoff_unknown_stream_frames": 0, "group1_threads": 3, "group1_encrypted_rows": 3, "hybrid_mappings": 0, "cutover_links": 0,
 		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "e2ee_received": 0, "e2ee_emitted": 0, "e2ee_dropped_unparsed_chat": 0, "encrypted_unlisted": 0, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0, "start_page_reload": 0,
 		"scope_parents": 0, "scope_pages": 1, "scope_failed": 0,
-	})
+	}, map[string]int{"inbox_rows_g1_inbox_end": 1}))
 }
 
 // A cutover link or hybrid mapping whose chat no table named is counted in
@@ -205,11 +205,11 @@ func TestKnownEncryptedKeyWithNoTableRowIsCountedNotEmitted(t *testing.T) {
 	if got["e:1600"] == nil {
 		t.Fatal("the already-known encrypted thread must still be listed")
 	}
-	wantStats(t, stats, map[string]int{
+	wantStats(t, stats, withProbeKeys(map[string]int{
 		"inbox_stop": 0, "inbox_pages": 1, "inbox_rows_total": 1, "inbox_rows_parent_inbox": 1, "inbox_rows_parent0_more": 0, "inbox_rows_parent0_end": 0, "inbox_rows_other_parent": 0, "inbox_rows_inbox_table": 0, "inbox_rows_v2": 0, "inbox_rows_late": 0, "inbox_pages_late": 0, "inbox_range_wait_ms": 0, "inbox_late_sync_inbox_more": 0, "inbox_late_sync_inbox_end": 0, "inbox_late_sync_p0_more": 0, "inbox_late_sync_p0_end": 0, "inbox_late_sync_other": 0, "inbox_late_inbox_more": 0, "inbox_late_inbox_end": 0, "inbox_late_v2_inbox": 0, "inbox_late_v2_other": 0, "inbox_late_other_epoch": 0, "inbox_late_rejected": 0, "inbox_late_rej_nofloor": 0, "inbox_late_rej_floor": 0, "inbox_late_rej_ceiling": 0, "inbox_late_rej_epoch": 0, "inbox_reply_threads": 0, "inbox_late_frames_threads": 0, "oneoff_extra_frames": 0, "oneoff_unknown_stream_frames": 0, "group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 1, "cutover_links": 2,
 		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "e2ee_received": 0, "e2ee_emitted": 0, "e2ee_dropped_unparsed_chat": 0, "encrypted_unlisted": 2, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0, "start_page_reload": 0,
 		"scope_parents": 0, "scope_pages": 1, "scope_failed": 0,
-	})
+	}, map[string]int{"inbox_rows_g1_inbox_end": 1}))
 }
 
 // State saved by the build that kept a hybrid kind proof still loads; the field is ignored.
