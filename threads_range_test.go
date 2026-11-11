@@ -179,7 +179,7 @@ func TestEncryptedGroup1RowsEmitAsEncryptedThreads(t *testing.T) {
 	}
 	wantStats(t, stats, map[string]int{
 		"inbox_stop": 0, "inbox_pages": 1, "inbox_rows_total": 1, "inbox_rows_parent_inbox": 1, "inbox_rows_parent0_more": 0, "inbox_rows_parent0_end": 0, "inbox_rows_other_parent": 0, "inbox_rows_inbox_table": 0, "inbox_rows_v2": 0, "inbox_rows_late": 0, "inbox_pages_late": 0, "inbox_range_wait_ms": 0, "inbox_late_sync_inbox_more": 0, "inbox_late_sync_inbox_end": 0, "inbox_late_sync_p0_more": 0, "inbox_late_sync_p0_end": 0, "inbox_late_sync_other": 0, "inbox_late_inbox_more": 0, "inbox_late_inbox_end": 0, "inbox_late_v2_inbox": 0, "inbox_late_v2_other": 0, "inbox_late_other_epoch": 0, "inbox_late_rejected": 0, "inbox_late_rej_nofloor": 0, "inbox_late_rej_floor": 0, "inbox_late_rej_ceiling": 0, "inbox_late_rej_epoch": 0, "inbox_reply_threads": 2, "inbox_late_frames_threads": 0, "oneoff_extra_frames": 0, "oneoff_unknown_stream_frames": 0, "group1_threads": 3, "group1_encrypted_rows": 3, "hybrid_mappings": 0, "cutover_links": 0,
-		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "e2ee_received": 0, "e2ee_emitted": 0, "e2ee_dropped_unparsed_chat": 0, "encrypted_unlisted": 0, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
+		"encrypted_known": 3, "encrypted_emitted": 3, "e2ee_connected": 0, "e2ee_received": 0, "e2ee_emitted": 0, "e2ee_dropped_unparsed_chat": 0, "encrypted_unlisted": 0, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0, "start_page_reload": 0,
 		"scope_parents": 0, "scope_pages": 1, "scope_failed": 0,
 	})
 }
@@ -207,7 +207,7 @@ func TestKnownEncryptedKeyWithNoTableRowIsCountedNotEmitted(t *testing.T) {
 	}
 	wantStats(t, stats, map[string]int{
 		"inbox_stop": 0, "inbox_pages": 1, "inbox_rows_total": 1, "inbox_rows_parent_inbox": 1, "inbox_rows_parent0_more": 0, "inbox_rows_parent0_end": 0, "inbox_rows_other_parent": 0, "inbox_rows_inbox_table": 0, "inbox_rows_v2": 0, "inbox_rows_late": 0, "inbox_pages_late": 0, "inbox_range_wait_ms": 0, "inbox_late_sync_inbox_more": 0, "inbox_late_sync_inbox_end": 0, "inbox_late_sync_p0_more": 0, "inbox_late_sync_p0_end": 0, "inbox_late_sync_other": 0, "inbox_late_inbox_more": 0, "inbox_late_inbox_end": 0, "inbox_late_v2_inbox": 0, "inbox_late_v2_other": 0, "inbox_late_other_epoch": 0, "inbox_late_rejected": 0, "inbox_late_rej_nofloor": 0, "inbox_late_rej_floor": 0, "inbox_late_rej_ceiling": 0, "inbox_late_rej_epoch": 0, "inbox_reply_threads": 0, "inbox_late_frames_threads": 0, "oneoff_extra_frames": 0, "oneoff_unknown_stream_frames": 0, "group1_threads": 0, "group1_encrypted_rows": 0, "hybrid_mappings": 1, "cutover_links": 2,
-		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "e2ee_received": 0, "e2ee_emitted": 0, "e2ee_dropped_unparsed_chat": 0, "encrypted_unlisted": 2, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0,
+		"encrypted_known": 3, "encrypted_emitted": 1, "e2ee_connected": 0, "e2ee_received": 0, "e2ee_emitted": 0, "e2ee_dropped_unparsed_chat": 0, "encrypted_unlisted": 2, "e2ee_offline_events": 0, "e2ee_offline_done": 0, "resume_sync_rows": 0, "start_page_reload": 0,
 		"scope_parents": 0, "scope_pages": 1, "scope_failed": 0,
 	})
 }
@@ -802,7 +802,10 @@ func TestResumeSyncAsksOnceForDatabases1And2AndFeedsTheNormalPath(t *testing.T) 
 		}
 		return &table.LSTable{}, nil
 	}
-	frames := s.resumeSync(context.Background(), savedConfig(t, 123))
+	frames, err := s.resumeSync(context.Background(), savedConfig(t, 123))
+	if err != nil {
+		t.Fatalf("a successful sync returns no error: %v", err)
+	}
 	want := []lsCall{{1, 123, "mb-params", nil, 0}, {2, 123, "ct-params", nil, 0}}
 	if len(calls) != 2 || calls[0] != want[0] || calls[1] != want[1] {
 		t.Fatalf("sync calls = %+v, want %+v", calls, want)
@@ -852,7 +855,7 @@ func TestResumeSyncFailureNeverBlocksTheListing(t *testing.T) {
 				}
 				return &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: 600, ThreadType: table.ONE_TO_ONE}}}, nil
 			}
-			frames := s.resumeSync(context.Background(), savedConfig(t, tc.version))
+			frames, _ := s.resumeSync(context.Background(), savedConfig(t, tc.version))
 			if (frames == nil) != tc.wantNil || n != tc.calls {
 				t.Fatalf("frames nil=%v calls=%d, want nil=%v calls=%d", frames == nil, n, tc.wantNil, tc.calls)
 			}
@@ -873,7 +876,7 @@ func TestResumeSyncHonoursCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
 	done := make(chan []Frame, 1)
-	go func() { done <- s.resumeSync(ctx, savedConfig(t, 123)) }()
+	go func() { f, _ := s.resumeSync(ctx, savedConfig(t, 123)); done <- f }()
 	select {
 	case tbl := <-done:
 		if tbl != nil {
