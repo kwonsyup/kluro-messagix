@@ -7,13 +7,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"go.mau.fi/mautrix-meta/pkg/messagix"
+	"go.mau.fi/mautrix-meta/pkg/messagix/crypto"
 	"go.mau.fi/mautrix-meta/pkg/messagix/graphql"
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
+	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 )
@@ -173,6 +179,9 @@ func TestStartPageReloadFailureContinuesTheStartAndIsCounted(t *testing.T) {
 			if r.loads != 1 || r.sync[1] != 1 || len(r.restores) != 1 {
 				t.Fatalf("loads=%d sync=%v restores=%d, want exactly one of each", r.loads, r.sync, len(r.restores))
 			}
+			if r.s.lastFullRec.IsZero() {
+				t.Fatal("a failed start reload must still hold off fullReconnect's page load")
+			}
 			if tc.restoreErr == nil && !bytes.Equal(r.restores[0], saved) {
 				t.Fatal("the restore must load the start's own saved state")
 			}
@@ -267,5 +276,159 @@ func TestStartPageReloadHonoursCancel(t *testing.T) {
 	if err != nil || frames != nil || r2.connects != 1 || r2.loads != 1 || len(r2.restores) != 1 {
 		t.Fatalf("a page-load timeout must restore and still connect: err=%v frames=%v connects=%d loads=%d restores=%d",
 			err, frames, r2.connects, r2.loads, len(r2.restores))
+	}
+}
+
+// savedClientState is a constructed saved messagix state blob in the library's own dump format: a page config
+// (version, tokens, user, sync params) and the sync store's cursors.
+func savedClientState(t *testing.T) json.RawMessage {
+	t.Helper()
+	cursor1, cursor2 := "saved-cursor-1", "saved-cursor-2"
+	b, err := json.Marshal(struct {
+		Configs     *httpclient.Configs
+		SyncStore   map[int64]*socket.QueryMetadata
+		PacketsSent uint16
+		SessionID   int64
+		Timestamp   time.Time
+	}{
+		Configs: &httpclient.Configs{
+			VersionID: 123,
+			LSDToken:  "saved-lsd",
+			// a real dump carries the page's bitmaps: a page load sets them before any dump
+			Bitmap:    crypto.NewBitmap().Update([]int{1, 5, 9}),
+			CSRBitmap: crypto.NewBitmap().Update([]int{2, 4}),
+			BrowserConfigTable: &types.SchedulerJSDefineConfig{
+				CurrentUserInitialData:        types.CurrentUserInitialData{AccountID: "1", UserID: "1", AppID: "saved-app", Name: "Saved"},
+				LSPlatformMessengerSyncParams: types.LSPlatformMessengerSyncParams{Mailbox: "mb-params", Contact: "ct-params"},
+			},
+		},
+		SyncStore: map[int64]*socket.QueryMetadata{
+			1: {DatabaseID: 1, SendSyncParams: true, LastAppliedCursor: &cursor1, SyncChannel: socket.MailBox},
+			2: {DatabaseID: 2, SendSyncParams: true, LastAppliedCursor: &cursor2, SyncChannel: socket.Contact},
+		},
+		PacketsSent: 7,
+		Timestamp:   time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// clientStateOf is a dumped client state without its save time, decoded for comparison; nil if the client has no
+// state to dump.
+func clientStateOf(t *testing.T, blob json.RawMessage) map[string]any {
+	t.Helper()
+	if len(blob) == 0 {
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(blob, &m); err != nil {
+		t.Fatal(err)
+	}
+	delete(m, "Timestamp")
+	return m
+}
+
+// failingPageTransport serves a messages page that parses (it writes a new token and user into the client's config
+// in place) and then fails the page setup's GraphQL sync with an undecodable answer. That happens after the library
+// has replaced the sync manager and marked the socket unsynced: the deepest partial state a failed page load leaves.
+// It counts page loads.
+func failingPageTransport(t *testing.T, cli *messagix.Client, pageLoads *atomic.Int64) {
+	cli.GetHTTP().SetTransportOverride(fakeHTTP(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.String() == cli.GetEndpoint("messages"):
+			pageLoads.Add(1)
+			return httpResponse(r, `<html><script type="application/json">{"require":[["ScheduledServerJS","handle",null,[{"__bbox":{"define":[["DTSGInitData",[],{"token":"partial-token"},1],["CurrentUserInitialData",[],{"ACCOUNT_ID":"1","USER_ID":"1","APP_ID":"partial-app","NAME":"Partial"},2]]}}]]]}</script><script src="https://static.invalid/version.js"></script></html>`), nil
+		case r.URL.String() == "https://static.invalid/version.js":
+			return httpResponse(r, `__d("LSVersion",[],function(a,b,c,d,e,f){e.exports="456"})`), nil
+		case r.Method == http.MethodPost:
+			return httpResponse(r, "not json"), nil
+		}
+		t.Errorf("unexpected HTTP request: %s %s", r.Method, r.URL)
+		return nil, errors.New("unexpected request")
+	}))
+}
+
+// The default wiring, against a real messagix client: the library's own page load fails after it has rewritten the
+// client's config and sync state, and the default restore (the client's LoadState) puts back exactly the start's
+// saved config and sync store, so the start continues as it would have without the reload.
+func TestStartPageReloadDefaultRestorePutsBackTheSavedClientState(t *testing.T) {
+	saved := savedClientState(t)
+
+	// The premise: the same failed page load, without a restore, leaves the client's state changed.
+	control := newWebTestClient()
+	if err := control.LoadState(saved); err != nil {
+		t.Fatal(err)
+	}
+	var controlLoads atomic.Int64
+	failingPageTransport(t, control, &controlLoads)
+	if _, _, err := control.LoadMessagesPage(t.Context()); err == nil || controlLoads.Load() != 1 {
+		t.Fatalf("fixture: the page load must fail after one page fetch: err=%v loads=%d", err, controlLoads.Load())
+	}
+	blob, _ := control.DumpState()
+	if after := clientStateOf(t, blob); reflect.DeepEqual(after, clientStateOf(t, saved)) {
+		t.Fatal("fixture: a failed page load must leave the client's state changed")
+	}
+
+	buf := captureCodes(t)
+	cli := newWebTestClient()
+	if err := cli.LoadState(saved); err != nil {
+		t.Fatal(err)
+	}
+	var pageLoads atomic.Int64
+	failingPageTransport(t, cli, &pageLoads)
+	s := newTestSession()
+	s.ctx = context.Background()
+	s.client = cli
+	s.lsRequest = func(context.Context, *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
+		return nil, reloadPageErr()
+	}
+	connects := 0
+	frames, err := s.openSocket(context.Background(), true, saved, func(context.Context) error { connects++; return nil })
+	if err != nil || frames != nil || connects != 1 || pageLoads.Load() != 1 {
+		t.Fatalf("err=%v frames=%v connects=%d page loads=%d", err, frames, connects, pageLoads.Load())
+	}
+	blob, err = cli.DumpState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := clientStateOf(t, blob), clientStateOf(t, saved); !reflect.DeepEqual(got, want) {
+		t.Fatalf("restored client state = %v, want the saved %v", got, want)
+	}
+	if cur, err := cli.GetCurrentAccount(); err != nil || cur.GetName() != "Saved" {
+		t.Fatalf("the client must serve the saved user again: %v %v", cur, err)
+	}
+	if w := codesAt(t, buf, "warn"); !slices.Equal(w, []string{"resume_sync_failed.reload_page", "start_page_reload_result.decode"}) {
+		t.Fatalf("warn codes = %v", w)
+	}
+}
+
+// A failed start reload holds off fullReconnect's page load as a successful one does: a fullReconnect right after
+// it, inside fullReconnect's spacing, loads no page.
+func TestStartPageReloadFailureHoldsOffFullReconnect(t *testing.T) {
+	captureCodes(t)
+	saved := savedClientState(t)
+	cli := newWebTestClient()
+	if err := cli.LoadState(saved); err != nil {
+		t.Fatal(err)
+	}
+	var pageLoads atomic.Int64
+	failingPageTransport(t, cli, &pageLoads)
+	s := newTestSession()
+	s.ctx = context.Background()
+	s.client = cli
+	s.lsRequest = func(context.Context, *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) {
+		return nil, reloadPageErr()
+	}
+	if _, err := s.openSocket(context.Background(), true, saved, func(context.Context) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if pageLoads.Load() != 1 || s.lastFullRec.IsZero() {
+		t.Fatalf("page loads=%d lastFullRec zero=%v: the failed reload must still hold off fullReconnect", pageLoads.Load(), s.lastFullRec.IsZero())
+	}
+	s.fullReconnect()
+	if pageLoads.Load() != 1 {
+		t.Fatalf("page loads = %d: fullReconnect right after the start's reload must not load the page again", pageLoads.Load())
 	}
 }
