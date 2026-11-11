@@ -102,6 +102,9 @@ type messagixSession struct {
 	e2eeUnparsed   int                                                                                                // ... whose chat id maps to no Messenger id
 	resumeRows     int                                                                                                // rows the resumed-start sync returned, count only
 	lsRequest      func(ctx context.Context, v *graphql.LSPlatformGraphQLLightspeedVariables) (*table.LSTable, error) // test seam; nil means the client
+	pageReloads    int                                                                                                // page loads a resumed start made for a "reload page" answer (0 or 1), count only
+	pageLoad       func(ctx context.Context) (*table.LSTable, error)                                                  // test seam: the page load; nil means the client's
+	stateRestore   func(saved json.RawMessage) error                                                                  // test seam: reload the saved state; nil means the client's
 	beforeListEmit func(id string)                                                                                    // test seam: runs between the listing's snapshot of ids and its emit of one
 	rowKeys        map[int64]bool                                                                                     // thread rows seen this run (counts only)
 	encRowKeys     map[int64]bool                                                                                     // ... of an encrypted-over-WA type
@@ -331,12 +334,24 @@ func (s *messagixSession) openSocket(ctx context.Context, resumed bool, saved js
 	if resumed {
 		// A resumed session skipped the page load, whose sync carries the cutover
 		// links and the typed rows a socket-only sync does not: run it once.
-		frames = s.resumeSync(ctx, saved)
+		var err error
+		frames, err = s.resumeSync(ctx, saved)
 		// The caller cancelled Start during the sync: do not open the socket. The
 		// sync's own timeout is not a cancel and falls through to connect.
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		// "Reload page": the saved page config is stale. Load the page once, never
+		// more, and only for this answer; a failed load continues as before.
+		reloaded := 0
+		if errors.Is(err, types.ErrPleaseReloadPage) {
+			reloaded = 1
+			frames = s.startPageReload(ctx, saved)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		logCode("info", "start_page_reload."+strconv.Itoa(reloaded))
 	}
 	if err := connect(s.ctx); err != nil {
 		return nil, err

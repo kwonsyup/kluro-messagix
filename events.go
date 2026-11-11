@@ -1090,6 +1090,7 @@ func (s *messagixSession) listingStats(known, emitted, unlisted int) map[string]
 		"e2ee_offline_events":   s.e2eeOffline,
 		"e2ee_offline_done":     offlineDone,
 		"resume_sync_rows":      s.resumeRows,
+		"start_page_reload":     s.pageReloads,
 		"encrypted_unlisted":    unlisted,
 		// Every encrypted message that reached deliverEncrypted, how many of
 		// them were emitted, how many had a chat id that maps to no Messenger id.
