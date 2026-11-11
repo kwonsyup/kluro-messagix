@@ -41,9 +41,9 @@ type laterFrame struct {
 // of each main-inbox request (the one-off stream's first data frame, all ExecuteTasks ever returns) and delivers that
 // request's scripted later events through handleMetaEvent, the session's real live path. onRequest, if set, runs
 // inside each inbox request (to stand in for something the library does while it is in flight). Other scopes' first
-// pages are answered empty. It does not model the transport below ExecuteTasks: a second frame on the same one-off
-// stream never reaches the session through any path, so that case is covered only by its count (see
-// TestLibraryDropWarningsAreCountedByMessageOnly).
+// pages are answered empty. It models live frames only, not the transport below ExecuteTasks: a second frame on the
+// request's own one-off stream never reaches the session through any path. That case runs through the pinned
+// library's real transport in TestSecondFrameOnTheOneOffStreamIsDroppedAndCounted.
 type framedInbox struct {
 	s         *messagixSession
 	replies   []*table.LSTable
@@ -174,7 +174,7 @@ func TestWalkTakesTheRangeFromALaterFrame(t *testing.T) {
 			withRangeWait(t, 2*time.Second)
 			s := newTestSession()
 			p := &framedInbox{s: s,
-				replies: []*table.LSTable{tpage(101, 5000), tpage(102, 4000, rangeRow(false, -1, 80, 4000))},
+				replies: []*table.LSTable{tpage(90, 5000), tpage(102, 4000, rangeRow(false, -1, 80, 4000))},
 				later:   [][]laterFrame{{frame}},
 			}
 			res, _ := runFramed(t, p)
@@ -203,7 +203,7 @@ func TestWalkReadsTheOtherRangeTables(t *testing.T) {
 			stats:   map[string]int{"inbox_rows_inbox_table": 2, "inbox_pages_late": 0},
 		},
 		"inbox table on a later frame": {
-			replies: []*table.LSTable{tpage(101, 5000), tpage(102, 4000, rangeRow(false, -1, 80, 4000))},
+			replies: []*table.LSTable{tpage(90, 5000), tpage(102, 4000, rangeRow(false, -1, 80, 4000))},
 			later:   [][]laterFrame{{late(30*time.Millisecond, inboxTable(inboxTableRow(true, 90, 5000)))}},
 			want:    walkWant{stop: 0, pages: 2, refs: [][2]int64{{90, 5000}}},
 			stats:   map[string]int{"inbox_late_inbox_more": 1, "inbox_pages_late": 1},
@@ -256,11 +256,11 @@ func TestWalkWithoutARangeStopsAsBefore(t *testing.T) {
 		refs     [][2]int64
 		rejected int
 	}{
-		"nothing":                         {replies: []*table.LSTable{tpage(101, 5000)}, pages: 1},
-		"another parent":                  {replies: []*table.LSTable{tpage(101, 5000)}, later: [][]laterFrame{{late(20*time.Millisecond, rangeOnly(rangeRow(true, 7, 90, 5000), rangeRow(false, 7, 0, 0)))}}, pages: 1},
-		"another sync group":              {replies: []*table.LSTable{tpage(101, 5000)}, later: [][]laterFrame{{late(20*time.Millisecond, &table.LSTable{LSUpsertSyncGroupThreadsRange: []*table.LSUpsertSyncGroupThreadsRange{{SyncGroup: 95, ParentThreadKey: -1, HasMoreBefore: true, MinThreadKey: 90, MinLastActivityTimestampMS: 5000}}, LSUpsertInboxThreadsRange: []*table.LSUpsertInboxThreadsRange{{SyncGroup: 95, HasMoreBefore: true, MinThreadKey: 90, MinLastActivityTimestampMs: 5000}}})}}, pages: 1},
-		"before the walk":                 {before: rangeOnly(rangeRow(true, -1, 90, 5000)), replies: []*table.LSTable{tpage(101, 5000)}, pages: 1},
-		"after the window":                {replies: []*table.LSTable{tpage(101, 5000)}, later: [][]laterFrame{{late(3*wait, rangeOnly(rangeRow(true, -1, 90, 5000)))}}, pages: 1},
+		"nothing":                         {replies: []*table.LSTable{tpage(90, 5000)}, pages: 1},
+		"another parent":                  {replies: []*table.LSTable{tpage(90, 5000)}, later: [][]laterFrame{{late(20*time.Millisecond, rangeOnly(rangeRow(true, 7, 90, 5000), rangeRow(false, 7, 0, 0)))}}, pages: 1},
+		"another sync group":              {replies: []*table.LSTable{tpage(90, 5000)}, later: [][]laterFrame{{late(20*time.Millisecond, &table.LSTable{LSUpsertSyncGroupThreadsRange: []*table.LSUpsertSyncGroupThreadsRange{{SyncGroup: 95, ParentThreadKey: -1, HasMoreBefore: true, MinThreadKey: 90, MinLastActivityTimestampMS: 5000}}, LSUpsertInboxThreadsRange: []*table.LSUpsertInboxThreadsRange{{SyncGroup: 95, HasMoreBefore: true, MinThreadKey: 90, MinLastActivityTimestampMs: 5000}}})}}, pages: 1},
+		"before the walk":                 {before: rangeOnly(rangeRow(true, -1, 90, 5000)), replies: []*table.LSTable{tpage(90, 5000)}, pages: 1},
+		"after the window":                {replies: []*table.LSTable{tpage(90, 5000)}, later: [][]laterFrame{{late(3*wait, rangeOnly(rangeRow(true, -1, 90, 5000)))}}, pages: 1},
 		"newer than the reference":        {replies: two, later: [][]laterFrame{nil, {late(20*time.Millisecond, rangeOnly(rangeRow(true, -1, 95, 6000)))}}, pages: 2, refs: [][2]int64{{90, 5000}}, rejected: 1},
 		"at the reference":                {replies: two, later: [][]laterFrame{nil, {late(20*time.Millisecond, rangeOnly(rangeRow(true, -1, 90, 5000)))}}, pages: 2, refs: [][2]int64{{90, 5000}}, rejected: 1},
 		"older than the page":             {replies: two, later: [][]laterFrame{nil, {late(20*time.Millisecond, rangeOnly(rangeRow(true, -1, 10, 100)))}}, pages: 2, refs: [][2]int64{{90, 5000}}, rejected: 1},
@@ -286,29 +286,108 @@ func TestWalkWithoutARangeStopsAsBefore(t *testing.T) {
 	}
 }
 
-// Review P1: a late end row that does not belong to the page never completes the walk. Page 1 says more; page 2's
-// reply has no range; the late rows below arrive while page 2 waits, and every one must leave today's honest stop 2.
-// On 7d56aa68 the parent-0 end, the inbox-table end and the other-connection end each completed the walk (stop 0).
-func TestStaleLateEndRowsNeverComplete(t *testing.T) {
-	for name, frames := range map[string][]laterFrame{
-		"parent-0 end (group-wide, from another request)": {late(20*time.Millisecond, rangeOnly(rangeRow(false, 0, 0, 0)))},
-		"inbox-table end":                      {late(20*time.Millisecond, inboxTable(inboxTableRow(false, 0, 0)))},
-		"inbox-table end at the page":          {late(20*time.Millisecond, inboxTable(inboxTableRow(false, 80, 4000)))},
-		"inbox end from an earlier connection": {late(10*time.Millisecond, disconnect), late(30*time.Millisecond, rangeOnly(rangeRow(false, -1, 0, 0)))},
-		"inbox end from deeper in the inbox":   {late(20*time.Millisecond, rangeOnly(rangeRow(false, -1, 10, 100)))},
-		"inbox end from an earlier page":       {late(20*time.Millisecond, rangeOnly(rangeRow(false, -1, 95, 6000)))},
+// Review P1 (#16, then #17 at cab3c480): a late row never concludes the walk. Only the reply to the walk's own
+// request can end it; a later frame's row may only extend it. Page 1 says more; page 2's reply has its thread but no
+// range; the end rows below arrive while page 2 waits, and every one leaves today's honest stop 2. The end row is
+// still counted, by kind (inbox_late_*_end), so a walk that reached its end late is visible in the counts.
+// "inbox end with no position" is the review's P1 on cab3c480: a (0,0) end row of an earlier request on the same
+// connection completed the walk there, silently omitting every older thread. On cab3c480 it and "inbox end at the
+// page" end stop 0.
+func TestLateEndRowsNeverConclude(t *testing.T) {
+	for name, tc := range map[string]struct {
+		frames  []laterFrame
+		counted string // the by-kind key that counts the ignored end row
+	}{
+		"inbox end with no position (another request's terminal row)": {[]laterFrame{late(20*time.Millisecond, rangeOnly(rangeRow(false, -1, 0, 0)))}, "inbox_late_sync_inbox_end"},
+		"inbox end at the page":                           {[]laterFrame{late(20*time.Millisecond, rangeOnly(rangeRow(false, -1, 102, 4000)))}, "inbox_late_sync_inbox_end"},
+		"a more row that answers, then a stray end row":   {[]laterFrame{late(20*time.Millisecond, rangeOnly(rangeRow(true, -1, 102, 4000), rangeRow(false, -1, 0, 0)))}, "inbox_late_sync_inbox_end"},
+		"parent-0 end (group-wide, from another request)": {[]laterFrame{late(20*time.Millisecond, rangeOnly(rangeRow(false, 0, 0, 0)))}, "inbox_late_sync_p0_end"},
+		"inbox-table end":                                 {[]laterFrame{late(20*time.Millisecond, inboxTable(inboxTableRow(false, 0, 0)))}, "inbox_late_inbox_end"},
+		"inbox-table end at the page":                     {[]laterFrame{late(20*time.Millisecond, inboxTable(inboxTableRow(false, 102, 4000)))}, "inbox_late_inbox_end"},
+		"inbox end from an earlier connection":            {[]laterFrame{late(10*time.Millisecond, disconnect), late(30*time.Millisecond, rangeOnly(rangeRow(false, -1, 0, 0)))}, "inbox_late_sync_inbox_end"},
+		"inbox end from deeper in the inbox":              {[]laterFrame{late(20*time.Millisecond, rangeOnly(rangeRow(false, -1, 10, 100)))}, "inbox_late_sync_inbox_end"},
+		"inbox end from an earlier page":                  {[]laterFrame{late(20*time.Millisecond, rangeOnly(rangeRow(false, -1, 95, 6000)))}, "inbox_late_sync_inbox_end"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			withRangeWait(t, 200*time.Millisecond)
+			s := newTestSession()
+			// Page 3 exists so that a walk the more row continues has somewhere to go, and ends from its reply.
+			p := &framedInbox{s: s,
+				replies: []*table.LSTable{tpage(101, 5000, rangeRow(true, -1, 90, 5000)), tpage(102, 4000), tpage(103, 3000, rangeRow(false, -1, 103, 3000))},
+				later:   [][]laterFrame{nil, tc.frames},
+			}
+			res, _ := runFramed(t, p)
+			if strings.HasPrefix(name, "a more row") {
+				// The more row extends the walk; the end row beside it decides nothing; page 3's reply ends it.
+				checkWalk(t, p, res, walkWant{stop: 0, pages: 3, refs: [][2]int64{{90, 5000}, {102, 4000}}})
+			} else {
+				checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 2, refs: [][2]int64{{90, 5000}}})
+				if res.Stats["inbox_pages_late"] != 0 {
+					t.Fatalf("a late end row decided a page: %v", res.Stats)
+				}
+			}
+			if res.Stats[tc.counted] != 1 {
+				t.Fatalf("stats[%s]=%d, want the ignored end row counted once; %v", tc.counted, res.Stats[tc.counted], res.Stats)
+			}
+			if strings.Contains(name, "connection") && res.Stats["inbox_late_other_epoch"] != 1 {
+				t.Fatalf("other-epoch row not counted: %v", res.Stats)
+			}
+		})
+	}
+	// A single-page inbox whose end only ever comes late stays incomplete, as on 55b3df5: never a silent COMPLETE.
+	t.Run("single page, end only late", func(t *testing.T) {
+		withRangeWait(t, 200*time.Millisecond)
+		s := newTestSession()
+		p := &framedInbox{s: s, replies: []*table.LSTable{tpage(101, 5000)}, later: [][]laterFrame{{late(20*time.Millisecond, rangeOnly(rangeRow(false, -1, 101, 5000)))}}}
+		res, _ := runFramed(t, p)
+		checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 1})
+		if res.Stats["inbox_late_sync_inbox_end"] != 1 {
+			t.Fatalf("late end row not counted: %v", res.Stats)
+		}
+	})
+}
+
+// Review P2 (cab3c480): a late row's position is the cursor's full (activity time, thread key) pair, compared in the
+// cursor's order (older = smaller time, then smaller key at the same time), never the time alone. The row must not be
+// older than the oldest thread the page's reply carried (else the next request skips that page's unseen threads at
+// the same time) and must be strictly older than the request's reference (else the walk does not move forward).
+// Page 2's reply holds threads 85 and 88 at 4000, so its floor is (4000, 85); its reference is (5000, 90).
+// On cab3c480 "floor time, older key" and "reference time, newer key" moved the walk on.
+func TestLateRowPositionIsTheFullCursorPair(t *testing.T) {
+	page2 := &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{
+		{ThreadKey: 88, ThreadType: table.ONE_TO_ONE, FolderName: "inbox", ThreadName: "T", LastActivityTimestampMs: 4000},
+		{ThreadKey: 85, ThreadType: table.ONE_TO_ONE, FolderName: "inbox", ThreadName: "T", LastActivityTimestampMs: 4000},
+	}}
+	for name, tc := range map[string]struct {
+		row    [2]int64 // the late more row's (thread key, activity ms)
+		accept bool
+	}{
+		"floor time, older key (skips thread 80..85 at 4000)": {row: [2]int64{80, 4000}, accept: false},
+		"reference time, newer key (behind the reference)":    {row: [2]int64{91, 5000}, accept: false},
+		"at the reference":          {row: [2]int64{90, 5000}, accept: false},
+		"older than the floor time": {row: [2]int64{99, 3999}, accept: false},
+		"at the floor":              {row: [2]int64{85, 4000}, accept: true},
+		"floor time, newer key":     {row: [2]int64{86, 4000}, accept: true},
+		"reference time, older key": {row: [2]int64{89, 5000}, accept: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			withRangeWait(t, 200*time.Millisecond)
 			s := newTestSession()
 			p := &framedInbox{s: s,
-				replies: []*table.LSTable{tpage(101, 5000, rangeRow(true, -1, 90, 5000)), tpage(102, 4000)},
-				later:   [][]laterFrame{nil, frames},
+				replies: []*table.LSTable{tpage(101, 5000, rangeRow(true, -1, 90, 5000)), page2, tpage(70, 3000, rangeRow(false, -1, 70, 3000))},
+				later:   [][]laterFrame{nil, {late(20*time.Millisecond, rangeOnly(rangeRow(true, -1, tc.row[0], tc.row[1])))}},
 			}
 			res, _ := runFramed(t, p)
+			if tc.accept {
+				checkWalk(t, p, res, walkWant{stop: 0, pages: 3, refs: [][2]int64{{90, 5000}, tc.row}})
+				if res.Stats["inbox_pages_late"] != 1 || res.Stats["inbox_late_rejected"] != 0 {
+					t.Fatalf("late stats = %v", res.Stats)
+				}
+				return
+			}
 			checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 2, refs: [][2]int64{{90, 5000}}})
-			if strings.Contains(name, "connection") && res.Stats["inbox_late_other_epoch"] != 1 {
-				t.Fatalf("other-epoch row not counted: %v", res.Stats)
+			if res.Stats["inbox_pages_late"] != 0 || res.Stats["inbox_late_rejected"] != 1 {
+				t.Fatalf("late stats = %v, want the row rejected", res.Stats)
 			}
 		})
 	}
@@ -324,7 +403,7 @@ func TestOneWaitBudgetPerWalk(t *testing.T) {
 		s := newTestSession()
 		p := &framedInbox{s: s}
 		for i := int64(0); i < 4; i++ {
-			p.replies = append(p.replies, tpage(100+i, 5000-i))
+			p.replies = append(p.replies, tpage(90-i, 5000-i))
 			p.later = append(p.later, []laterFrame{late(lag, rangeOnly(rangeRow(true, -1, 90-i, 5000-i)))})
 		}
 		res, took := runFramed(t, p)
@@ -341,44 +420,17 @@ func TestOneWaitBudgetPerWalk(t *testing.T) {
 		w := s.openWatch()
 		s.handleMetaEvent(context.Background(), rangeOnly(rangeRow(true, -1, 90, 5000)))
 		var counts inboxRowCounts
-		rng, waited, err := s.awaitInboxRange(context.Background(), w, inboxTop, 5000, true, 0, &counts)
+		rng, waited, err := s.awaitInboxRange(context.Background(), w, inboxTop, cursorPos{ts: 5000, key: 90}, true, 0, &counts)
 		s.closeWatch(w, &counts)
 		if err != nil || rng == nil || !rng.more || rng.minKey != 90 || rng.minTS != 5000 || waited > 50*time.Millisecond {
 			t.Fatalf("rng=%+v waited=%v err=%v", rng, waited, err)
 		}
 		w = s.openWatch()
-		rng, _, err = s.awaitInboxRange(context.Background(), w, inboxTop, 5000, true, 0, &counts)
+		rng, _, err = s.awaitInboxRange(context.Background(), w, inboxTop, cursorPos{ts: 5000, key: 90}, true, 0, &counts)
 		s.closeWatch(w, &counts)
 		if err != nil || rng != nil {
 			t.Fatalf("with nothing arrived and no budget: rng=%+v err=%v", rng, err)
 		}
-	})
-}
-
-// (d) The final page: an inbox-parent end row on a later frame, at the page's position or with none, ends the listing
-// complete without another request. 55b3df5 stopped incomplete on that page.
-func TestWalkCompletesOnALateEndRow(t *testing.T) {
-	for name, end := range map[string]*table.LSTable{
-		"inbox end at the page":  rangeOnly(rangeRow(false, -1, 80, 4000)),
-		"inbox end, no position": rangeOnly(rangeRow(false, -1, 0, 0)),
-	} {
-		t.Run(name, func(t *testing.T) {
-			withRangeWait(t, 2*time.Second)
-			s := newTestSession()
-			p := &framedInbox{s: s,
-				replies: []*table.LSTable{tpage(101, 5000, rangeRow(true, -1, 90, 5000)), tpage(102, 4000)},
-				later:   [][]laterFrame{nil, {late(30*time.Millisecond, end)}},
-			}
-			res, _ := runFramed(t, p)
-			checkWalk(t, p, res, walkWant{stop: 0, pages: 2, refs: [][2]int64{{90, 5000}}})
-		})
-	}
-	t.Run("single page", func(t *testing.T) {
-		withRangeWait(t, 2*time.Second)
-		s := newTestSession()
-		p := &framedInbox{s: s, replies: []*table.LSTable{tpage(101, 5000)}, later: [][]laterFrame{{late(30*time.Millisecond, rangeOnly(rangeRow(false, -1, 101, 5000)))}}}
-		res, _ := runFramed(t, p)
-		checkWalk(t, p, res, walkWant{stop: 0, pages: 1})
 	})
 }
 
@@ -392,7 +444,7 @@ func TestLateRangesKeepTheWalkCapAndResume(t *testing.T) {
 	s := newTestSession()
 	p := &framedInbox{s: s}
 	for i := int64(0); i < 5; i++ {
-		p.replies = append(p.replies, tpage(100+i, 5000-i))
+		p.replies = append(p.replies, tpage(90-i, 5000-i))
 		p.later = append(p.later, []laterFrame{late(5*time.Millisecond, rangeOnly(rangeRow(true, -1, 90-i, 5000-i)))})
 	}
 	res, _ := runFramed(t, p)

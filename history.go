@@ -575,8 +575,14 @@ var inboxTop = socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, Referenc
 // (connector/threadbackfill.go). Such a row carries no request id (the library hands
 // the event handler a parsed table only), so it is tied to the page by everything the
 // library does expose: the connection epoch, the window, the sync group, the parent
-// and the page's position (see lateCandidates). The watch opens before the request is
-// sent and counts every range row that arrives while it is open, deciding or not.
+// and the page's position (see lateCandidates). Even so it may only continue the walk,
+// from a position strictly past the request's and not past the page's oldest thread;
+// it never ends it. Only a reply can complete the walk: a page whose end comes only on
+// a later frame stops 2, incomplete, as before, and the end row is counted. The late
+// wait covers live frames only: a second data frame on the request's one-off stream is
+// dropped by the library and only counted (oneoff_extra_frames). The watch opens before
+// the request is sent and counts every range row that arrives while it is open,
+// deciding or not.
 func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit emitFunc, rows *inboxRowCounts, ref socket.FetchThreadsTask, limit int, done func() bool) (gap string, stop, pages int, next socket.FetchThreadsTask, err error) {
 	const group = 1
 	budget := inboxRangeWait
@@ -944,8 +950,10 @@ type inboxRowCounts struct {
 // lateCounts is the range rows of later frames by table, kind and parent. "sync" is
 // LSUpsertSyncGroupThreadsRange (group 1), "inbox" LSUpsertInboxThreadsRange (group 1),
 // "v2" LSUpdateThreadsRangesV2. otherEpoch counts the rows that arrived after the
-// connection epoch changed (they are dropped); rejected the rows that could have
-// decided the page but did not answer its position (see pagePosition.answers).
+// connection epoch changed (they are dropped); rejected the more rows that could have
+// continued the page but did not answer its position (see pagePosition.answers). The
+// end rows (syncInboxEnd, syncP0End, inboxEnd) never decide anything: their counts
+// are the late terminal rows the walk ignored.
 type lateCounts struct {
 	total                                                         int
 	syncInboxMore, syncInboxEnd, syncP0More, syncP0End, syncOther int
@@ -1113,23 +1121,34 @@ func replyRange(tbl *table.LSTable, counts *inboxRowCounts) *walkRange {
 	return nil
 }
 
-// pageFloor is the oldest last-activity time among the thread rows of a page's reply:
-// the range that answers the page starts there. ok is false when the reply has no
-// thread row with a time.
-func pageFloor(tbl *table.LSTable) (floor int64, ok bool) {
-	see := func(ts int64) {
-		if ts > 0 && (!ok || ts < floor) {
-			floor, ok = ts, true
+// cursorPos is a position in the inbox walk's order: a request's reference, a range
+// row's minimum, a thread's place. The walk goes from newer to older; at the same
+// activity time the smaller thread key is the older one, as a range row names its
+// minimum key and minimum time together.
+type cursorPos struct{ ts, key int64 }
+
+// olderThan says whether p comes strictly after q in the walk.
+func (p cursorPos) olderThan(q cursorPos) bool {
+	return p.ts < q.ts || (p.ts == q.ts && p.key < q.key)
+}
+
+// pageFloor is the oldest position among the thread rows of a page's reply: the range
+// that answers the page starts there. ok is false when the reply has no thread row
+// with a time.
+func pageFloor(tbl *table.LSTable) (floor cursorPos, ok bool) {
+	see := func(key, ts int64) {
+		if p := (cursorPos{ts: ts, key: key}); ts > 0 && (!ok || p.olderThan(floor)) {
+			floor, ok = p, true
 		}
 	}
 	if tbl == nil {
-		return 0, false
+		return floor, false
 	}
 	for _, th := range tbl.LSDeleteThenInsertThread {
-		see(th.LastActivityTimestampMs)
+		see(th.ThreadKey, th.LastActivityTimestampMs)
 	}
 	for _, th := range tbl.LSUpdateOrInsertThread {
-		see(th.LastActivityTimestampMs)
+		see(th.ThreadKey, th.LastActivityTimestampMs)
 	}
 	return floor, ok
 }
@@ -1137,41 +1156,35 @@ func pageFloor(tbl *table.LSTable) (floor int64, ok bool) {
 // pagePosition is what a later frame's row is checked against: the page's request
 // reference (its ceiling) and the oldest thread its reply carried (its floor).
 type pagePosition struct {
-	ref     socket.FetchThreadsTask
-	floor   int64
+	ref     cursorPos
+	floor   cursorPos
 	floorOK bool
 }
 
-// answers says whether a row with this position can be the range of the page. A
-// page's range covers what the page delivered: its minimum is not newer than the
-// request's reference, not older than the oldest thread the reply carried, and, if it
-// says more, not the requested position itself (that would not move the walk). A row
-// from deeper in the inbox (an older request's, or a folder's) fails the floor; a row
-// from a page before this one fails the ceiling or is the reference. A no-more row
-// with no position (0/0) passes: the server's terminal rows may carry none.
-func (p pagePosition) answers(more bool, key, ts int64) bool {
-	if !more && key == 0 && ts == 0 {
-		return true
-	}
-	if !p.floorOK || ts < p.floor || ts > p.ref.ReferenceActivityTimestamp {
-		return false
-	}
-	return !more || key != p.ref.ReferenceThreadKey || ts != p.ref.ReferenceActivityTimestamp
+// answers says whether a more row whose minimum is at pos can continue the walk from
+// this page, comparing the whole (time, key) position in the walk's order. It must be
+// strictly older than the request's reference, so the walk moves forward, and not
+// older than the oldest thread the reply carried, so the next request skips none of
+// this page's threads, not even one at the same time. A row from deeper in the inbox
+// (an older request's, or a folder's) fails the floor; a row from a page before this
+// one, or at the reference, fails the ceiling.
+func (p pagePosition) answers(pos cursorPos) bool {
+	return p.floorOK && pos.olderThan(p.ref) && !pos.olderThan(p.floor)
 }
 
-// lateCandidates splits a later frame's rows into those that may decide the page and
-// a count of the ones that could have but do not answer its position. Only these may
-// decide: a group-1 sync-group row for the inbox parent (more or end); a group-1 inbox
-// table row that says more; a parent-0 sync-group row that says more. A late end row
-// completes the walk only for the inbox parent itself: never a parent-0 end (the
-// library's group-wide end, which another request's answer can carry) and never an
-// inbox-table end. V2 never decides.
+// lateCandidates splits a later frame's rows into those that may continue the page and
+// a count of the ones that could have but do not answer its position. A late row
+// carries no request id, so it never concludes the walk: only the reply to the walk's
+// own request can say there is nothing more. Only more rows may continue it: a group-1
+// sync-group row for the inbox parent or for parent 0, or a group-1 inbox-table row.
+// End rows of every table are left out here (they are counted by kind, see
+// lateCounts), and V2 never decides.
 func lateCandidates(r rangeRows, p pagePosition) (out rangeRows, rejected int) {
 	for _, row := range r.sync {
-		if row.ParentThreadKey != inboxParentKey && !(row.ParentThreadKey == 0 && row.HasMoreBefore) {
+		if !row.HasMoreBefore || (row.ParentThreadKey != inboxParentKey && row.ParentThreadKey != 0) {
 			continue
 		}
-		if p.answers(row.HasMoreBefore, row.MinThreadKey, row.MinLastActivityTimestampMS) {
+		if p.answers(cursorPos{ts: row.MinLastActivityTimestampMS, key: row.MinThreadKey}) {
 			out.sync = append(out.sync, row)
 		} else {
 			rejected++
@@ -1181,7 +1194,7 @@ func lateCandidates(r rangeRows, p pagePosition) (out rangeRows, rejected int) {
 		if !row.HasMoreBefore {
 			continue
 		}
-		if p.answers(true, row.MinThreadKey, row.MinLastActivityTimestampMs) {
+		if p.answers(cursorPos{ts: row.MinLastActivityTimestampMs, key: row.MinThreadKey}) {
 			out.inbox = append(out.inbox, row)
 		} else {
 			rejected++
@@ -1190,9 +1203,9 @@ func lateCandidates(r rangeRows, p pagePosition) (out rangeRows, rejected int) {
 	return out, rejected
 }
 
-// lateRange decides a page from the candidate rows of later frames: the last
-// inbox-parent row (it alone can end the walk), else the last inbox-table more row,
-// else the last parent-0 more row, both as cursors.
+// lateRange continues a page from the candidate rows of later frames, always with
+// more: the last inbox-parent row, else the last inbox-table row, else the last
+// parent-0 row. nil means no candidate yet.
 func lateRange(r rangeRows) *walkRange {
 	var inbox, p0 *table.LSUpsertSyncGroupThreadsRange
 	for _, row := range r.sync {
@@ -1203,7 +1216,7 @@ func lateRange(r rangeRows) *walkRange {
 		}
 	}
 	if inbox != nil {
-		return &walkRange{more: inbox.HasMoreBefore, minKey: inbox.MinThreadKey, minTS: inbox.MinLastActivityTimestampMS}
+		return &walkRange{more: true, minKey: inbox.MinThreadKey, minTS: inbox.MinLastActivityTimestampMS}
 	}
 	if n := len(r.inbox); n > 0 {
 		row := r.inbox[n-1]
@@ -1270,16 +1283,17 @@ func (s *messagixSession) offerLocked(w *rangeWatch, tbl *table.LSTable) {
 	}
 }
 
-// awaitInboxRange waits, at most budget, for a later frame to carry a row that
-// answers the page requested at ref whose reply's oldest thread is floor, and decides
-// the page from the candidates gathered so far each time rows arrive. It returns how
-// long it waited. nil without an error means none arrived in time: the walk stops as
-// before (stop 2). Only a cancel is an error.
-func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, ref socket.FetchThreadsTask, floor int64, floorOK bool, budget time.Duration, counts *inboxRowCounts) (*walkRange, time.Duration, error) {
+// awaitInboxRange waits, at most budget, for a later frame to carry a more row that
+// answers the page requested at ref whose reply's oldest thread is floor, and
+// continues the page from the candidates gathered so far each time rows arrive. A
+// late row never ends the walk (see lateCandidates). It returns how long it waited.
+// nil without an error means none arrived in time: the walk stops as before (stop 2).
+// Only a cancel is an error.
+func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, ref socket.FetchThreadsTask, floor cursorPos, floorOK bool, budget time.Duration, counts *inboxRowCounts) (*walkRange, time.Duration, error) {
 	start := time.Now()
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
-	pos := pagePosition{ref: ref, floor: floor, floorOK: floorOK}
+	pos := pagePosition{ref: cursorPos{ts: ref.ReferenceActivityTimestamp, key: ref.ReferenceThreadKey}, floor: floor, floorOK: floorOK}
 	var gathered rangeRows
 	for {
 		s.mu.Lock()
