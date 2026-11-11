@@ -93,7 +93,13 @@ func (s *messagixSession) handleTableFrames(tbl *table.LSTable) []Frame {
 // folder marks (pending or spam), the message request status and the thread's type.
 // The fence only ever withholds a reply's facts, so it can only reduce certification.
 // Its other facts (title, activity) still apply: they cannot certify anything.
+//
+// A live table's range rows also go to the inbox page's open range watch, if any
+// (see offerLocked); a reply's never do, since the walk reads its own reply.
 func (s *messagixSession) buildTableFramesLocked(tbl *table.LSTable, epoch int64, reply *issueMark) (frames []Frame) {
+	if reply == nil && s.rangeWatch != nil {
+		s.offerLocked(s.rangeWatch, tbl)
+	}
 	// stale: a reply's roster rows for this thread are older than a live change.
 	stale := func(key int64) bool { return reply != nil && s.rosterMut[key] > reply.seq }
 	// mutate records a live roster row for the thread.
