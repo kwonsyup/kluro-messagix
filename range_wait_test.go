@@ -51,9 +51,22 @@ type framedInbox struct {
 	onRequest func()
 	tasks     []socket.FetchThreadsTask
 	wg        sync.WaitGroup
+	ids       []messagix.RequestIDs // optional: the ids each inbox request reports (ExecuteTasksWithIDs)
+	cursor    string                // optional: the group-1 cursor each request is sent with
 }
 
-func (p *framedInbox) GetCursor(int64) string { return "" }
+func (p *framedInbox) GetCursor(int64) string { return p.cursor }
+
+// ExecuteTasksWithIDs is ExecuteTasks with the scripted ids of the inbox request (zero when none are scripted).
+func (p *framedInbox) ExecuteTasksWithIDs(ctx context.Context, tasks ...socket.Task) (*table.LSTable, messagix.RequestIDs, error) {
+	inbox := isInboxTask(tasks[0])
+	tbl, err := p.ExecuteTasks(ctx, tasks...)
+	var ids messagix.RequestIDs
+	if i := len(p.tasks) - 1; inbox && i >= 0 && i < len(p.ids) {
+		ids = p.ids[i]
+	}
+	return tbl, ids, err
+}
 
 func (p *framedInbox) ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error) {
 	if !isInboxTask(tasks[0]) {
@@ -70,14 +83,14 @@ func (p *framedInbox) ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*
 	if i < len(p.later) {
 		for _, f := range p.later[i] {
 			if f.after == 0 {
-				p.s.handleMetaEvent(ctx, f.ev)
+				deliver(p.s, ctx, f.ev)
 				continue
 			}
 			p.wg.Add(1)
 			go func(f laterFrame) {
 				defer p.wg.Done()
 				time.Sleep(f.after)
-				p.s.handleMetaEvent(context.Background(), f.ev)
+				deliver(p.s, context.Background(), f.ev)
 			}(f)
 		}
 	}
@@ -419,16 +432,16 @@ func TestOneWaitBudgetPerWalk(t *testing.T) {
 	t.Run("a row that already arrived decides with no budget left", func(t *testing.T) {
 		s := newTestSession()
 		topPos := pagePosition{ref: cursorPos{ts: inboxTop.ReferenceActivityTimestamp, key: inboxTop.ReferenceThreadKey}, floor: cursorPos{ts: 5000, key: 90}, floorOK: true}
-		w := s.openWatch()
-		s.handleMetaEvent(context.Background(), rangeOnly(rangeRow(true, -1, 90, 5000)))
 		var counts inboxRowCounts
-		rng, waited, err := s.awaitInboxRange(context.Background(), w, topPos, 0, &counts)
+		w := s.openWatch("", &counts)
+		s.handleMetaEvent(context.Background(), rangeOnly(rangeRow(true, -1, 90, 5000)))
+		rng, _, waited, err := s.awaitInboxRange(context.Background(), w, topPos, 0, &counts)
 		s.closeWatch(w, &counts)
 		if err != nil || rng == nil || !rng.more || rng.minKey != 90 || rng.minTS != 5000 || waited > 50*time.Millisecond {
 			t.Fatalf("rng=%+v waited=%v err=%v", rng, waited, err)
 		}
-		w = s.openWatch()
-		rng, _, err = s.awaitInboxRange(context.Background(), w, topPos, 0, &counts)
+		w = s.openWatch("", &counts)
+		rng, _, _, err = s.awaitInboxRange(context.Background(), w, topPos, 0, &counts)
 		s.closeWatch(w, &counts)
 		if err != nil || rng != nil {
 			t.Fatalf("with nothing arrived and no budget: rng=%+v err=%v", rng, err)

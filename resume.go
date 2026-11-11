@@ -68,6 +68,7 @@ func (s *messagixSession) resumeSync(ctx context.Context, saved json.RawMessage)
 	wctx, cancel := context.WithTimeout(ctx, resumeSyncTimeout)
 	defer cancel()
 	var frames []Frame
+	var applied []*table.LSTable
 	rows := 0
 	for _, db := range resumeSyncDatabases {
 		syncParams := params.Contact
@@ -95,10 +96,12 @@ func (s *messagixSession) resumeSync(ctx context.Context, saved json.RawMessage)
 		}
 		frames = append(frames, s.handleTableFrames(tbl)...)
 		rows += countRows(tbl)
+		applied = append(applied, tbl)
 	}
 	s.mu.Lock()
 	s.resumeRows = rows
 	s.mu.Unlock()
+	s.setStartKinds(startSrcResumeSync, applied...)
 	return frames, nil
 }
 
@@ -161,6 +164,7 @@ func (s *messagixSession) startPageReload(ctx context.Context, saved json.RawMes
 	s.mu.Lock()
 	s.resumeRows = countRows(tbl)
 	s.mu.Unlock()
+	s.setStartKinds(startSrcPageReload, tbl)
 	return frames
 }
 

@@ -521,6 +521,7 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit
 	stats["inbox_rows_parent0_end"] = rows.parent0End
 	stats["inbox_rows_other_parent"] = rows.other
 	rows.addStats(stats)
+	s.logWalkTables(&rows)
 	stats["scope_parents"], stats["scope_pages"], stats["scope_failed"] = len(parents), scopePages, failed
 	return listingDone{Stats: stats, Gap: gap}, nil
 }
@@ -534,7 +535,9 @@ func (s *messagixSession) listThreads(ctx context.Context, cli threadPager, emit
 // own page fetch does; nothing is written to the library.
 // Inbox stop codes: 0 complete, 1 no table, 2 no range (none in the reply, and none on
 // a later frame that answers the page within the walk's wait budget), 3 no movement,
-// 4 page bound.
+// 4 page bound, 6 end not confirmed (a later frame carried an end row for the page, see
+// pagePosition.endForPage; it cannot be tied to the walk's request, so the walk is
+// still incomplete).
 //
 // A walk that ends at the page bound keeps its continuation position in s.inboxResume,
 // and the next walk of this session resumes there, so an inbox longer than the cap is
@@ -581,7 +584,9 @@ var inboxTop = socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, Referenc
 // thread is unknown; a late row may then be checked against the oldest thread of the
 // frame that carried it, and only on a watch opened after the socket's first sync (see
 // pagePosition.frameFloor). Only a reply can complete the walk: a page whose end comes only on
-// a later frame stops 2, incomplete, as before, and the end row is counted. The late
+// a later frame stops incomplete: 6 when that end row is one for the page (see
+// pagePosition.endForPage; it changes neither the wait nor whether the walk goes on, only
+// the stop code), else 2 as before. Every end row is counted. The late
 // wait covers live frames only: a second data frame on the request's one-off stream is
 // dropped by the library and only counted (oneoff_extra_frames). The watch opens before
 // the request is sent and counts every range row that arrives while it is open,
@@ -596,10 +601,12 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 			return "", 0, pages, ref, err
 		}
 		task := ref
-		task.Cursor = cli.GetCursor(group)
+		cursor := cli.GetCursor(group)
+		task.Cursor = cursor
 		task.SyncGroup = group
-		watch = s.openWatch()
-		tbl, err := s.fetchPage(ctx, cli, emit, task)
+		watch = s.openWatch(cursor, rows)
+		tbl, ids, err := s.fetchPage(ctx, cli, emit, task)
+		s.setWatchIDs(watch, ids)
 		if err != nil {
 			return "", 0, pages, ref, err
 		}
@@ -607,6 +614,7 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 			return gapInboxIncomplete, 1, pages, ref, nil
 		}
 		pages++
+		rows.reply.see(tbl, ids)
 		if err := ctx.Err(); err != nil {
 			return "", 0, pages, ref, err
 		}
@@ -616,14 +624,15 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 		replyThreads := threadRowCount(tbl)
 		rows.replyThreads += replyThreads
 		rng := replyRange(tbl, rows)
+		endSeen := false
 		if rng == nil {
-			pos := pagePosition{ref: cursorPos{ts: ref.ReferenceActivityTimestamp, key: ref.ReferenceThreadKey}}
+			pos := pagePosition{ref: cursorPos{ts: ref.ReferenceActivityTimestamp, key: ref.ReferenceThreadKey}, postConnect: watch.postConnect}
 			pos.floor, pos.floorOK = pageFloor(tbl)
 			// An empty reply gives no floor; a late row may then use its own frame's, but only on a
 			// watch opened after the socket's first sync (see rangeWatch.postConnect).
 			pos.frameFloor = replyThreads == 0 && watch.postConnect
 			var waited time.Duration
-			rng, waited, err = s.awaitInboxRange(ctx, watch, pos, max(budget, 0), rows)
+			rng, endSeen, waited, err = s.awaitInboxRange(ctx, watch, pos, max(budget, 0), rows)
 			budget -= waited
 			rows.waitMS += int(waited.Milliseconds())
 			if err != nil {
@@ -635,6 +644,9 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 		}
 		s.closeWatch(watch, rows)
 		watch = nil
+		if rng == nil && endSeen {
+			return gapInboxIncomplete, 6, pages, ref, nil
+		}
 		if rng == nil {
 			return gapInboxIncomplete, 2, pages, ref, nil
 		}
@@ -661,19 +673,20 @@ type inboxResumeRef struct{ threadKey, activityMS int64 }
 // fetchPage issues one thread-list request and applies its reply through the normal
 // table path. The reply's roster rows date from the request: a reconnect, or a live
 // roster or mark change, while it was in flight leaves them stale. A nil table is
-// returned as is, unapplied.
-func (s *messagixSession) fetchPage(ctx context.Context, cli threadPager, emit emitFunc, task socket.FetchThreadsTask) (*table.LSTable, error) {
+// returned as is, unapplied. ids are the request's packet and task ids when the client
+// reports them (zero otherwise); they are only ever counted (see tieProbe).
+func (s *messagixSession) fetchPage(ctx context.Context, cli threadPager, emit emitFunc, task socket.FetchThreadsTask) (*table.LSTable, messagix.RequestIDs, error) {
 	task.IsAfter = 0
 	task.AdditionalPagesToFetch = 0
 	s.mu.Lock()
 	mark := s.issueMarkLocked()
 	s.mu.Unlock()
-	tbl, err := cli.ExecuteTasks(ctx, &task)
+	tbl, ids, err := executeWithIDs(ctx, cli, &task)
 	if err != nil {
-		return nil, mapSendErr(err)
+		return nil, ids, mapSendErr(err)
 	}
 	if tbl == nil {
-		return nil, nil
+		return nil, ids, nil
 	}
 	s.handleReplyEmit(tbl, mark, func(f Frame) int64 {
 		if ctx.Err() != nil {
@@ -681,7 +694,7 @@ func (s *messagixSession) fetchPage(ctx context.Context, cli threadPager, emit e
 		}
 		return emit(f)
 	})
-	return tbl, nil
+	return tbl, ids, nil
 }
 
 // inboxParentKey is the parent thread key of the main inbox: the only parent the walk
@@ -762,7 +775,7 @@ func (s *messagixSession) scanScopes(ctx context.Context, cli threadPager, emit 
 		if task.SyncGroup == 1 {
 			task.Cursor = cli.GetCursor(1)
 		}
-		tbl, err := s.fetchPage(ctx, cli, emit, task)
+		tbl, _, err := s.fetchPage(ctx, cli, emit, task)
 		if err := ctx.Err(); err != nil {
 			return pages, failed, err
 		}
@@ -793,13 +806,19 @@ type tallyPager struct {
 }
 
 func (p tallyPager) ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error) {
-	tbl, err := p.threadPager.ExecuteTasks(ctx, tasks...)
+	tbl, _, err := p.ExecuteTasksWithIDs(ctx, tasks...)
+	return tbl, err
+}
+
+// ExecuteTasksWithIDs passes the request's ids through from the client it wraps.
+func (p tallyPager) ExecuteTasksWithIDs(ctx context.Context, tasks ...socket.Task) (*table.LSTable, messagix.RequestIDs, error) {
+	tbl, ids, err := executeWithIDs(ctx, p.threadPager, tasks...)
 	if err == nil && tbl != nil && len(tasks) == 1 {
 		if task, ok := tasks[0].(*socket.FetchThreadsTask); ok {
 			p.tally.add(task, tbl)
 		}
 	}
-	return tbl, err
+	return tbl, ids, err
 }
 
 // scopeKey is one request scope: a sync group and a parent thread key.
@@ -940,8 +959,8 @@ func scopeCode(t *scopeTally, parents []int64, failed bool) string {
 	return code
 }
 
-// inboxRowCounts accumulates one walk's range diagnostics, counts only. None of them
-// changes what the walk decides.
+// inboxRowCounts accumulates one walk's range diagnostics, counts only. The walk never
+// reads them to decide anything.
 type inboxRowCounts struct {
 	// The replies' group-1 LSUpsertSyncGroupThreadsRange rows by category, as before.
 	total, inbox, parent0More, parent0End, other int
@@ -956,6 +975,19 @@ type inboxRowCounts struct {
 	// Frames the library dropped during the walk (see frameDropHook): a second data
 	// frame on a one-off stream, and a data frame for a stream it no longer has.
 	oneoffExtra, unknownStream int
+	// The replies' group-1 sync-group rows by parent class and more/end.
+	replyClass rangeClass
+	// The replies' task, sync-block and table-name diagnostics.
+	reply replyDiag
+	// The request ids of the live tables seen while a page's watch was open (see tieProbe).
+	tie tieProbe
+	// The end rows that stopped a page with 6, and what was counted beside them (see end6Counts).
+	end6 end6Counts
+	// Table names present in the later frames that carried a range row.
+	lateNames map[string]bool
+	// The connection epoch of the walk's first watch, and whether one was opened.
+	firstEpoch int64
+	opened     bool
 }
 
 // lateCounts is the range rows of later frames by table, kind and parent. "sync" is
@@ -974,6 +1006,15 @@ type lateCounts struct {
 	inboxMore, inboxEnd, v2Inbox, v2Other                         int
 	otherEpoch, rejected                                          int
 	rejNoFloor, rejCeiling, rejFloor, rejEpoch, framesThreads     int
+	// syncOtherEnd is the end rows among syncOther.
+	syncOtherEnd int
+	// Rows of the task tables (LSRemoveTask, LSTaskExists, the task-completion table),
+	// database-1 sync blocks, and the blocks whose current cursor is the one the page was
+	// sent with, in the later frames that carried a range row.
+	removeTask, taskExists, taskDone, db1Blocks, cursorSent int
+	// resync is the database-1 resync markers that live tables carried while a watch
+	// was open, in its epoch.
+	resync int
 }
 
 func (c *lateCounts) add(r rangeRows) {
@@ -990,6 +1031,9 @@ func (c *lateCounts) add(r rangeRows) {
 			c.syncP0End++
 		default:
 			c.syncOther++
+			if !row.HasMoreBefore {
+				c.syncOtherEnd++
+			}
 		}
 	}
 	for _, row := range r.inbox {
@@ -1026,6 +1070,13 @@ func (c *lateCounts) merge(o lateCounts) {
 	c.rejFloor += o.rejFloor
 	c.rejEpoch += o.rejEpoch
 	c.framesThreads += o.framesThreads
+	c.syncOtherEnd += o.syncOtherEnd
+	c.removeTask += o.removeTask
+	c.taskExists += o.taskExists
+	c.taskDone += o.taskDone
+	c.db1Blocks += o.db1Blocks
+	c.cursorSent += o.cursorSent
+	c.resync += o.resync
 }
 
 // reject counts a candidate row that did not answer the page, by reason.
@@ -1068,6 +1119,17 @@ func (c *inboxRowCounts) addStats(stats map[string]int) {
 	stats["inbox_late_frames_threads"] = c.late.framesThreads
 	stats["oneoff_extra_frames"] = c.oneoffExtra
 	stats["oneoff_unknown_stream_frames"] = c.unknownStream
+	stats["inbox_late_sync_other_end"] = c.late.syncOtherEnd
+	stats["inbox_late_remove_task"] = c.late.removeTask
+	stats["inbox_late_task_exists"] = c.late.taskExists
+	stats["inbox_late_task_done"] = c.late.taskDone
+	stats["inbox_late_db1_blocks"] = c.late.db1Blocks
+	stats["inbox_late_cursor_sent"] = c.late.cursorSent
+	stats["inbox_watch_resync"] = c.late.resync
+	c.replyClass.addStats(stats, "inbox_rows_g1_")
+	c.reply.addStats(stats)
+	c.tie.addStats(stats)
+	c.end6.addStats(stats)
 }
 
 // walkRange is one page's range decision: more says whether the walk goes on, and
@@ -1144,6 +1206,7 @@ func replyRange(tbl *table.LSTable, counts *inboxRowCounts) *walkRange {
 		default:
 			counts.other++
 		}
+		counts.replyClass.add(row)
 	}
 	counts.inboxTable += len(r.inbox)
 	counts.v2 += len(r.v2)
@@ -1207,15 +1270,28 @@ func threadRowCount(tbl *table.LSTable) int {
 // first sync, so the library's own connect-time thread fetches (which may start deeper
 // in the inbox, from its saved state) can never lend a row a floor.
 type pagePosition struct {
-	ref        cursorPos
-	floor      cursorPos
-	floorOK    bool
-	frameFloor bool
+	ref         cursorPos
+	floor       cursorPos
+	floorOK     bool
+	frameFloor  bool
+	postConnect bool // the page's watch was opened after the socket's first sync
 }
 
 // possible says whether any late row could ever answer this page: without a floor from
 // the reply or from the row's own frame, none can.
 func (p pagePosition) possible() bool { return p.floorOK || p.frameFloor }
+
+// floorFor is the floor a row carried by frame f is judged against: the reply's, else
+// (with frameFloor) the frame's own oldest thread. ok is false when there is none.
+func (p pagePosition) floorFor(f lateFrame) (floor cursorPos, ok bool) {
+	if p.floorOK {
+		return p.floor, true
+	}
+	if p.frameFloor {
+		return f.floor, f.floorOK
+	}
+	return cursorPos{}, false
+}
 
 type rejectReason int
 
@@ -1237,10 +1313,7 @@ const (
 // single new thread) fails the floor; a row from a page before this one, or at the
 // reference, fails the ceiling.
 func (p pagePosition) judge(pos cursorPos, f lateFrame) rejectReason {
-	floor, ok := p.floor, p.floorOK
-	if !ok && p.frameFloor {
-		floor, ok = f.floor, f.floorOK
-	}
+	floor, ok := p.floorFor(f)
 	switch {
 	case !ok:
 		return rejNoFloor
@@ -1340,32 +1413,68 @@ func lateRange(r rangeRows) *walkRange {
 // was up): the library's own connect-time thread fetches are answered before that. Its
 // fields are guarded by s.mu; ready is signalled, never blocking, when rows are kept or
 // the epoch changes.
+//
+// The rest is counted only, never decided on: cursor is the database-1 cursor the page
+// was sent with; ids are the page request's ids once its reply returned; seen is every
+// live table that reached the event handler while the watch was open, with its frame's
+// request id (see tieProbe); resync is whether one of them carried a database-1 resync
+// marker in the watch's epoch; names is the table names of the frames it kept.
 type rangeWatch struct {
 	epoch       int64
 	postConnect bool
 	frames      []lateFrame
 	counts      lateCounts
 	ready       chan struct{}
+
+	cursor     string
+	firstEpoch int64 // the epoch of the walk's first watch
+	ids        messagix.RequestIDs
+	seen       []liveSeen
+	resync     bool
+	names      map[string]bool
+	closed     bool
 }
 
-// lateFrame is one live table's range rows and the oldest of its thread rows.
+// lateFrame is one live table's range rows and the oldest of its thread rows. The
+// other fields serve endForPage and the counts beside stop 6: the newest thread row, the
+// number of thread rows and whether any has no time, the frame's request tag, its
+// task-table ids and its database-1 current cursors.
 type lateFrame struct {
 	rows    rangeRows
 	floor   cursorPos
 	floorOK bool
+
+	newest  cursorPos
+	threads int
+	untimed bool
+	keys    map[int64]bool
+	tag     liveTag
+	taskIDs []int64
+	cursors []string
 }
 
-// openWatch opens the walk's watch for the page about to be requested. Walks hold the
-// walk slot, so at most one watch is open at a time.
-func (s *messagixSession) openWatch() *rangeWatch {
+// openWatch opens the walk's watch for the page about to be requested, sent with
+// cursor. Walks hold the walk slot, so at most one watch is open at a time.
+func (s *messagixSession) openWatch(cursor string, counts *inboxRowCounts) *rangeWatch {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	w := &rangeWatch{epoch: s.connEpoch, postConnect: !s.linkDown, ready: make(chan struct{}, 1)}
+	if !counts.opened {
+		counts.opened, counts.firstEpoch = true, s.connEpoch
+	}
+	w := &rangeWatch{epoch: s.connEpoch, postConnect: !s.linkDown, ready: make(chan struct{}, 1), cursor: cursor, firstEpoch: counts.firstEpoch}
 	s.rangeWatch = w
 	return w
 }
 
-// closeWatch closes w (if it is still the open one) and adds what it counted to counts.
+// setWatchIDs records the page request's ids on its watch, for the counts only.
+func (s *messagixSession) setWatchIDs(w *rangeWatch, ids messagix.RequestIDs) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w.ids = ids
+}
+
+// closeWatch closes w (if it is still the open one) and adds what it counted to counts,
+// once.
 func (s *messagixSession) closeWatch(w *rangeWatch, counts *inboxRowCounts) {
 	if w == nil {
 		return
@@ -1375,8 +1484,19 @@ func (s *messagixSession) closeWatch(w *rangeWatch, counts *inboxRowCounts) {
 	if s.rangeWatch == w {
 		s.rangeWatch = nil
 	}
+	if w.closed {
+		return
+	}
+	w.closed = true
 	counts.late.merge(w.counts)
 	w.counts = lateCounts{}
+	counts.tie.count(w)
+	for name := range w.names {
+		if counts.lateNames == nil {
+			counts.lateNames = map[string]bool{}
+		}
+		counts.lateNames[name] = true
+	}
 }
 
 // bumpEpochLocked starts a new connection epoch and wakes an open range watch, whose
@@ -1407,13 +1527,32 @@ func (s *messagixSession) offerLocked(w *rangeWatch, tbl *table.LSTable) {
 	if threadRowCount(tbl) > 0 {
 		w.counts.framesThreads++
 	}
+	f := lateFrame{rows: r, tag: s.liveTag, taskIDs: taskIDsOf(tbl)}
+	w.counts.removeTask += len(tbl.LSRemoveTask)
+	w.counts.taskExists += len(tbl.LSTaskExists)
+	w.counts.taskDone += len(tbl.LSMailboxTaskCompletionApiOnTaskCompletion)
+	for _, b := range tbl.GetLSExecuteFirstBlockForSyncTransactionV4() {
+		if b.DatabaseID == 1 {
+			w.counts.db1Blocks++
+			f.cursors = append(f.cursors, b.CurrentCursor)
+			if w.cursor != "" && b.CurrentCursor == w.cursor {
+				w.counts.cursorSent++
+			}
+		}
+	}
+	if w.names == nil {
+		w.names = map[string]bool{}
+	}
+	for _, name := range tbl.NonNilFields() {
+		w.names[name] = true
+	}
 	if s.connEpoch != w.epoch {
 		w.counts.otherEpoch += r.len()
 		w.counts.rejEpoch += candidateCount(r)
 		return
 	}
-	f := lateFrame{rows: r}
 	f.floor, f.floorOK = pageFloor(tbl)
+	f.newest, f.threads, f.untimed, f.keys = frameThreads(tbl)
 	w.frames = append(w.frames, f)
 	w.wake()
 }
@@ -1427,12 +1566,28 @@ func (s *messagixSession) offerLocked(w *rangeWatch, tbl *table.LSTable) {
 // connection epoch changed, or a candidate row arrived that could only be judged
 // against its own frame and that frame had no thread rows (the page's range came apart
 // from its threads; a later row would not be the answer to this page).
-// Only a cancel is an error.
-func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, pos pagePosition, budget time.Duration, counts *inboxRowCounts) (*walkRange, time.Duration, error) {
+//
+// Stop 6 means exactly: an end row for the page was seen (see pagePosition.endForPage)
+// and no more row that answers the page arrived before the budget ran out. It is an
+// unproven end, since the end row cannot be tied to the walk's own request, and it is
+// always incomplete. An end row never shortens the wait and never changes whether the
+// walk goes on: the page waits as it would without it, and a more row that answers the
+// page still continues the walk. Its one effect is the stop code when the budget runs
+// out: endSeen is then true (stop 6) instead of the no-range stop 2. Every early end of
+// the wait keeps stop 2. A more row in the end row's own frame makes that end row not
+// one for the page (stop 2, counted as inbox_end_rej_more_in_frame); a later frame's
+// more row that does not answer the page leaves the end standing, and such frames are
+// counted in inbox_end6_contradicted, so stop 6 can be split into ends that stood alone
+// and ends that were contradicted. The decisions read no diagnostic counter. Only a
+// cancel is an error.
+func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, pos pagePosition, budget time.Duration, counts *inboxRowCounts) (rng *walkRange, endSeen bool, waited time.Duration, err error) {
 	start := time.Now()
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
 	var gathered rangeRows
+	var end *lateFrame // the first end row for the page; it only picks the stop code
+	contradicted := 0  // frames after it with more rows that did not answer the page (counted only)
+	var endRow *table.LSUpsertSyncGroupThreadsRange
 	for {
 		s.mu.Lock()
 		got := w.frames
@@ -1440,24 +1595,52 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 		moved := s.connEpoch != w.epoch
 		s.mu.Unlock()
 		if len(got) > 0 {
-			noFloor := counts.late.rejNoFloor
+			noFloor := false
+			for _, f := range got {
+				if _, ok := pos.floorFor(f); !ok && candidateCount(f.rows) > 0 {
+					noFloor = true // a candidate that can never be judged: see the doc comment
+				}
+			}
 			gathered.add(lateCandidates(got, pos, &counts.late))
 			if rng := lateRange(gathered); rng != nil {
-				return rng, time.Since(start), nil
+				return rng, false, time.Since(start), nil
 			}
-			if counts.late.rejNoFloor > noFloor {
-				return nil, time.Since(start), nil
+			if noFloor {
+				return nil, false, time.Since(start), nil
+			}
+			for i := range got {
+				if end != nil && candidateCount(got[i].rows) > 0 {
+					// After the end row, a frame whose more rows did not answer the page
+					// (one that did would have continued the walk above): counted only.
+					contradicted++
+				}
+				row := pos.endForPage(got[i])
+				if row == nil {
+					counts.end6.reject(pos, got[i])
+				} else if end == nil {
+					end, endRow = &got[i], row
+				}
 			}
 		}
 		if moved || !pos.possible() {
-			return nil, time.Since(start), nil
+			return nil, false, time.Since(start), nil
 		}
 		select {
 		case <-w.ready:
 		case <-timer.C:
-			return nil, time.Since(start), nil
+			if end == nil {
+				return nil, false, time.Since(start), nil
+			}
+			s.mu.Lock()
+			moved = s.connEpoch != w.epoch
+			if !moved {
+				counts.end6.count(s, w, pos, *end, endRow)
+				counts.end6.contradicted += contradicted
+			}
+			s.mu.Unlock()
+			return nil, !moved, time.Since(start), nil
 		case <-ctx.Done():
-			return nil, time.Since(start), ctx.Err()
+			return nil, false, time.Since(start), ctx.Err()
 		}
 	}
 }

@@ -174,6 +174,9 @@ type Frame struct {
 	// waitAck is local routing metadata. Encrypted events and enrollment state
 	// register a blocking ack waiter; ordinary state emission does not block.
 	waitAck bool `json:"-"`
+	// msgKind is local diagnostic metadata: 1 + the kind of a message's thread when its
+	// frame was built (msgKindLocked), 0 for any other frame. Counted once emitted.
+	msgKind int8 `json:"-"`
 
 	// commands
 	Target   int64             `json:"target,omitempty"`

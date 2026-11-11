@@ -127,7 +127,7 @@ func TestStartPageReloadOnReloadPageLoadsOnceAndUsesThePage(t *testing.T) {
 	if w := codesAt(t, buf, "warn"); !slices.Equal(w, []string{"resume_sync_failed.reload_page"}) {
 		t.Fatalf("warn codes = %v: the existing warning class stays, nothing else warns", w)
 	}
-	if i := codesAt(t, buf, "info"); !slices.Equal(i, []string{"start_page_reload_result.ok", "start_page_reload.1"}) {
+	if i := codesAt(t, buf, "info"); !slices.Equal(i, []string{"start_page_reload_result.ok", "start_tables.3.CreateOpenToE2EEThreadLink+DeleteThenInsertThread", "start_page_reload.1"}) {
 		t.Fatalf("info codes = %v", i)
 	}
 	if strings.Contains(buf.String(), secretText) {
@@ -219,7 +219,11 @@ func TestNoStartPageReloadOnOtherAnswers(t *testing.T) {
 			if r.loads != 0 || r.connects != 1 || len(r.restores) != 0 || r.s.listingStats(0, 0, 0)["start_page_reload"] != 0 {
 				t.Fatalf("loads=%d connects=%d restores=%d: no page load for this answer", r.loads, r.connects, len(r.restores))
 			}
-			if i := codesAt(t, buf, "info"); !slices.Equal(i, []string{"start_page_reload.0"}) {
+			want := []string{"start_page_reload.0"}
+			if name == "success" || name == "reload page on contacts" { // database 1 synced: its table's kinds are logged
+				want = []string{"start_tables.2.DeleteThenInsertThread", "start_page_reload.0"}
+			}
+			if i := codesAt(t, buf, "info"); !slices.Equal(i, want) {
 				t.Fatalf("info codes = %v", i)
 			}
 		})

@@ -60,3 +60,5 @@ require (
 )
 
 replace github.com/imroc/req/v3 => github.com/beeper/req/v3 v3.0.0-20260925135712-b49593750e56
+
+replace go.mau.fi/mautrix-meta => github.com/kwonsyup/mautrix-meta v0.0.0-20261111115334-a349dea558a1
