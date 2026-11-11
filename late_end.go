@@ -224,6 +224,7 @@ type end6Counts struct {
 	cursorSent, cursorOther, walkEpochMoved, knownGap, c1to8     int
 	rejPreConnect, rejNoThreads, rejUntimed, rejNewer            int
 	rejMoreInFrame, rejPosition                                  int
+	contradicted                                                 int // frames after a stop-6 end row whose more rows did not answer the page
 }
 
 // reject counts the stop-6 conditions that frame f's inbox-parent end row fails, if it
@@ -312,6 +313,7 @@ func (c *end6Counts) addStats(stats map[string]int) {
 	stats["inbox_end6_walk_epoch_moved"] = c.walkEpochMoved
 	stats["inbox_end6_known_gap"] = min(c.knownGap, 999)
 	stats["inbox_end6_c1to8"] = c.c1to8
+	stats["inbox_end6_contradicted"] = c.contradicted
 	stats["inbox_end_rej_preconnect"] = c.rejPreConnect
 	stats["inbox_end_rej_nothreads"] = c.rejNoThreads
 	stats["inbox_end_rej_untimed"] = c.rejUntimed

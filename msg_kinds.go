@@ -4,7 +4,10 @@ package main
 // The helper holds no message: every message it converts goes out at once (the
 // withholding for marked threads was reverted). Each message frame carries the kind of
 // its thread when it was built, and is counted when it went out (an encrypted one once
-// the connector acked it). What it does decide is what each
+// the connector acked it). Live and walk frames are emitted in the same hold of s.mu
+// they are built in, so build time is emit time. The start's frames are the exception:
+// they are built during Start and emitted later by the initial emitter, and they keep
+// the kind their thread had at Start. What it does decide is what each
 // thread frame says, and the connector holds a thread's live messages until that
 // frame qualifies (an inert request frame never does). msgKinds counts the messages
 // the helper emitted by what it knew of their thread at that moment, so the counts say

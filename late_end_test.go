@@ -114,7 +114,7 @@ var newDiagKeys = []string{
 	"inbox_tie_req_prev", "inbox_tie_req_prev_range", "inbox_tie_req_prev_end", "inbox_tie_req_zero", "inbox_tie_req_other",
 	"inbox_tie_remove_page", "inbox_tie_remove_prev", "inbox_tie_remove_other", "inbox_tie_exists_page", "inbox_tie_exists_prev", "inbox_tie_done_page", "inbox_tie_done_prev",
 	"inbox_end6_pages", "inbox_end6_tied_req", "inbox_end6_tied_task", "inbox_end6_tight", "inbox_end6_v2_agree", "inbox_end6_v2_disagree", "inbox_end6_resync",
-	"inbox_end6_cursor_sent", "inbox_end6_cursor_other", "inbox_end6_walk_epoch_moved", "inbox_end6_known_gap", "inbox_end6_c1to8",
+	"inbox_end6_cursor_sent", "inbox_end6_cursor_other", "inbox_end6_walk_epoch_moved", "inbox_end6_known_gap", "inbox_end6_c1to8", "inbox_end6_contradicted",
 	"inbox_end_rej_preconnect", "inbox_end_rej_nothreads", "inbox_end_rej_untimed", "inbox_end_rej_newer", "inbox_end_rej_more_in_frame", "inbox_end_rej_position",
 	"start_tbl_src", "start_tbl_threads", "start_tbl_verify_threads", "start_tbl_g1_inbox_more", "start_tbl_g1_inbox_end", "start_tbl_g1_p0_more", "start_tbl_g1_p0_end",
 	"start_tbl_g1_other_more", "start_tbl_g1_other_end", "start_tbl_inbox_more", "start_tbl_inbox_end", "start_tbl_v2_inbox", "start_tbl_v2_other", "start_tbl_ranges_query",
@@ -364,7 +364,8 @@ func TestF8CeilingAndKeyTiebreak(t *testing.T) {
 // F9: a more row wins over an end row, as it would without one. In the same frame: one that answers the page continues
 // the walk; one that does not leaves the end row unusable (stop 2, counted as more_in_frame). After the end row: one that
 // answers the page continues the walk; one that does not changes nothing, and the end row stops the page 6 when the
-// budget runs out (stop 6 does not look at other frames' more rows).
+// budget runs out (stop 6 does not look at other frames' more rows); each such frame after the end row is counted in
+// inbox_end6_contradicted, and one before it is not.
 func TestF9MoreRowWinsOverEnd(t *testing.T) {
 	pg := [][2]int64{{120, 7000}, {90, 5000}}
 	end := threadsFrame(pg, rangeOnly(endRow(-1, 90, 5000)))
@@ -372,22 +373,24 @@ func TestF9MoreRowWinsOverEnd(t *testing.T) {
 	stray := threadsFrame([][2]int64{{200, 9000}}, rangeOnly(moreRow(-1, 10, 100)))
 	two := []*table.LSTable{emptyReply, tpage(80, 4000, endRow(-1, 80, 4000))}
 	for name, tc := range map[string]struct {
-		later      []laterFrame
-		want       walkWant
-		end6, rejM int
+		later             []laterFrame
+		want              walkWant
+		end6, rejM, contr int
 	}{
-		"answering more in the end's frame":        {[]laterFrame{late(20*time.Millisecond, threadsFrame(pg, rangeOnly(endRow(-1, 90, 5000), moreRow(0, 90, 5000))))}, walkWant{stop: 0, pages: 2, refs: [][2]int64{{90, 5000}}}, 0, 0},
-		"non-answering more in the end's frame":    {[]laterFrame{late(20*time.Millisecond, threadsFrame(pg, rangeOnly(endRow(-1, 90, 5000), moreRow(-1, 10, 100))))}, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 1}, 0, 1},
-		"answering more after the end":             {[]laterFrame{late(20*time.Millisecond, end), late(150*time.Millisecond, answer)}, walkWant{stop: 0, pages: 2, refs: [][2]int64{{90, 5000}}}, 0, 0},
-		"non-answering more after the end":         {[]laterFrame{late(20*time.Millisecond, end), late(150*time.Millisecond, stray)}, walkWant{gap: gapInboxIncomplete, stop: 6, pages: 1}, 1, 0},
-		"answering more after a stray and the end": {[]laterFrame{late(20*time.Millisecond, end), late(120*time.Millisecond, stray), late(320*time.Millisecond, answer)}, walkWant{stop: 0, pages: 2, refs: [][2]int64{{90, 5000}}}, 0, 0},
+		"answering more in the end's frame":        {[]laterFrame{late(20*time.Millisecond, threadsFrame(pg, rangeOnly(endRow(-1, 90, 5000), moreRow(0, 90, 5000))))}, walkWant{stop: 0, pages: 2, refs: [][2]int64{{90, 5000}}}, 0, 0, 0},
+		"non-answering more in the end's frame":    {[]laterFrame{late(20*time.Millisecond, threadsFrame(pg, rangeOnly(endRow(-1, 90, 5000), moreRow(-1, 10, 100))))}, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 1}, 0, 1, 0},
+		"answering more after the end":             {[]laterFrame{late(20*time.Millisecond, end), late(150*time.Millisecond, answer)}, walkWant{stop: 0, pages: 2, refs: [][2]int64{{90, 5000}}}, 0, 0, 0},
+		"non-answering more after the end":         {[]laterFrame{late(20*time.Millisecond, end), late(150*time.Millisecond, stray)}, walkWant{gap: gapInboxIncomplete, stop: 6, pages: 1}, 1, 0, 1},
+		"two non-answering mores after the end":    {[]laterFrame{late(20*time.Millisecond, end), late(120*time.Millisecond, stray), late(220*time.Millisecond, stray)}, walkWant{gap: gapInboxIncomplete, stop: 6, pages: 1}, 1, 0, 2},
+		"non-answering more before the end":        {[]laterFrame{late(20*time.Millisecond, stray), late(120*time.Millisecond, end)}, walkWant{gap: gapInboxIncomplete, stop: 6, pages: 1}, 1, 0, 0},
+		"answering more after a stray and the end": {[]laterFrame{late(20*time.Millisecond, end), late(120*time.Millisecond, stray), late(320*time.Millisecond, answer)}, walkWant{stop: 0, pages: 2, refs: [][2]int64{{90, 5000}}}, 0, 0, 0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			withRangeWait(t, 500*time.Millisecond)
 			p := &framedInbox{s: connected(t), replies: two, later: [][]laterFrame{tc.later}}
 			res, _ := runFramed(t, p)
 			checkWalk(t, p, res, tc.want)
-			wantLate(t, res.Stats, map[string]int{"inbox_end6_pages": tc.end6, "inbox_end_rej_more_in_frame": tc.rejM})
+			wantLate(t, res.Stats, map[string]int{"inbox_end6_pages": tc.end6, "inbox_end_rej_more_in_frame": tc.rejM, "inbox_end6_contradicted": tc.contr})
 		})
 	}
 }
@@ -785,15 +788,39 @@ func TestEncryptedMessageWithoutAckIsNotCounted(t *testing.T) {
 	s := newTestSession()
 	acks := newAckHub()
 	s.acks = acks
-	s.emit = func(f Frame) int64 { return acks.stamp(&f) } // stamped and written, never acked
-	done := make(chan bool, 1)
-	go func() {
-		done <- s.deliverEncrypted(e2eeEvent(waTypes.NewJID("6262", waTypes.MessengerServer), waTypes.EmptyJID, "W9"))
-	}()
-	time.Sleep(50 * time.Millisecond)
-	acks.close()
-	if <-done {
+	var seqs []int64
+	s.emit = func(f Frame) int64 { seq := acks.stamp(&f); seqs = append(seqs, seq); return seq } // stamped and written
+	acks.close()                                                                                 // the connector is gone: no ack can come
+	if s.deliverEncrypted(e2eeEvent(waTypes.NewJID("6262", waTypes.MessengerServer), waTypes.EmptyJID, "W9")) {
 		t.Fatal("a delivery without its ack must not be acknowledged")
 	}
+	if len(seqs) == 0 || seqs[len(seqs)-1] <= 0 {
+		t.Fatalf("the message must have been emitted (seqs %v): this test is about the missing ack, not a failed emit", seqs)
+	}
 	wantLate(t, s.listingStats(0, 0, 0), map[string]int{"emitted_msgs_enc": 0, "emitted_msgs_unknown": 0})
+}
+
+// The start's frames go out through the initial emitter; a message among them is counted once its emit returned a seq,
+// by the kind its thread had when Start built it, and not when the emit failed.
+func TestInitialEmitterCountsEmittedMessages(t *testing.T) {
+	s := newTestSession()
+	frames := s.handleTableFrames(&table.LSTable{
+		LSDeleteThenInsertThread:        []*table.LSDeleteThenInsertThread{{ThreadKey: 41, ThreadType: table.ONE_TO_ONE, FolderName: "inbox"}, {ThreadKey: 43, ThreadType: table.ONE_TO_ONE, FolderName: folderPending}},
+		LSAddParticipantIdToGroupThread: []*table.LSAddParticipantIdToGroupThread{{ThreadKey: 41, ContactId: 7}, {ThreadKey: 43, ContactId: 7}},
+		LSInsertMessage:                 []*table.LSInsertMessage{{ThreadKey: 41, MessageId: "s1", SenderId: 7, TimestampMs: 10}, {ThreadKey: 43, MessageId: "s2", SenderId: 7, TimestampMs: 10}, {ThreadKey: 41, MessageId: "s3", SenderId: 7, TimestampMs: 10}},
+	})
+	emitInitial := s.initialEmitter(frames)
+	if emitInitial == nil {
+		t.Fatal("no initial emitter")
+	}
+	wantLate(t, s.listingStats(0, 0, 0), map[string]int{"emitted_msgs_open": 0, "emitted_msgs_request": 0}) // built, not yet emitted
+	var seq int64
+	emitInitial(func(f Frame) int64 {
+		if f.T == TMessage && f.Message.ID == "s3" {
+			return -1
+		}
+		seq++
+		return seq
+	})
+	wantLate(t, s.listingStats(0, 0, 0), map[string]int{"emitted_msgs_open": 1, "emitted_msgs_request": 1})
 }

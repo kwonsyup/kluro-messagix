@@ -1567,19 +1567,26 @@ func (s *messagixSession) offerLocked(w *rangeWatch, tbl *table.LSTable) {
 // against its own frame and that frame had no thread rows (the page's range came apart
 // from its threads; a later row would not be the answer to this page).
 //
-// An end row for the page (see pagePosition.endForPage) never shortens the wait and
-// never changes whether the walk goes on: the page waits as it would without it, and a
-// more row that answers the page still continues the walk. Its one effect is the stop
-// code when the budget runs out: endSeen is then true (the page stops 6, still
-// incomplete, since the end row cannot be tied to the walk's own request) instead of
-// the no-range stop 2. Every early end of the wait keeps stop 2. The decisions read no
-// diagnostic counter. Only a cancel is an error.
+// Stop 6 means exactly: an end row for the page was seen (see pagePosition.endForPage)
+// and no more row that answers the page arrived before the budget ran out. It is an
+// unproven end, since the end row cannot be tied to the walk's own request, and it is
+// always incomplete. An end row never shortens the wait and never changes whether the
+// walk goes on: the page waits as it would without it, and a more row that answers the
+// page still continues the walk. Its one effect is the stop code when the budget runs
+// out: endSeen is then true (stop 6) instead of the no-range stop 2. Every early end of
+// the wait keeps stop 2. A more row in the end row's own frame makes that end row not
+// one for the page (stop 2, counted as inbox_end_rej_more_in_frame); a later frame's
+// more row that does not answer the page leaves the end standing, and such frames are
+// counted in inbox_end6_contradicted, so stop 6 can be split into ends that stood alone
+// and ends that were contradicted. The decisions read no diagnostic counter. Only a
+// cancel is an error.
 func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, pos pagePosition, budget time.Duration, counts *inboxRowCounts) (rng *walkRange, endSeen bool, waited time.Duration, err error) {
 	start := time.Now()
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
 	var gathered rangeRows
 	var end *lateFrame // the first end row for the page; it only picks the stop code
+	contradicted := 0  // frames after it with more rows that did not answer the page (counted only)
 	var endRow *table.LSUpsertSyncGroupThreadsRange
 	for {
 		s.mu.Lock()
@@ -1602,6 +1609,11 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 				return nil, false, time.Since(start), nil
 			}
 			for i := range got {
+				if end != nil && candidateCount(got[i].rows) > 0 {
+					// After the end row, a frame whose more rows did not answer the page
+					// (one that did would have continued the walk above): counted only.
+					contradicted++
+				}
 				row := pos.endForPage(got[i])
 				if row == nil {
 					counts.end6.reject(pos, got[i])
@@ -1623,6 +1635,7 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 			moved = s.connEpoch != w.epoch
 			if !moved {
 				counts.end6.count(s, w, pos, *end, endRow)
+				counts.end6.contradicted += contradicted
 			}
 			s.mu.Unlock()
 			return nil, !moved, time.Since(start), nil
