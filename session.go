@@ -288,7 +288,7 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 		}
 	}
 	if currentUser == nil {
-		ui, tbl, err := cli.LoadMessagesPage(ctx)
+		ui, tbl, err := s.startPageLoad(ctx, cli)
 		if err != nil {
 			return Ready{}, nil, classifyStartError("load_page", err)
 		}
@@ -323,6 +323,17 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 	s.markStateDirty()
 	logCode("info", "session_started")
 	return ready, emitInitial, nil
+}
+
+// startPageLoad is a non-resumed start's page load (no saved state, or state the
+// library refused). Like the resumed start's reload, it counts against
+// fullReconnect's spacing, marked before the load: a fatal socket error right after
+// the start must not load the page a second time.
+func (s *messagixSession) startPageLoad(ctx context.Context, cli *messagix.Client) (types.UserInfo, *table.LSTable, error) {
+	s.mu.Lock()
+	s.lastFullRec = time.Now()
+	s.mu.Unlock()
+	return cli.LoadMessagesPage(ctx)
 }
 
 // openSocket applies a resumed session's page-load sync and then opens the socket,

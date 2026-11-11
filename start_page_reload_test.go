@@ -432,3 +432,40 @@ func TestStartPageReloadFailureHoldsOffFullReconnect(t *testing.T) {
 		t.Fatalf("page loads = %d: fullReconnect right after the start's reload must not load the page again", pageLoads.Load())
 	}
 }
+
+// A non-resumed start's page load (no saved state, or state the library refused) holds off fullReconnect's page load
+// too: a fullReconnect right after the start, inside fullReconnect's spacing, loads no second page.
+func TestFreshStartPageLoadHoldsOffFullReconnect(t *testing.T) {
+	captureCodes(t)
+	cli := newWebTestClient()
+	var pageLoads atomic.Int64
+	cli.GetHTTP().SetTransportOverride(fakeHTTP(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.String() == cli.GetEndpoint("messages"):
+			// Only the start's page load is served; a second one fails before fullReconnect could connect.
+			if pageLoads.Add(1) > 1 {
+				return nil, errors.New("second page load")
+			}
+			return httpResponse(r, `<html><script type="application/json">{"require":[["ScheduledServerJS","handle",null,[{"__bbox":{"define":[["DTSGInitData",[],{"token":"page-token"},1],["CurrentUserInitialData",[],{"ACCOUNT_ID":"1","USER_ID":"1","NAME":"Me"},2]]}}]]]}</script><script src="https://static.invalid/version.js"></script></html>`), nil
+		case r.URL.String() == "https://static.invalid/version.js":
+			return httpResponse(r, `__d("LSVersion",[],function(a,b,c,d,e,f){e.exports="123"})`), nil
+		case r.Method == http.MethodPost && r.URL.String() == cli.GetEndpoint("graphql"):
+			return httpResponse(r, `{"data":{"viewer":{"lightspeed_web_request":{"payload":"{\"step\":[1]}","dependencies":[]}}}}`), nil
+		}
+		t.Errorf("unexpected HTTP request: %s %s", r.Method, r.URL)
+		return nil, errors.New("unexpected request")
+	}))
+	s := newTestSession()
+	s.ctx = context.Background()
+	s.client = cli
+	if user, _, err := s.startPageLoad(t.Context(), cli); err != nil || user.GetFBID() != 1 || pageLoads.Load() != 1 {
+		t.Fatalf("start page load: user=%v err=%v page loads=%d", user, err, pageLoads.Load())
+	}
+	if s.lastFullRec.IsZero() {
+		t.Fatal("the start's page load must hold off fullReconnect's")
+	}
+	s.fullReconnect() // what a fatal socket sync error right after the start triggers
+	if pageLoads.Load() != 1 {
+		t.Fatalf("page loads = %d: fullReconnect right after a fresh start must not load the page again", pageLoads.Load())
+	}
+}
