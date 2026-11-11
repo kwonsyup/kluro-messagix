@@ -14,7 +14,7 @@ import (
 	waTypes "go.mau.fi/whatsmeow/types"
 )
 
-// These tests pin stop 6 ("end not confirmed"), the settle after a late end row, the request-id tie counts and the
+// These tests pin stop 6 ("end not confirmed"), that an end row changes nothing but the stop code, the request-id tie counts and the
 // counts-only diagnostics. Fixture names (F0..F14) follow the walk notes' fixture list; each says what it changes from
 // F0, the base case: empty replies after the first sync, one epoch, pages 1 and 2 answered on a later frame by their
 // threads, a tight inbox-parent more row and a matching V2 row, and page 3 by its threads, an inbox-parent end row at
@@ -56,19 +56,6 @@ func TestFrameRequestIDIsTheLibrarys(t *testing.T) {
 		t.Fatal("a plain context carries no frame request id")
 	}
 	var _ requestIDPager = tallyPager{} // the walk's wrapper passes the ids through
-}
-
-func TestShippedEndSettle(t *testing.T) {
-	if endSettle != time.Second {
-		t.Fatalf("shipped end settle = %v, want 1s", endSettle)
-	}
-}
-
-func withEndSettle(t *testing.T, d time.Duration) {
-	t.Helper()
-	old := endSettle
-	endSettle = d
-	t.Cleanup(func() { endSettle = old })
 }
 
 func endRow(parent, key, ts int64) *table.LSUpsertSyncGroupThreadsRange {
@@ -127,7 +114,8 @@ var newDiagKeys = []string{
 	"inbox_tie_req_prev", "inbox_tie_req_prev_range", "inbox_tie_req_prev_end", "inbox_tie_req_zero", "inbox_tie_req_other",
 	"inbox_tie_remove_page", "inbox_tie_remove_prev", "inbox_tie_remove_other", "inbox_tie_exists_page", "inbox_tie_exists_prev", "inbox_tie_done_page", "inbox_tie_done_prev",
 	"inbox_end6_pages", "inbox_end6_tied_req", "inbox_end6_tied_task", "inbox_end6_tight", "inbox_end6_v2_agree", "inbox_end6_v2_disagree", "inbox_end6_resync",
-	"inbox_end6_cursor_sent", "inbox_end6_cursor_other", "inbox_end6_walk_epoch_moved", "inbox_end6_known_gap", "inbox_end6_c1to8", "inbox_end_settle_more", "inbox_end_settle_rejected",
+	"inbox_end6_cursor_sent", "inbox_end6_cursor_other", "inbox_end6_walk_epoch_moved", "inbox_end6_known_gap", "inbox_end6_c1to8",
+	"inbox_end_rej_preconnect", "inbox_end_rej_nothreads", "inbox_end_rej_untimed", "inbox_end_rej_newer", "inbox_end_rej_more_in_frame", "inbox_end_rej_position",
 	"start_tbl_src", "start_tbl_threads", "start_tbl_verify_threads", "start_tbl_g1_inbox_more", "start_tbl_g1_inbox_end", "start_tbl_g1_p0_more", "start_tbl_g1_p0_end",
 	"start_tbl_g1_other_more", "start_tbl_g1_other_end", "start_tbl_inbox_more", "start_tbl_inbox_end", "start_tbl_v2_inbox", "start_tbl_v2_other", "start_tbl_ranges_query",
 	"start_tbl_sync_blocks", "start_tbl_db1_blocks",
@@ -151,13 +139,12 @@ func withProbeKeys(base, nonzero map[string]int) map[string]int {
 }
 
 // F0 without and with a tie: the walk follows the late more rows to page 3, whose late end row stops it 6, never
-// complete, and returns after the settle. With every frame carrying its own page's request_id and page 3's frame its
+// complete, after page 3 waited the rest of the walk's budget. With every frame carrying its own page's request_id and page 3's frame its
 // task's removeTask row, the tie counts say so, and the walk still stops 6: no decision reads them.
 func TestF0LateEndStopsSixNeverComplete(t *testing.T) {
 	for name, tied := range map[string]bool{"untied": false, "tied by request and task id": true} {
 		t.Run(name, func(t *testing.T) {
-			withRangeWait(t, 2*time.Second)
-			withEndSettle(t, 100*time.Millisecond)
+			withRangeWait(t, 300*time.Millisecond)
 			fr := f0Frames()
 			var ev [3]any
 			for i := range fr {
@@ -192,8 +179,8 @@ func TestF0LateEndStopsSixNeverComplete(t *testing.T) {
 				}
 			}
 			wantLate(t, res.Stats, want)
-			if took > time.Second {
-				t.Fatalf("walk took %v: the end row should end page 3's wait after the settle", took)
+			if w := res.Stats["inbox_range_wait_ms"]; w < 299 || took > 2*time.Second {
+				t.Fatalf("waited %d ms in all, took %v: page 3 must wait out the 300 ms budget", w, took)
 			}
 		})
 	}
@@ -213,8 +200,7 @@ func TestF1StrayDeepEndNeverCompletes(t *testing.T) {
 		"during page 2": {[][]laterFrame{{late(20*time.Millisecond, f0Frames()[0])}, {late(20*time.Millisecond, deep)}}, 2, f0Refs[:1]},
 	} {
 		t.Run(name, func(t *testing.T) {
-			withRangeWait(t, time.Second)
-			withEndSettle(t, 50*time.Millisecond)
+			withRangeWait(t, 300*time.Millisecond)
 			p := &framedInbox{s: connected(t), ids: f0IDs, replies: []*table.LSTable{emptyReply, emptyReply, emptyReply}, later: tc.later}
 			res, _ := runFramed(t, p)
 			checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 6, pages: tc.pages, refs: tc.refs})
@@ -228,18 +214,18 @@ func TestF1StrayDeepEndNeverCompletes(t *testing.T) {
 func TestF2EndBeforeFirstSyncIsNotTaken(t *testing.T) {
 	frame := threadsFrame([][2]int64{{95, 6000}, {90, 5000}}, rangeOnly(endRow(-1, 90, 5000)))
 	for name, tc := range map[string]struct {
-		s    func(*testing.T) *messagixSession
-		stop int
+		s         func(*testing.T) *messagixSession
+		stop, rej int
 	}{
-		"before first sync": {func(*testing.T) *messagixSession { return beforeFirstSync() }, 2},
-		"after first sync":  {connected, 6},
+		"before first sync": {func(*testing.T) *messagixSession { return beforeFirstSync() }, 2, 1},
+		"after first sync":  {connected, 6, 0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			withRangeWait(t, 200*time.Millisecond)
-			withEndSettle(t, 50*time.Millisecond)
 			p := &framedInbox{s: tc.s(t), replies: []*table.LSTable{tpage(90, 5000)}, later: [][]laterFrame{{late(20*time.Millisecond, frame)}}}
 			res, _ := runFramed(t, p)
 			checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: tc.stop, pages: 1})
+			wantLate(t, res.Stats, map[string]int{"inbox_end_rej_preconnect": tc.rej, "inbox_end_rej_nothreads": 0, "inbox_end_rej_newer": 0, "inbox_end_rej_position": 0})
 		})
 	}
 }
@@ -247,8 +233,7 @@ func TestF2EndBeforeFirstSyncIsNotTaken(t *testing.T) {
 // F3: a database-1 resync marker, then a replayed end row (the replay is not a live frame: no request id), in the same
 // epoch. The resync check does not exist in the walk yet, so it is counted beside stop 6, not folded into it.
 func TestF3ResyncIsCountedBesideStopSix(t *testing.T) {
-	withRangeWait(t, time.Second)
-	withEndSettle(t, 50*time.Millisecond)
+	withRangeWait(t, 300*time.Millisecond)
 	marker := tagged{id: 500, ev: withDB1Block(&table.LSTable{}, "c", table.SyncStatusResync)}
 	replay := withV2(threadsFrame([][2]int64{{120, 7000}, {90, 5000}}, rangeOnly(endRow(-1, 90, 5000))), -1, 90, 5000)
 	p := &framedInbox{s: connected(t), ids: f0IDs, replies: []*table.LSTable{emptyReply}, later: [][]laterFrame{{late(10*time.Millisecond, marker), late(30*time.Millisecond, replay)}}}
@@ -257,16 +242,16 @@ func TestF3ResyncIsCountedBesideStopSix(t *testing.T) {
 	wantLate(t, res.Stats, map[string]int{"inbox_end6_resync": 1, "inbox_watch_resync": 1, "inbox_end6_c1to8": 0, "inbox_end6_v2_agree": 1, "inbox_tie_noid": 1, "inbox_tie_req_other": 1})
 }
 
-// F4: an epoch change between the send and the end row, or during the end row's settle: the page stops 2.
+// F4: an epoch change between the send and the end row, or after the end row: the wait ends at once, as without an end
+// row, and the page stops 2.
 func TestF4EpochChangeNeverStopsSix(t *testing.T) {
 	end := threadsFrame([][2]int64{{120, 7000}, {90, 5000}}, rangeOnly(endRow(-1, 90, 5000)))
 	for name, later := range map[string][]laterFrame{
 		"between the send and the end": {late(10*time.Millisecond, disconnect), late(40*time.Millisecond, end)},
-		"during the settle":            {late(20*time.Millisecond, end), late(150*time.Millisecond, disconnect)},
+		"after the end":                {late(20*time.Millisecond, end), late(150*time.Millisecond, disconnect)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			withRangeWait(t, 2*time.Second)
-			withEndSettle(t, 600*time.Millisecond)
 			p := &framedInbox{s: connected(t), replies: []*table.LSTable{emptyReply}, later: [][]laterFrame{later}}
 			res, took := runFramed(t, p)
 			checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 1})
@@ -280,19 +265,27 @@ func TestF4EpochChangeNeverStopsSix(t *testing.T) {
 
 // F5: an end row on a frame without thread rows stops 2, even when the reply's own floor would place it.
 func TestF5EndWithoutThreadsIsNotStopSix(t *testing.T) {
+	untimed := threadsFrame([][2]int64{{95, 6000}, {90, 5000}}, rangeOnly(endRow(-1, 90, 5000)))
+	untimed.LSDeleteThenInsertThread[0].LastActivityTimestampMs = 0
 	for name, tc := range map[string]struct {
-		frame *table.LSTable
-		stop  int
+		frame    *table.LSTable
+		stop     int
+		rej, key string
 	}{
-		"no thread rows":   {rangeOnly(endRow(-1, 90, 5000)), 2},
-		"with its threads": {threadsFrame([][2]int64{{95, 6000}, {90, 5000}}, rangeOnly(endRow(-1, 90, 5000))), 6},
+		"no thread rows":        {rangeOnly(endRow(-1, 90, 5000)), 2, "inbox_end_rej_nothreads", ""},
+		"a thread with no time": {untimed, 2, "inbox_end_rej_untimed", ""},
+		"with its threads":      {threadsFrame([][2]int64{{95, 6000}, {90, 5000}}, rangeOnly(endRow(-1, 90, 5000))), 6, "", ""},
 	} {
 		t.Run(name, func(t *testing.T) {
 			withRangeWait(t, 200*time.Millisecond)
-			withEndSettle(t, 50*time.Millisecond)
 			p := &framedInbox{s: connected(t), replies: []*table.LSTable{tpage(90, 5000)}, later: [][]laterFrame{{late(20*time.Millisecond, tc.frame)}}}
 			res, _ := runFramed(t, p)
 			checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: tc.stop, pages: 1})
+			want := map[string]int{"inbox_end_rej_nothreads": 0, "inbox_end_rej_untimed": 0, "inbox_end_rej_preconnect": 0}
+			if tc.rej != "" {
+				want[tc.rej] = 1
+			}
+			wantLate(t, res.Stats, want)
 		})
 	}
 }
@@ -311,11 +304,11 @@ func TestF6ThreadNewerThanTheReference(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			withRangeWait(t, 200*time.Millisecond)
-			withEndSettle(t, 50*time.Millisecond)
 			p := &framedInbox{s: connected(t), replies: []*table.LSTable{first, emptyReply},
 				later: [][]laterFrame{nil, {late(20*time.Millisecond, threadsFrame(tc.threads, rangeOnly(endRow(-1, 85, 4000))))}}}
 			res, _ := runFramed(t, p)
 			checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: tc.stop, pages: 2, refs: [][2]int64{{90, 5000}}})
+			wantLate(t, res.Stats, map[string]int{"inbox_end_rej_newer": map[int]int{2: 1, 6: 0}[tc.stop], "inbox_end_rej_position": 0})
 		})
 	}
 }
@@ -335,7 +328,6 @@ func TestF7FloorAndTight(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			withRangeWait(t, 200*time.Millisecond)
-			withEndSettle(t, 50*time.Millisecond)
 			p := &framedInbox{s: connected(t), replies: []*table.LSTable{emptyReply}, later: [][]laterFrame{{late(20*time.Millisecond, threadsFrame(threads, rangeOnly(tc.row)))}}}
 			res, _ := runFramed(t, p)
 			checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: tc.stop, pages: 1})
@@ -360,18 +352,19 @@ func TestF8CeilingAndKeyTiebreak(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			withRangeWait(t, 200*time.Millisecond)
-			withEndSettle(t, 50*time.Millisecond)
 			p := &framedInbox{s: connected(t), replies: []*table.LSTable{first, emptyReply},
 				later: [][]laterFrame{nil, {late(20*time.Millisecond, threadsFrame(tc.threads, rangeOnly(tc.row)))}}}
 			res, _ := runFramed(t, p)
 			checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: tc.stop, pages: 2, refs: [][2]int64{{90, 5000}}})
+			wantLate(t, res.Stats, map[string]int{"inbox_end_rej_position": map[int]int{2: 1, 6: 0}[tc.stop], "inbox_end_rej_newer": 0})
 		})
 	}
 }
 
-// F9: a more row wins over an end row. In the same frame: one that answers the page continues the walk; one that does
-// not leaves the end row unusable (stop 2). During the settle: one that answers the page continues the walk; one that
-// does not contradicts the end row (stop 2).
+// F9: a more row wins over an end row, as it would without one. In the same frame: one that answers the page continues
+// the walk; one that does not leaves the end row unusable (stop 2, counted as more_in_frame). After the end row: one that
+// answers the page continues the walk; one that does not changes nothing, and the end row stops the page 6 when the
+// budget runs out (stop 6 does not look at other frames' more rows).
 func TestF9MoreRowWinsOverEnd(t *testing.T) {
 	pg := [][2]int64{{120, 7000}, {90, 5000}}
 	end := threadsFrame(pg, rangeOnly(endRow(-1, 90, 5000)))
@@ -379,22 +372,22 @@ func TestF9MoreRowWinsOverEnd(t *testing.T) {
 	stray := threadsFrame([][2]int64{{200, 9000}}, rangeOnly(moreRow(-1, 10, 100)))
 	two := []*table.LSTable{emptyReply, tpage(80, 4000, endRow(-1, 80, 4000))}
 	for name, tc := range map[string]struct {
-		later          []laterFrame
-		want           walkWant
-		more, rejected int
+		later      []laterFrame
+		want       walkWant
+		end6, rejM int
 	}{
-		"answering more in the end's frame":     {[]laterFrame{late(20*time.Millisecond, threadsFrame(pg, rangeOnly(endRow(-1, 90, 5000), moreRow(0, 90, 5000))))}, walkWant{stop: 0, pages: 2, refs: [][2]int64{{90, 5000}}}, 0, 0},
-		"non-answering more in the end's frame": {[]laterFrame{late(20*time.Millisecond, threadsFrame(pg, rangeOnly(endRow(-1, 90, 5000), moreRow(-1, 10, 100))))}, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 1}, 0, 0},
-		"answering more during the settle":      {[]laterFrame{late(20*time.Millisecond, end), late(150*time.Millisecond, answer)}, walkWant{stop: 0, pages: 2, refs: [][2]int64{{90, 5000}}}, 1, 0},
-		"non-answering more during the settle":  {[]laterFrame{late(20*time.Millisecond, end), late(150*time.Millisecond, stray)}, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 1}, 0, 1},
+		"answering more in the end's frame":        {[]laterFrame{late(20*time.Millisecond, threadsFrame(pg, rangeOnly(endRow(-1, 90, 5000), moreRow(0, 90, 5000))))}, walkWant{stop: 0, pages: 2, refs: [][2]int64{{90, 5000}}}, 0, 0},
+		"non-answering more in the end's frame":    {[]laterFrame{late(20*time.Millisecond, threadsFrame(pg, rangeOnly(endRow(-1, 90, 5000), moreRow(-1, 10, 100))))}, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 1}, 0, 1},
+		"answering more after the end":             {[]laterFrame{late(20*time.Millisecond, end), late(150*time.Millisecond, answer)}, walkWant{stop: 0, pages: 2, refs: [][2]int64{{90, 5000}}}, 0, 0},
+		"non-answering more after the end":         {[]laterFrame{late(20*time.Millisecond, end), late(150*time.Millisecond, stray)}, walkWant{gap: gapInboxIncomplete, stop: 6, pages: 1}, 1, 0},
+		"answering more after a stray and the end": {[]laterFrame{late(20*time.Millisecond, end), late(120*time.Millisecond, stray), late(320*time.Millisecond, answer)}, walkWant{stop: 0, pages: 2, refs: [][2]int64{{90, 5000}}}, 0, 0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			withRangeWait(t, 500*time.Millisecond)
-			withEndSettle(t, 400*time.Millisecond)
 			p := &framedInbox{s: connected(t), replies: two, later: [][]laterFrame{tc.later}}
 			res, _ := runFramed(t, p)
 			checkWalk(t, p, res, tc.want)
-			wantLate(t, res.Stats, map[string]int{"inbox_end6_pages": 0, "inbox_end_settle_more": tc.more, "inbox_end_settle_rejected": tc.rejected})
+			wantLate(t, res.Stats, map[string]int{"inbox_end6_pages": tc.end6, "inbox_end_rej_more_in_frame": tc.rejM})
 		})
 	}
 }
@@ -410,7 +403,6 @@ func TestF10OtherEndRowsAreNotStopSix(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			withRangeWait(t, 200*time.Millisecond)
-			withEndSettle(t, 50*time.Millisecond)
 			p := &framedInbox{s: connected(t), replies: []*table.LSTable{emptyReply}, later: [][]laterFrame{{late(20*time.Millisecond, threadsFrame(pg, rows))}}}
 			res, _ := runFramed(t, p)
 			checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 1})
@@ -422,7 +414,6 @@ func TestF10OtherEndRowsAreNotStopSix(t *testing.T) {
 // F11: the V2 row disagreeing with the end row is counted beside stop 6 (V2 agreement is not a walk check yet).
 func TestF11V2DisagreementIsCounted(t *testing.T) {
 	withRangeWait(t, 200*time.Millisecond)
-	withEndSettle(t, 50*time.Millisecond)
 	frame := withV2(threadsFrame([][2]int64{{120, 7000}, {90, 5000}}, rangeOnly(endRow(-1, 90, 5000))), -1, 91, 5000)
 	p := &framedInbox{s: connected(t), replies: []*table.LSTable{emptyReply}, later: [][]laterFrame{{late(20*time.Millisecond, frame)}}}
 	res, _ := runFramed(t, p)
@@ -432,8 +423,7 @@ func TestF11V2DisagreementIsCounted(t *testing.T) {
 
 // F12: a frame carrying an earlier page's request_id or task id is counted as the earlier page's, never this one's.
 func TestF12TieOfAnotherPageIsNotThePages(t *testing.T) {
-	withRangeWait(t, time.Second)
-	withEndSettle(t, 50*time.Millisecond)
+	withRangeWait(t, 300*time.Millisecond)
 	fr := f0Frames()
 	p := &framedInbox{s: connected(t), ids: f0IDs,
 		replies: []*table.LSTable{emptyReply, emptyReply, emptyReply},
@@ -451,17 +441,117 @@ func TestF12TieOfAnotherPageIsNotThePages(t *testing.T) {
 	})
 }
 
-// F13: an end row for the page ends its wait after the settle, not at the end of the budget. 82eada1..d7c4dad spent
-// the whole budget.
-func TestF13EndEndsTheWait(t *testing.T) {
-	withRangeWait(t, 3*time.Second)
-	withEndSettle(t, 150*time.Millisecond)
-	frame := threadsFrame([][2]int64{{120, 7000}, {90, 5000}}, rangeOnly(endRow(-1, 90, 5000)))
-	p := &framedInbox{s: connected(t), replies: []*table.LSTable{emptyReply}, later: [][]laterFrame{{late(20*time.Millisecond, frame)}}}
-	res, took := runFramed(t, p)
-	checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 6, pages: 1})
-	if w := res.Stats["inbox_range_wait_ms"]; w < 150 || w > 700 || took > time.Second {
-		t.Fatalf("waited %d ms, took %v: want about the settle (170 ms), not the 3 s budget", w, took)
+// F13: an end row for the page never shortens its wait: the page waits out the budget exactly as it would without the
+// end row, and only its stop code differs.
+func TestF13EndNeverShortensTheWait(t *testing.T) {
+	const budget = 300 * time.Millisecond
+	for name, tc := range map[string]struct {
+		at   time.Duration
+		stop int
+	}{
+		"end early":                  {20 * time.Millisecond, 6},
+		"end just before the budget": {250 * time.Millisecond, 6},
+	} {
+		t.Run(name, func(t *testing.T) {
+			withRangeWait(t, budget)
+			frame := threadsFrame([][2]int64{{120, 7000}, {90, 5000}}, rangeOnly(endRow(-1, 90, 5000)))
+			p := &framedInbox{s: connected(t), replies: []*table.LSTable{emptyReply}, later: [][]laterFrame{{late(tc.at, frame)}}}
+			res, took := runFramed(t, p)
+			checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: tc.stop, pages: 1})
+			if w := res.Stats["inbox_range_wait_ms"]; w < 299 || w > 400 || took > time.Second {
+				t.Fatalf("waited %d ms, took %v: want the whole 300 ms budget, no more, no less", w, took)
+			}
+		})
+	}
+}
+
+// stripEnds is frames with every group-1 inbox-parent end row taken out of their tables.
+func stripEnds(frames []laterFrame) []laterFrame {
+	out := make([]laterFrame, len(frames))
+	for i, f := range frames {
+		out[i] = f
+		ev, tg := f.ev, tagged{}
+		if t, ok := ev.(tagged); ok {
+			tg, ev = t, t.ev
+		}
+		tbl, ok := ev.(*table.LSTable)
+		if !ok {
+			continue
+		}
+		cp := *tbl
+		cp.LSUpsertSyncGroupThreadsRange = nil
+		for _, r := range tbl.LSUpsertSyncGroupThreadsRange {
+			if !(r.SyncGroup == 1 && r.ParentThreadKey == inboxParentKey && !r.HasMoreBefore) {
+				cp.LSUpsertSyncGroupThreadsRange = append(cp.LSUpsertSyncGroupThreadsRange, r)
+			}
+		}
+		if tg.ev != nil {
+			out[i].ev = tagged{id: tg.id, ev: &cp}
+		} else {
+			out[i].ev = &cp
+		}
+	}
+	return out
+}
+
+// An end row changes nothing but the stop code. Across the end-row fixtures, the same walk with every late inbox-parent
+// end row removed reaches the same pages with the same requests, waits as long, and continues or stops on the same
+// pages; the only difference allowed is stop 6 with the end row where the walk without it stops 2.
+func TestEndChangesOnlyTheStopCode(t *testing.T) {
+	const budget = 250 * time.Millisecond
+	pg := [][2]int64{{120, 7000}, {90, 5000}}
+	end := threadsFrame(pg, rangeOnly(endRow(-1, 90, 5000)))
+	fr := f0Frames()
+	two := []*table.LSTable{emptyReply, tpage(80, 4000, endRow(-1, 80, 4000))}
+	type fixture struct {
+		s       func(*testing.T) *messagixSession
+		replies []*table.LSTable
+		later   [][]laterFrame
+	}
+	for name, fx := range map[string]fixture{
+		"F0":                         {connected, []*table.LSTable{emptyReply, emptyReply, emptyReply}, [][]laterFrame{{late(20*time.Millisecond, fr[0])}, {late(20*time.Millisecond, fr[1])}, {late(20*time.Millisecond, fr[2])}}},
+		"F1 stray deep end":          {connected, []*table.LSTable{emptyReply}, [][]laterFrame{{late(20*time.Millisecond, threadsFrame([][2]int64{{12, 150}, {10, 100}}, rangeOnly(endRow(-1, 10, 100))))}}},
+		"F2 before first sync":       {func(*testing.T) *messagixSession { return beforeFirstSync() }, []*table.LSTable{tpage(90, 5000)}, [][]laterFrame{{late(20*time.Millisecond, threadsFrame([][2]int64{{95, 6000}, {90, 5000}}, rangeOnly(endRow(-1, 90, 5000))))}}},
+		"F4 epoch change after end":  {connected, []*table.LSTable{emptyReply}, [][]laterFrame{{late(20*time.Millisecond, end), late(100*time.Millisecond, disconnect)}}},
+		"F5 no thread rows":          {connected, []*table.LSTable{tpage(90, 5000)}, [][]laterFrame{{late(20*time.Millisecond, rangeOnly(endRow(-1, 90, 5000)))}}},
+		"F9 answering more after":    {connected, two, [][]laterFrame{{late(20*time.Millisecond, end), late(120*time.Millisecond, threadsFrame(pg, rangeOnly(moreRow(-1, 90, 5000))))}}},
+		"F9 stray more after":        {connected, two, [][]laterFrame{{late(20*time.Millisecond, end), late(120*time.Millisecond, threadsFrame([][2]int64{{200, 9000}}, rangeOnly(moreRow(-1, 10, 100))))}}},
+		"F9 more in the end's frame": {connected, two, [][]laterFrame{{late(20*time.Millisecond, threadsFrame(pg, rangeOnly(endRow(-1, 90, 5000), moreRow(0, 90, 5000))))}}},
+		"F13 end late in the budget": {connected, []*table.LSTable{emptyReply}, [][]laterFrame{{late(200*time.Millisecond, end)}}},
+		"no-floor row after the end": {connected, []*table.LSTable{emptyReply}, [][]laterFrame{{late(20*time.Millisecond, end), late(100*time.Millisecond, rangeOnly(moreRow(-1, 90, 5000)))}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			withRangeWait(t, budget)
+			run := func(later [][]laterFrame) (listingDone, *framedInbox) {
+				p := &framedInbox{s: fx.s(t), replies: fx.replies, later: later}
+				res, _ := runFramed(t, p)
+				return res, p
+			}
+			stripped := make([][]laterFrame, len(fx.later))
+			for i := range fx.later {
+				stripped[i] = stripEnds(fx.later[i])
+			}
+			with, pw := run(fx.later)
+			without, po := run(stripped)
+			if !slices.Equal(pw.tasks, po.tasks) {
+				t.Fatalf("requests differ:\n with end    %+v\n without end %+v", pw.tasks, po.tasks)
+			}
+			for _, k := range []string{"inbox_pages", "inbox_pages_late"} {
+				if with.Stats[k] != without.Stats[k] {
+					t.Fatalf("%s: %d with the end row, %d without", k, with.Stats[k], without.Stats[k])
+				}
+			}
+			ws, os := with.Stats["inbox_stop"], without.Stats["inbox_stop"]
+			if ws != os && !(ws == 6 && os == 2) {
+				t.Fatalf("stop %d with the end row, %d without: only 6 for 2 may differ", ws, os)
+			}
+			if with.Gap != without.Gap {
+				t.Fatalf("gap %q with the end row, %q without", with.Gap, without.Gap)
+			}
+			if a, b := with.Stats["inbox_range_wait_ms"], without.Stats["inbox_range_wait_ms"]; a-b > 40 || b-a > 40 {
+				t.Fatalf("waited %d ms with the end row, %d ms without", a, b)
+			}
+		})
 	}
 }
 
@@ -469,7 +559,6 @@ func TestF13EndEndsTheWait(t *testing.T) {
 // counted beside stop 6 (known-thread contiguity is not a walk check yet); an encrypted one is not counted.
 func TestF14KnownThreadGapIsCounted(t *testing.T) {
 	withRangeWait(t, 200*time.Millisecond)
-	withEndSettle(t, 50*time.Millisecond)
 	s := connected(t)
 	s.threads["150"] = &threadInfo{Key: 150, Kind: "user", LastActivity: 8000}
 	s.threads["e:160"] = &threadInfo{Key: 160, Enc: true, Kind: "user", LastActivity: 8100}
@@ -498,8 +587,7 @@ func (p *epochBumpPager) GetCursor(int64) string {
 
 // The walk's first page's epoch: an end row on a page in a later epoch than page 1's is counted beside stop 6.
 func TestWalkEpochMovedIsCounted(t *testing.T) {
-	withRangeWait(t, time.Second)
-	withEndSettle(t, 50*time.Millisecond)
+	withRangeWait(t, 300*time.Millisecond)
 	fr := f0Frames()
 	inner := &framedInbox{s: connected(t), replies: []*table.LSTable{emptyReply, emptyReply},
 		later: [][]laterFrame{{late(20*time.Millisecond, fr[0])}, {late(20*time.Millisecond, withV2(threadsFrame(f0Page2, rangeOnly(endRow(-1, 90, 5000))), -1, 90, 5000))}}}
@@ -613,9 +701,25 @@ func TestStartTableKindsAreCounted(t *testing.T) {
 	wantLate(t, ok.s.listingStats(0, 0, 0), map[string]int{"start_tbl_src": 2, "start_tbl_threads": 2}) // databases 1 and 2
 }
 
-// Messages are counted by what the helper reported of their thread when it emitted them (it holds none itself).
+// Messages are counted by what the helper reported of their thread when it built them, once they went out (it holds
+// none itself): a live message once emit returned its seq, an encrypted one once the connector acked it. A failed emit,
+// a frame dropped after a cancel, a frame only built and a failed encrypted delivery are not counted; the redelivery
+// that succeeds counts once.
 func TestEmittedMessagesAreCountedByThreadKind(t *testing.T) {
 	s := newTestSession()
+	acks := newAckHub()
+	s.acks = acks
+	failMsg := "" // the message id whose emit fails
+	s.emit = func(f Frame) int64 {
+		if f.T == TMessage && f.Message.ID == failMsg {
+			return -1
+		}
+		seq := acks.stamp(&f)
+		if f.waitAck {
+			acks.ack(seq)
+		}
+		return seq
+	}
 	threads := &table.LSTable{
 		LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{
 			{ThreadKey: 41, ThreadType: table.ONE_TO_ONE, FolderName: "inbox"},
@@ -626,30 +730,70 @@ func TestEmittedMessagesAreCountedByThreadKind(t *testing.T) {
 			{ThreadKey: 46, ThreadType: table.ONE_TO_ONE, FolderName: "inbox"},
 			{ThreadKey: 4747, ThreadType: table.ENCRYPTED_OVER_WA_ONE_TO_ONE},
 		},
-		LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 48, FolderName: "inbox"}}, // a group-like row with no type
+		LSUpdateOrInsertThread: []*table.LSUpdateOrInsertThread{{ThreadKey: 48, FolderName: "inbox"}},
 		LSAddParticipantIdToGroupThread: []*table.LSAddParticipantIdToGroupThread{
 			{ThreadKey: 41, ContactId: 7}, {ThreadKey: 42, ContactId: 7}, {ThreadKey: 43, ContactId: 7}, {ThreadKey: 44, ContactId: 7}, {ThreadKey: 45, ContactId: 7}, {ThreadKey: 46, ContactId: 1},
 		},
 	}
-	s.handleTableFrames(threads)
+	s.handleTable(threads)
 	s.mu.Lock()
 	if th := s.threads["48"]; th != nil {
-		th.Kind, th.Typed = "group", false
+		th.Kind, th.Typed = "group", false // a group whose type is not learned
 	}
 	s.mu.Unlock()
-	var msgs []*table.LSInsertMessage
-	for i, key := range []int64{41, 41, 42, 43, 44, 45, 46, 48, 4747, 99} {
-		msgs = append(msgs, &table.LSInsertMessage{ThreadKey: key, MessageId: "m" + string(rune('a'+i)), SenderId: 7, TimestampMs: 10})
+	msg := func(key int64, id string) *table.LSTable {
+		return &table.LSTable{LSInsertMessage: []*table.LSInsertMessage{{ThreadKey: key, MessageId: id, SenderId: 7, TimestampMs: 10}}}
 	}
-	s.handleTableFrames(&table.LSTable{LSInsertMessage: msgs})
-	// An encrypted message on a marked encrypted thread (its open predecessor is in spam), through the encrypted path.
-	s.handleTableFrames(&table.LSTable{
-		LSCreateOpenToE2EEThreadLink: []*table.LSCreateOpenToE2EEThreadLink{{OpenThreadID: 42, ArmadilloThreadID: 5252}},
+	for i, key := range []int64{41, 41, 42, 43, 44, 45, 46, 48, 4747, 99} {
+		s.handleTable(msg(key, "m"+string(rune('a'+i))))
+	}
+	// Not counted: a failed emit, a frame only built, a reply frame emitted after a cancel.
+	failMsg = "mfail"
+	s.handleTable(msg(41, "mfail"))
+	s.handleTableFrames(msg(41, "mbuilt"))
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	s.handleReplyEmit(msg(41, "mcancel"), issueMark{epoch: 1}, func(f Frame) int64 {
+		if cancelled.Err() != nil {
+			return 0
+		}
+		return s.emit(f)
 	})
-	s.waMessageFrames(e2eeEvent(waTypes.NewJID("5252", waTypes.MessengerServer), waTypes.EmptyJID, "W1"))
-	s.waMessageFrames(e2eeEvent(waTypes.NewJID("6262", waTypes.MessengerServer), waTypes.EmptyJID, "W2"))
+	// Encrypted: one on a marked thread (its open predecessor is in spam), one plain; then a delivery whose emit fails,
+	// redelivered with success.
+	s.handleTable(&table.LSTable{LSCreateOpenToE2EEThreadLink: []*table.LSCreateOpenToE2EEThreadLink{{OpenThreadID: 42, ArmadilloThreadID: 5252}}})
+	if !s.deliverEncrypted(e2eeEvent(waTypes.NewJID("5252", waTypes.MessengerServer), waTypes.EmptyJID, "W1")) ||
+		!s.deliverEncrypted(e2eeEvent(waTypes.NewJID("6262", waTypes.MessengerServer), waTypes.EmptyJID, "W2")) {
+		t.Fatal("encrypted delivery failed")
+	}
+	failMsg = "wa:W3"
+	if s.deliverEncrypted(e2eeEvent(waTypes.NewJID("6262", waTypes.MessengerServer), waTypes.EmptyJID, "W3")) {
+		t.Fatal("a delivery whose emit failed must not be acknowledged")
+	}
+	failMsg = ""
+	if !s.deliverEncrypted(e2eeEvent(waTypes.NewJID("6262", waTypes.MessengerServer), waTypes.EmptyJID, "W3")) {
+		t.Fatal("the redelivery failed")
+	}
 	wantLate(t, s.listingStats(0, 0, 0), map[string]int{
 		"emitted_msgs_open": 3, "emitted_msgs_spam": 1, "emitted_msgs_request": 1, "emitted_msgs_marketplace": 1, "emitted_msgs_folder": 1,
-		"emitted_msgs_group_untyped": 1, "emitted_msgs_unknown": 1, "emitted_msgs_enc": 2, "emitted_msgs_enc_marked": 1,
+		"emitted_msgs_group_untyped": 1, "emitted_msgs_unknown": 1, "emitted_msgs_enc": 3, "emitted_msgs_enc_marked": 1,
 	})
+}
+
+// An encrypted message whose emit succeeded but whose ack never came (the connector went away) is not counted.
+func TestEncryptedMessageWithoutAckIsNotCounted(t *testing.T) {
+	s := newTestSession()
+	acks := newAckHub()
+	s.acks = acks
+	s.emit = func(f Frame) int64 { return acks.stamp(&f) } // stamped and written, never acked
+	done := make(chan bool, 1)
+	go func() {
+		done <- s.deliverEncrypted(e2eeEvent(waTypes.NewJID("6262", waTypes.MessengerServer), waTypes.EmptyJID, "W9"))
+	}()
+	time.Sleep(50 * time.Millisecond)
+	acks.close()
+	if <-done {
+		t.Fatal("a delivery without its ack must not be acknowledged")
+	}
+	wantLate(t, s.listingStats(0, 0, 0), map[string]int{"emitted_msgs_enc": 0, "emitted_msgs_unknown": 0})
 }

@@ -585,8 +585,8 @@ var inboxTop = socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, Referenc
 // frame that carried it, and only on a watch opened after the socket's first sync (see
 // pagePosition.frameFloor). Only a reply can complete the walk: a page whose end comes only on
 // a later frame stops incomplete: 6 when that end row is one for the page (see
-// pagePosition.endForPage; it ends the page's wait after a short settle, in which a more
-// row still wins), else 2 as before. Every end row is counted. The late
+// pagePosition.endForPage; it changes neither the wait nor whether the walk goes on, only
+// the stop code), else 2 as before. Every end row is counted. The late
 // wait covers live frames only: a second data frame on the request's one-off stream is
 // dropped by the library and only counted (oneoff_extra_frames). The watch opens before
 // the request is sent and counts every range row that arrives while it is open,
@@ -959,8 +959,8 @@ func scopeCode(t *scopeTally, parents []int64, failed bool) string {
 	return code
 }
 
-// inboxRowCounts accumulates one walk's range diagnostics, counts only. None of them
-// changes what the walk decides.
+// inboxRowCounts accumulates one walk's range diagnostics, counts only. The walk never
+// reads them to decide anything.
 type inboxRowCounts struct {
 	// The replies' group-1 LSUpsertSyncGroupThreadsRange rows by category, as before.
 	total, inbox, parent0More, parent0End, other int
@@ -1281,6 +1281,18 @@ type pagePosition struct {
 // the reply or from the row's own frame, none can.
 func (p pagePosition) possible() bool { return p.floorOK || p.frameFloor }
 
+// floorFor is the floor a row carried by frame f is judged against: the reply's, else
+// (with frameFloor) the frame's own oldest thread. ok is false when there is none.
+func (p pagePosition) floorFor(f lateFrame) (floor cursorPos, ok bool) {
+	if p.floorOK {
+		return p.floor, true
+	}
+	if p.frameFloor {
+		return f.floor, f.floorOK
+	}
+	return cursorPos{}, false
+}
+
 type rejectReason int
 
 const (
@@ -1301,10 +1313,7 @@ const (
 // single new thread) fails the floor; a row from a page before this one, or at the
 // reference, fails the ceiling.
 func (p pagePosition) judge(pos cursorPos, f lateFrame) rejectReason {
-	floor, ok := p.floor, p.floorOK
-	if !ok && p.frameFloor {
-		floor, ok = f.floor, f.floorOK
-	}
+	floor, ok := p.floorFor(f)
 	switch {
 	case !ok:
 		return rejNoFloor
@@ -1558,19 +1567,19 @@ func (s *messagixSession) offerLocked(w *rangeWatch, tbl *table.LSTable) {
 // against its own frame and that frame had no thread rows (the page's range came apart
 // from its threads; a later row would not be the answer to this page).
 //
-// An end row for the page (see pagePosition.endForPage) ends the wait too, after a
-// short settle: what is left of the budget, at most endSettle. A more row that answers
-// the page during the settle wins and the walk goes on. endSeen is true when the settle
-// ran out with the end standing: the page stops 6, still incomplete, since the end row
-// cannot be tied to the walk's own request. A more row that arrives after the end and
-// does not answer the page (it was rejected), or an epoch change during the settle,
-// makes it stop 2 instead. Only a cancel is an error.
+// An end row for the page (see pagePosition.endForPage) never shortens the wait and
+// never changes whether the walk goes on: the page waits as it would without it, and a
+// more row that answers the page still continues the walk. Its one effect is the stop
+// code when the budget runs out: endSeen is then true (the page stops 6, still
+// incomplete, since the end row cannot be tied to the walk's own request) instead of
+// the no-range stop 2. Every early end of the wait keeps stop 2. The decisions read no
+// diagnostic counter. Only a cancel is an error.
 func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, pos pagePosition, budget time.Duration, counts *inboxRowCounts) (rng *walkRange, endSeen bool, waited time.Duration, err error) {
 	start := time.Now()
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
 	var gathered rangeRows
-	var end *lateFrame
+	var end *lateFrame // the first end row for the page; it only picks the stop code
 	var endRow *table.LSUpsertSyncGroupThreadsRange
 	for {
 		s.mu.Lock()
@@ -1579,33 +1588,25 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 		moved := s.connEpoch != w.epoch
 		s.mu.Unlock()
 		if len(got) > 0 {
-			noFloor := counts.late.rejNoFloor
-			rejected := make([]int, len(got)) // per frame: its more rows that did not answer the page
-			for i := range got {
-				before := counts.late.rejected
-				gathered.add(lateCandidates(got[i:i+1], pos, &counts.late))
-				rejected[i] = counts.late.rejected - before
-			}
-			if rng := lateRange(gathered); rng != nil {
-				if end != nil {
-					counts.end6.settleMore++
+			noFloor := false
+			for _, f := range got {
+				if _, ok := pos.floorFor(f); !ok && candidateCount(f.rows) > 0 {
+					noFloor = true // a candidate that can never be judged: see the doc comment
 				}
+			}
+			gathered.add(lateCandidates(got, pos, &counts.late))
+			if rng := lateRange(gathered); rng != nil {
 				return rng, false, time.Since(start), nil
 			}
-			if counts.late.rejNoFloor > noFloor {
+			if noFloor {
 				return nil, false, time.Since(start), nil
 			}
 			for i := range got {
-				if end != nil && rejected[i] > 0 {
-					// A more row after the end that does not answer the page: the end is contradicted.
-					counts.end6.settleRejected++
-					return nil, false, time.Since(start), nil
-				}
-				if end == nil {
-					if row := pos.endForPage(got[i]); row != nil {
-						end, endRow = &got[i], row
-						timer.Reset(max(min(budget-time.Since(start), endSettle), 0))
-					}
+				row := pos.endForPage(got[i])
+				if row == nil {
+					counts.end6.reject(pos, got[i])
+				} else if end == nil {
+					end, endRow = &got[i], row
 				}
 			}
 		}

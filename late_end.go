@@ -6,7 +6,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
@@ -21,10 +20,6 @@ import (
 // packet and task ids (from the library's ExecuteTasksWithIDs) against the request_id
 // of each live frame (FrameRequestID) and the task-table rows it carries. No decision
 // reads those counts.
-
-// endSettle caps the settle after an end row for the page: a more row that answers the
-// page within it still wins (see awaitInboxRange).
-var endSettle = time.Second
 
 // requestIDPager is a threadPager that also reports the ids its request was sent with.
 // The library's client is one; executeWithIDs falls back to ExecuteTasks otherwise.
@@ -73,7 +68,7 @@ func (s *messagixSession) handleLiveTable(tbl *table.LSTable, tag liveTag) {
 	frames := s.buildTableFramesLocked(tbl, s.connEpoch, nil)
 	s.liveTag = liveTag{}
 	for _, f := range frames {
-		s.emit(f)
+		s.countEmittedLocked(f, s.emit(f))
 	}
 }
 
@@ -149,10 +144,13 @@ func frameThreads(tbl *table.LSTable) (newest cursorPos, n int, untimed bool, ke
 	return newest, n, untimed, keys
 }
 
-// endForPage returns the end row of frame f that is one for this page, or nil. It uses
-// only checks the walk already makes for a more row, applied to an end row:
-//   - the frame is in the watch's connection epoch (offerLocked keeps no other), and the
-//     watch was opened after the socket's first sync;
+// endForPage returns the end row of frame f that is one for this page, or nil. Stop 6
+// is defined by exactly the conditions named for it in this build, and no others. Some
+// are checks the walk already makes for a more row (the epoch, the ceiling and floor,
+// the more rows); the others are new, for end rows only (after the first sync for any
+// reply, and the thread-row conditions):
+//   - the frame is in the watch's connection epoch (offerLocked keeps no other);
+//   - the watch was opened after the socket's first sync;
 //   - the row is a group-1 sync-group row for the inbox parent (-1) with no more before:
 //     not parent 0, not another parent, not the inbox table, not V2;
 //   - the frame carries thread rows, every one with a time and none newer than the
@@ -162,23 +160,51 @@ func frameThreads(tbl *table.LSTable) (newest cursorPos, n int, untimed bool, ke
 //   - the frame has no more row for the inbox parent or parent 0, and no inbox-table
 //     more row.
 //
-// What the walk does not check yet (a resync marker, the V2 row agreeing, the cursor
-// order, the known threads above the frame, the epoch of the walk's first page) is
-// counted beside stop 6, never folded into it (see end6Counts).
+// An end row that fails one of them is counted by each condition it fails (see
+// end6Counts.reject). What the walk does not check (a resync marker, the V2 row
+// agreeing, the cursor order, the known threads above the frame, the epoch of the
+// walk's first page) is counted beside stop 6, never folded into it.
 func (p pagePosition) endForPage(f lateFrame) *table.LSUpsertSyncGroupThreadsRange {
-	if !p.postConnect || f.threads == 0 || f.untimed || p.ref.olderThan(f.newest) {
+	row, why := p.endCheck(f)
+	if why != (endRejects{}) {
 		return nil
 	}
-	if candidateCount(f.rows) > 0 {
-		return nil
-	}
-	for _, row := range f.rows.sync {
-		if row.ParentThreadKey == inboxParentKey && !row.HasMoreBefore &&
-			p.judge(cursorPos{ts: row.MinLastActivityTimestampMS, key: row.MinThreadKey}, f) == accepted {
-			return row
+	return row
+}
+
+// endRejects is which stop-6 conditions an inbox-parent end row's frame fails.
+type endRejects struct {
+	preConnect, noThreads, untimed, newer, moreInFrame, position bool
+}
+
+// endCheck returns the frame's first group-1 inbox-parent end row (nil if it has none)
+// and the stop-6 conditions it fails. With several such rows, a row that passes the
+// position check is preferred.
+func (p pagePosition) endCheck(f lateFrame) (*table.LSUpsertSyncGroupThreadsRange, endRejects) {
+	var row *table.LSUpsertSyncGroupThreadsRange
+	var why endRejects
+	why.position = true
+	for _, r := range f.rows.sync {
+		if r.ParentThreadKey != inboxParentKey || r.HasMoreBefore {
+			continue
+		}
+		if row == nil {
+			row = r
+		}
+		if p.judge(cursorPos{ts: r.MinLastActivityTimestampMS, key: r.MinThreadKey}, f) == accepted {
+			row, why.position = r, false
+			break
 		}
 	}
-	return nil
+	if row == nil {
+		return nil, endRejects{}
+	}
+	why.preConnect = !p.postConnect
+	why.noThreads = f.threads == 0
+	why.untimed = f.untimed
+	why.newer = f.threads > 0 && p.ref.olderThan(f.newest)
+	why.moreInFrame = candidateCount(f.rows) > 0
+	return row, why
 }
 
 // end6Counts is what was counted when a page stopped 6: pages is how many did; the
@@ -191,12 +217,28 @@ func (p pagePosition) endForPage(f lateFrame) *table.LSUpsertSyncGroupThreadsRan
 // walkEpochMoved: the epoch is not the walk's first page's; knownGap: known threads
 // strictly between the frame's newest thread and the reference that the frame does not
 // carry (folder threads count too); c1to8: tight, V2 agrees, no resync and the walk's
-// epoch, together. settleMore and settleRejected count the settles a more row ended:
-// one that answered the page (the walk went on), or one that did not (stop 2).
+// epoch, together. The rej counts are the frames whose inbox-parent end row failed a
+// stop-6 condition, by each condition it failed (one frame can count under several).
 type end6Counts struct {
 	pages, tiedReq, tiedTask, tight, v2Agree, v2Disagree, resync int
 	cursorSent, cursorOther, walkEpochMoved, knownGap, c1to8     int
-	settleMore, settleRejected                                   int
+	rejPreConnect, rejNoThreads, rejUntimed, rejNewer            int
+	rejMoreInFrame, rejPosition                                  int
+}
+
+// reject counts the stop-6 conditions that frame f's inbox-parent end row fails, if it
+// has one and it fails any.
+func (c *end6Counts) reject(pos pagePosition, f lateFrame) {
+	row, why := pos.endCheck(f)
+	if row == nil {
+		return
+	}
+	c.rejPreConnect += b2i(why.preConnect)
+	c.rejNoThreads += b2i(why.noThreads)
+	c.rejUntimed += b2i(why.untimed)
+	c.rejNewer += b2i(why.newer)
+	c.rejMoreInFrame += b2i(why.moreInFrame)
+	c.rejPosition += b2i(why.position)
 }
 
 // count records a stop-6 end row. The caller holds s.mu.
@@ -270,8 +312,12 @@ func (c *end6Counts) addStats(stats map[string]int) {
 	stats["inbox_end6_walk_epoch_moved"] = c.walkEpochMoved
 	stats["inbox_end6_known_gap"] = min(c.knownGap, 999)
 	stats["inbox_end6_c1to8"] = c.c1to8
-	stats["inbox_end_settle_more"] = c.settleMore
-	stats["inbox_end_settle_rejected"] = c.settleRejected
+	stats["inbox_end_rej_preconnect"] = c.rejPreConnect
+	stats["inbox_end_rej_nothreads"] = c.rejNoThreads
+	stats["inbox_end_rej_untimed"] = c.rejUntimed
+	stats["inbox_end_rej_newer"] = c.rejNewer
+	stats["inbox_end_rej_more_in_frame"] = c.rejMoreInFrame
+	stats["inbox_end_rej_position"] = c.rejPosition
 }
 
 // tieProbe counts, over a walk's pages, the live tables seen while a page's watch was

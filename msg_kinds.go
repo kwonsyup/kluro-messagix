@@ -2,7 +2,9 @@
 package main
 
 // The helper holds no message: every message it converts goes out at once (the
-// withholding for marked threads was reverted). What it does decide is what each
+// withholding for marked threads was reverted). Each message frame carries the kind of
+// its thread when it was built, and is counted when it went out (an encrypted one once
+// the connector acked it). What it does decide is what each
 // thread frame says, and the connector holds a thread's live messages until that
 // frame qualifies (an inert request frame never does). msgKinds counts the messages
 // the helper emitted by what it knew of their thread at that moment, so the counts say
@@ -65,9 +67,19 @@ func (s *messagixSession) othersLocked(t *threadInfo) (out []int64) {
 	return out
 }
 
-// countMsgLocked counts one emitted message by its thread's kind. The caller holds s.mu.
-func (s *messagixSession) countMsgLocked(enc bool, key int64, known bool) {
-	s.msgKinds[s.msgKindLocked(enc, key, known)]++
+// msgKindTagLocked is a message frame's msgKind tag: its thread's kind now, plus 1.
+// The caller holds s.mu.
+func (s *messagixSession) msgKindTagLocked(enc bool, key int64, known bool) int8 {
+	return int8(s.msgKindLocked(enc, key, known) + 1)
+}
+
+// countEmittedLocked counts a message frame by the kind it was built with, once it went
+// out: emit returned the seq it stamped (a message always gets one). A failed emit
+// (-1), or a frame dropped after a cancel (0), is not counted. The caller holds s.mu.
+func (s *messagixSession) countEmittedLocked(f Frame, seq int64) {
+	if f.msgKind > 0 && seq > 0 {
+		s.msgKinds[f.msgKind-1]++
+	}
 }
 
 func (s *messagixSession) addMsgKindStats(stats map[string]int) {
