@@ -24,7 +24,8 @@ var resumeSyncDatabases = []int64{1, 2}
 // (2), for a session resumed from saved state, which skipped the page load. The
 // version and the sync params come from the saved state's own copy of the page
 // config, so nothing needs the page. One attempt, bounded by resumeSyncTimeout, cancel
-// honoured: a failure logs a fixed code and returns what was applied (nothing if
+// honoured: a failure logs a fixed code with the request's error class
+// (requestErrorClass, never the error text) and returns what was applied (nothing if
 // database 1 failed).
 //
 // Each table is only applied to the session (frames for the initial emitter); the
@@ -77,7 +78,7 @@ func (s *messagixSession) resumeSync(ctx context.Context, saved json.RawMessage)
 		})
 		if err != nil || tbl == nil {
 			if ctx.Err() == nil {
-				logCode("warn", "resume_sync_failed")
+				logCode("warn", "resume_sync_failed."+requestErrorClass(err))
 			}
 			if db == 1 {
 				return nil

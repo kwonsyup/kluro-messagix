@@ -265,7 +265,6 @@ func TestWalkWithoutARangeStopsAsBefore(t *testing.T) {
 		"at the reference":                {replies: two, later: [][]laterFrame{nil, {late(20*time.Millisecond, rangeOnly(rangeRow(true, -1, 90, 5000)))}}, pages: 2, refs: [][2]int64{{90, 5000}}, rejected: 1},
 		"older than the page":             {replies: two, later: [][]laterFrame{nil, {late(20*time.Millisecond, rangeOnly(rangeRow(true, -1, 10, 100)))}}, pages: 2, refs: [][2]int64{{90, 5000}}, rejected: 1},
 		"inbox table older than the page": {replies: two, later: [][]laterFrame{nil, {late(20*time.Millisecond, inboxTable(inboxTableRow(true, 10, 100)))}}, pages: 2, refs: [][2]int64{{90, 5000}}, rejected: 1},
-		"a reply with no threads":         {replies: []*table.LSTable{{}}, later: [][]laterFrame{{late(20*time.Millisecond, rangeOnly(rangeRow(true, -1, 90, 5000)))}}, pages: 1, rejected: 1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			withRangeWait(t, wait)
@@ -304,7 +303,7 @@ func TestLateEndRowsNeverConclude(t *testing.T) {
 		"parent-0 end (group-wide, from another request)": {[]laterFrame{late(20*time.Millisecond, rangeOnly(rangeRow(false, 0, 0, 0)))}, "inbox_late_sync_p0_end"},
 		"inbox-table end":                                 {[]laterFrame{late(20*time.Millisecond, inboxTable(inboxTableRow(false, 0, 0)))}, "inbox_late_inbox_end"},
 		"inbox-table end at the page":                     {[]laterFrame{late(20*time.Millisecond, inboxTable(inboxTableRow(false, 102, 4000)))}, "inbox_late_inbox_end"},
-		"inbox end from an earlier connection":            {[]laterFrame{late(10*time.Millisecond, disconnect), late(30*time.Millisecond, rangeOnly(rangeRow(false, -1, 0, 0)))}, "inbox_late_sync_inbox_end"},
+		"inbox end from an earlier connection":            {[]laterFrame{late(0, disconnect), late(0, rangeOnly(rangeRow(false, -1, 0, 0)))}, "inbox_late_sync_inbox_end"},
 		"inbox end from deeper in the inbox":              {[]laterFrame{late(20*time.Millisecond, rangeOnly(rangeRow(false, -1, 10, 100)))}, "inbox_late_sync_inbox_end"},
 		"inbox end from an earlier page":                  {[]laterFrame{late(20*time.Millisecond, rangeOnly(rangeRow(false, -1, 95, 6000)))}, "inbox_late_sync_inbox_end"},
 	} {
@@ -312,6 +311,8 @@ func TestLateEndRowsNeverConclude(t *testing.T) {
 			withRangeWait(t, 200*time.Millisecond)
 			s := newTestSession()
 			// Page 3 exists so that a walk the more row continues has somewhere to go, and ends from its reply.
+			// The connection case delivers its disconnect and row while the request is in flight: the wait ends at
+			// once on an epoch change, so a row after it would not be seen at all.
 			p := &framedInbox{s: s,
 				replies: []*table.LSTable{tpage(101, 5000, rangeRow(true, -1, 90, 5000)), tpage(102, 4000), tpage(103, 3000, rangeRow(false, -1, 103, 3000))},
 				later:   [][]laterFrame{nil, tc.frames},
@@ -417,16 +418,17 @@ func TestOneWaitBudgetPerWalk(t *testing.T) {
 	})
 	t.Run("a row that already arrived decides with no budget left", func(t *testing.T) {
 		s := newTestSession()
+		topPos := pagePosition{ref: cursorPos{ts: inboxTop.ReferenceActivityTimestamp, key: inboxTop.ReferenceThreadKey}, floor: cursorPos{ts: 5000, key: 90}, floorOK: true}
 		w := s.openWatch()
 		s.handleMetaEvent(context.Background(), rangeOnly(rangeRow(true, -1, 90, 5000)))
 		var counts inboxRowCounts
-		rng, waited, err := s.awaitInboxRange(context.Background(), w, inboxTop, cursorPos{ts: 5000, key: 90}, true, 0, &counts)
+		rng, waited, err := s.awaitInboxRange(context.Background(), w, topPos, 0, &counts)
 		s.closeWatch(w, &counts)
 		if err != nil || rng == nil || !rng.more || rng.minKey != 90 || rng.minTS != 5000 || waited > 50*time.Millisecond {
 			t.Fatalf("rng=%+v waited=%v err=%v", rng, waited, err)
 		}
 		w = s.openWatch()
-		rng, _, err = s.awaitInboxRange(context.Background(), w, inboxTop, cursorPos{ts: 5000, key: 90}, true, 0, &counts)
+		rng, _, err = s.awaitInboxRange(context.Background(), w, topPos, 0, &counts)
 		s.closeWatch(w, &counts)
 		if err != nil || rng != nil {
 			t.Fatalf("with nothing arrived and no budget: rng=%+v err=%v", rng, err)
@@ -486,6 +488,8 @@ func TestLateRangeRowsAreCountedByKind(t *testing.T) {
 		"inbox_late_sync_inbox_more": 2, "inbox_late_sync_inbox_end": 1, "inbox_late_sync_p0_more": 1, "inbox_late_sync_p0_end": 1,
 		"inbox_late_sync_other": 1, "inbox_late_inbox_more": 1, "inbox_late_inbox_end": 1, "inbox_late_v2_inbox": 1,
 		"inbox_late_v2_other": 1, "inbox_late_other_epoch": 1, "inbox_late_rejected": 0,
+		"inbox_late_rej_epoch": 1, "inbox_late_rej_nofloor": 0, "inbox_late_rej_floor": 0, "inbox_late_rej_ceiling": 0,
+		"inbox_reply_threads": 1, "inbox_late_frames_threads": 0,
 		"oneoff_extra_frames": 0, "oneoff_unknown_stream_frames": 0,
 	}
 	for k, v := range want {

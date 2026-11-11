@@ -539,7 +539,7 @@ func (s *messagixSession) logRosterLocked(t *threadInfo, complete bool) {
 // bumpConnEpoch ends every roster snapshot taken so far.
 func (s *messagixSession) bumpConnEpoch() {
 	s.mu.Lock()
-	s.connEpoch++
+	s.bumpEpochLocked()
 	s.mu.Unlock()
 }
 
@@ -547,7 +547,7 @@ func (s *messagixSession) bumpConnEpoch() {
 // snapshot taken so far ends; while down, no roster is complete.
 func (s *messagixSession) setLinkDown(down bool) {
 	s.mu.Lock()
-	s.connEpoch++
+	s.bumpEpochLocked()
 	s.linkDown = down
 	if down {
 		s.hadDisconnect = true
@@ -843,7 +843,7 @@ func (s *messagixSession) handleWAEvent(raw any) bool {
 	case *events.OfflineSyncCompleted:
 		s.mu.Lock()
 		s.e2eeOfflineEnd = true
-		s.connEpoch++
+		s.bumpEpochLocked()
 		s.mu.Unlock()
 		s.markStateDirty()
 	case *events.Connected:

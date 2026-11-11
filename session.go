@@ -647,15 +647,23 @@ func (s *messagixSession) checkHistory(ctx context.Context) HistoryState {
 	defer cancel()
 	backup, err := cli.GetSecureHistoryClient().GetBackup(bakCtx)
 	if err != nil {
-		if !errors.Is(err, securehistory.ErrNoPINBackup) {
-			logCode("warn", "history_check_failed")
-		}
+		historyCheckFailed(err)
 		return HistoryNone
 	}
 	s.mu.Lock()
 	s.histBak = backup
 	s.mu.Unlock()
 	return HistoryNeedsPIN
+}
+
+// historyCheckFailed says whether a backup lookup error is a failed check rather than
+// the answer "no backup", and logs a failed one with its error class (never its text).
+func historyCheckFailed(err error) bool {
+	if err == nil || errors.Is(err, securehistory.ErrNoPINBackup) {
+		return false
+	}
+	logCode("warn", "history_check_failed."+requestErrorClass(err))
+	return true
 }
 
 // HistoryPIN runs the connector's restoreHistory flow: GetBackup, RecoverPIN,
@@ -1087,6 +1095,66 @@ func errorClass(err error) string {
 		return "net"
 	}
 	return "other"
+}
+
+// requestErrorClass names why one of the library's HTTP GraphQL requests failed, by a
+// fixed class (never the error text or a response body, which can carry provider
+// content): its HTTP status class (http_4xx, http_5xx, http_429), a known server answer
+// (please_log_in, reload_page, ls_error, graphql_error), an account state the library
+// recognises, a transport failure (transport_ plus the errorClass), an unreadable or
+// undecodable answer (read, decode), else the errorClass. A nil error (no table and no
+// error) is no_table.
+func requestErrorClass(err error) string {
+	var lsErr *types.ErrorResponse
+	var gqlErr *types.GraphQLError
+	var syntaxErr *json.SyntaxError
+	var typeErr *json.UnmarshalTypeError
+	switch {
+	case err == nil:
+		return "no_table"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return errorClass(err)
+	case errors.Is(err, httpclient.ErrRateLimited):
+		return "http_429"
+	case errors.Is(err, httpclient.ErrUnexpectedError):
+		return httpStatusClass(err)
+	case errors.Is(err, types.ErrPleaseLogIn):
+		return "please_log_in"
+	case errors.Is(err, types.ErrPleaseReloadPage):
+		return "reload_page"
+	case errors.As(err, &lsErr):
+		return "ls_error"
+	case errors.As(err, &gqlErr):
+		return "graphql_error"
+	case errors.Is(err, httpclient.ErrTokenInvalidated):
+		return "token_invalid"
+	case errors.Is(err, httpclient.ErrChallengeRequired), errors.Is(err, httpclient.ErrCheckpointRequired):
+		return "checkpoint"
+	case errors.Is(err, httpclient.ErrConsentRequired):
+		return "consent"
+	case errors.Is(err, httpclient.ErrAccountSuspended):
+		return "suspended"
+	case errors.Is(err, httpclient.ErrRequestFailed):
+		return "transport_" + errorClass(err)
+	case errors.Is(err, httpclient.ErrResponseReadFailed):
+		return "read"
+	case errors.As(err, &syntaxErr), errors.As(err, &typeErr):
+		return "decode"
+	}
+	return errorClass(err)
+}
+
+// httpStatusClass is the status class of the library's unexpected-status error, which
+// carries the status only in its text ("<sentinel> <code>"): only the first digit of
+// the code is read, and only the class leaves.
+func httpStatusClass(err error) string {
+	msg, prefix := err.Error(), httpclient.ErrUnexpectedError.Error()+" "
+	if i := strings.Index(msg, prefix); i >= 0 && len(msg) > i+len(prefix) {
+		if d := msg[i+len(prefix)]; d >= '1' && d <= '5' {
+			return "http_" + string(d) + "xx"
+		}
+	}
+	return "http_status"
 }
 
 func zero(b []byte) {

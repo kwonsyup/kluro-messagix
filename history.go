@@ -577,7 +577,10 @@ var inboxTop = socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, Referenc
 // library does expose: the connection epoch, the window, the sync group, the parent
 // and the page's position (see lateCandidates). Even so it may only continue the walk,
 // from a position strictly past the request's and not past the page's oldest thread;
-// it never ends it. Only a reply can complete the walk: a page whose end comes only on
+// it never ends it. When the reply carries no thread rows at all, the page's oldest
+// thread is unknown; a late row may then be checked against the oldest thread of the
+// frame that carried it, and only on a watch opened after the socket's first sync (see
+// pagePosition.frameFloor). Only a reply can complete the walk: a page whose end comes only on
 // a later frame stops 2, incomplete, as before, and the end row is counted. The late
 // wait covers live frames only: a second data frame on the request's one-off stream is
 // dropped by the library and only counted (oneoff_extra_frames). The watch opens before
@@ -610,11 +613,17 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 		if done != nil && done() {
 			return "", 5, pages, ref, nil
 		}
+		replyThreads := threadRowCount(tbl)
+		rows.replyThreads += replyThreads
 		rng := replyRange(tbl, rows)
 		if rng == nil {
-			floor, floorOK := pageFloor(tbl)
+			pos := pagePosition{ref: cursorPos{ts: ref.ReferenceActivityTimestamp, key: ref.ReferenceThreadKey}}
+			pos.floor, pos.floorOK = pageFloor(tbl)
+			// An empty reply gives no floor; a late row may then use its own frame's, but only on a
+			// watch opened after the socket's first sync (see rangeWatch.postConnect).
+			pos.frameFloor = replyThreads == 0 && watch.postConnect
 			var waited time.Duration
-			rng, waited, err = s.awaitInboxRange(ctx, watch, ref, floor, floorOK, max(budget, 0), rows)
+			rng, waited, err = s.awaitInboxRange(ctx, watch, pos, max(budget, 0), rows)
 			budget -= waited
 			rows.waitMS += int(waited.Milliseconds())
 			if err != nil {
@@ -938,6 +947,8 @@ type inboxRowCounts struct {
 	total, inbox, parent0More, parent0End, other int
 	// The replies' group-1 LSUpsertInboxThreadsRange rows, and their LSUpdateThreadsRangesV2 rows.
 	inboxTable, v2 int
+	// Thread rows in the walk's replies (the two thread tables pageFloor reads).
+	replyThreads int
 	// Range rows that later frames carried while a page's watch was open, by kind.
 	late lateCounts
 	// Pages a later frame's row decided; milliseconds spent waiting for one.
@@ -951,14 +962,18 @@ type inboxRowCounts struct {
 // LSUpsertSyncGroupThreadsRange (group 1), "inbox" LSUpsertInboxThreadsRange (group 1),
 // "v2" LSUpdateThreadsRangesV2. otherEpoch counts the rows that arrived after the
 // connection epoch changed (they are dropped); rejected the more rows that could have
-// continued the page but did not answer its position (see pagePosition.answers). The
-// end rows (syncInboxEnd, syncP0End, inboxEnd) never decide anything: their counts
-// are the late terminal rows the walk ignored.
+// continued the page but did not answer its position (see pagePosition.judge), split by
+// reason into rejNoFloor, rejCeiling and rejFloor. rejEpoch is the more rows that could
+// have continued the page but arrived after the epoch changed (a subset of otherEpoch;
+// not in rejected). framesThreads is the late frames with a range row that also carried
+// thread rows. The end rows (syncInboxEnd, syncP0End, inboxEnd) never decide anything:
+// their counts are the late terminal rows the walk ignored.
 type lateCounts struct {
 	total                                                         int
 	syncInboxMore, syncInboxEnd, syncP0More, syncP0End, syncOther int
 	inboxMore, inboxEnd, v2Inbox, v2Other                         int
 	otherEpoch, rejected                                          int
+	rejNoFloor, rejCeiling, rejFloor, rejEpoch, framesThreads     int
 }
 
 func (c *lateCounts) add(r rangeRows) {
@@ -1006,6 +1021,24 @@ func (c *lateCounts) merge(o lateCounts) {
 	c.v2Other += o.v2Other
 	c.otherEpoch += o.otherEpoch
 	c.rejected += o.rejected
+	c.rejNoFloor += o.rejNoFloor
+	c.rejCeiling += o.rejCeiling
+	c.rejFloor += o.rejFloor
+	c.rejEpoch += o.rejEpoch
+	c.framesThreads += o.framesThreads
+}
+
+// reject counts a candidate row that did not answer the page, by reason.
+func (c *lateCounts) reject(why rejectReason) {
+	c.rejected++
+	switch why {
+	case rejNoFloor:
+		c.rejNoFloor++
+	case rejCeiling:
+		c.rejCeiling++
+	case rejFloor:
+		c.rejFloor++
+	}
 }
 
 // addStats puts the range diagnostics on threads_done (the five reply categories are
@@ -1027,6 +1060,12 @@ func (c *inboxRowCounts) addStats(stats map[string]int) {
 	stats["inbox_late_v2_other"] = c.late.v2Other
 	stats["inbox_late_other_epoch"] = c.late.otherEpoch
 	stats["inbox_late_rejected"] = c.late.rejected
+	stats["inbox_late_rej_nofloor"] = c.late.rejNoFloor
+	stats["inbox_late_rej_floor"] = c.late.rejFloor
+	stats["inbox_late_rej_ceiling"] = c.late.rejCeiling
+	stats["inbox_late_rej_epoch"] = c.late.rejEpoch
+	stats["inbox_reply_threads"] = c.replyThreads
+	stats["inbox_late_frames_threads"] = c.late.framesThreads
 	stats["oneoff_extra_frames"] = c.oneoffExtra
 	stats["oneoff_unknown_stream_frames"] = c.unknownStream
 }
@@ -1153,54 +1192,118 @@ func pageFloor(tbl *table.LSTable) (floor cursorPos, ok bool) {
 	return floor, ok
 }
 
+// threadRowCount is the number of thread rows in a table, in the two tables pageFloor reads.
+func threadRowCount(tbl *table.LSTable) int {
+	if tbl == nil {
+		return 0
+	}
+	return len(tbl.LSDeleteThenInsertThread) + len(tbl.LSUpdateOrInsertThread)
+}
+
 // pagePosition is what a later frame's row is checked against: the page's request
-// reference (its ceiling) and the oldest thread its reply carried (its floor).
+// reference (its ceiling) and the oldest thread its reply carried (its floor). When the
+// reply carried no thread rows at all, frameFloor lets a row use the oldest thread of
+// the frame that carried it instead; it is set only on a watch opened after the socket's
+// first sync, so the library's own connect-time thread fetches (which may start deeper
+// in the inbox, from its saved state) can never lend a row a floor.
 type pagePosition struct {
-	ref     cursorPos
-	floor   cursorPos
-	floorOK bool
+	ref        cursorPos
+	floor      cursorPos
+	floorOK    bool
+	frameFloor bool
 }
 
-// answers says whether a more row whose minimum is at pos can continue the walk from
-// this page, comparing the whole (time, key) position in the walk's order. It must be
-// strictly older than the request's reference, so the walk moves forward, and not
-// older than the oldest thread the reply carried, so the next request skips none of
-// this page's threads, not even one at the same time. A row from deeper in the inbox
-// (an older request's, or a folder's) fails the floor; a row from a page before this
-// one, or at the reference, fails the ceiling.
-func (p pagePosition) answers(pos cursorPos) bool {
-	return p.floorOK && pos.olderThan(p.ref) && !pos.olderThan(p.floor)
+// possible says whether any late row could ever answer this page: without a floor from
+// the reply or from the row's own frame, none can.
+func (p pagePosition) possible() bool { return p.floorOK || p.frameFloor }
+
+type rejectReason int
+
+const (
+	accepted rejectReason = iota
+	rejNoFloor
+	rejCeiling
+	rejFloor
+)
+
+// judge says whether a more row whose minimum is at pos, carried by frame f, can
+// continue the walk from this page, comparing the whole (time, key) position in the
+// walk's order, and if not, why. It must be strictly older than the request's reference,
+// so the walk moves forward, and not older than the page's oldest thread, so the next
+// request skips none of this page's threads, not even one at the same time. That floor
+// is the reply's; only when the reply had no thread rows (and frameFloor is set) is it
+// the oldest thread of the row's own frame. A row with no floor is never taken. A row
+// from deeper in the inbox (an older request's, a folder's, a cumulative range beside a
+// single new thread) fails the floor; a row from a page before this one, or at the
+// reference, fails the ceiling.
+func (p pagePosition) judge(pos cursorPos, f lateFrame) rejectReason {
+	floor, ok := p.floor, p.floorOK
+	if !ok && p.frameFloor {
+		floor, ok = f.floor, f.floorOK
+	}
+	switch {
+	case !ok:
+		return rejNoFloor
+	case !pos.olderThan(p.ref):
+		return rejCeiling
+	case pos.olderThan(floor):
+		return rejFloor
+	}
+	return accepted
 }
 
-// lateCandidates splits a later frame's rows into those that may continue the page and
-// a count of the ones that could have but do not answer its position. A late row
-// carries no request id, so it never concludes the walk: only the reply to the walk's
-// own request can say there is nothing more. Only more rows may continue it: a group-1
-// sync-group row for the inbox parent or for parent 0, or a group-1 inbox-table row.
-// End rows of every table are left out here (they are counted by kind, see
-// lateCounts), and V2 never decides.
-func lateCandidates(r rangeRows, p pagePosition) (out rangeRows, rejected int) {
+// isCandidateSync and isCandidateInbox say whether a group-1 range row could continue
+// a page at all: a more row for the inbox parent or parent 0, or an inbox-table more row.
+func isCandidateSync(row *table.LSUpsertSyncGroupThreadsRange) bool {
+	return row.HasMoreBefore && (row.ParentThreadKey == inboxParentKey || row.ParentThreadKey == 0)
+}
+
+func isCandidateInbox(row *table.LSUpsertInboxThreadsRange) bool { return row.HasMoreBefore }
+
+func candidateCount(r rangeRows) (n int) {
 	for _, row := range r.sync {
-		if !row.HasMoreBefore || (row.ParentThreadKey != inboxParentKey && row.ParentThreadKey != 0) {
-			continue
-		}
-		if p.answers(cursorPos{ts: row.MinLastActivityTimestampMS, key: row.MinThreadKey}) {
-			out.sync = append(out.sync, row)
-		} else {
-			rejected++
+		if isCandidateSync(row) {
+			n++
 		}
 	}
 	for _, row := range r.inbox {
-		if !row.HasMoreBefore {
-			continue
-		}
-		if p.answers(cursorPos{ts: row.MinLastActivityTimestampMs, key: row.MinThreadKey}) {
-			out.inbox = append(out.inbox, row)
-		} else {
-			rejected++
+		if isCandidateInbox(row) {
+			n++
 		}
 	}
-	return out, rejected
+	return n
+}
+
+// lateCandidates splits later frames' rows into those that may continue the page, and
+// counts the ones that could have but do not answer its position, by reason. A late row
+// carries no request id, so it never concludes the walk: only the reply to the walk's
+// own request can say there is nothing more. Only more rows may continue it (see
+// isCandidateSync). End rows of every table are left out here (they are counted by
+// kind, see lateCounts), and V2 never decides.
+func lateCandidates(frames []lateFrame, p pagePosition, counts *lateCounts) (out rangeRows) {
+	for _, f := range frames {
+		for _, row := range f.rows.sync {
+			if !isCandidateSync(row) {
+				continue
+			}
+			if why := p.judge(cursorPos{ts: row.MinLastActivityTimestampMS, key: row.MinThreadKey}, f); why == accepted {
+				out.sync = append(out.sync, row)
+			} else {
+				counts.reject(why)
+			}
+		}
+		for _, row := range f.rows.inbox {
+			if !isCandidateInbox(row) {
+				continue
+			}
+			if why := p.judge(cursorPos{ts: row.MinLastActivityTimestampMs, key: row.MinThreadKey}, f); why == accepted {
+				out.inbox = append(out.inbox, row)
+			} else {
+				counts.reject(why)
+			}
+		}
+	}
+	return out
 }
 
 // lateRange continues a page from the candidate rows of later frames, always with
@@ -1229,15 +1332,27 @@ func lateRange(r rangeRows) *walkRange {
 }
 
 // rangeWatch gathers the range rows of live tables (frames that are not the reply to
-// the walk's own request) while one inbox page is outstanding. It belongs to the
-// connection epoch it was opened in: a row that arrives after the epoch changed (a
-// reconnect, a disconnect, the offline sync's end) is counted and dropped. Its fields
-// are guarded by s.mu; ready is signalled, never blocking, when rows are kept.
+// the walk's own request) while one inbox page is outstanding, frame by frame, each with
+// the oldest thread its frame carried. It belongs to the connection epoch it was opened
+// in: a row that arrives after the epoch changed (a reconnect, a disconnect, the offline
+// sync's end) is counted and dropped, and the change wakes the waiter, which then stops.
+// postConnect is whether it was opened after the socket's first sync completed (the link
+// was up): the library's own connect-time thread fetches are answered before that. Its
+// fields are guarded by s.mu; ready is signalled, never blocking, when rows are kept or
+// the epoch changes.
 type rangeWatch struct {
-	epoch  int64
-	rows   rangeRows
-	counts lateCounts
-	ready  chan struct{}
+	epoch       int64
+	postConnect bool
+	frames      []lateFrame
+	counts      lateCounts
+	ready       chan struct{}
+}
+
+// lateFrame is one live table's range rows and the oldest of its thread rows.
+type lateFrame struct {
+	rows    rangeRows
+	floor   cursorPos
+	floorOK bool
 }
 
 // openWatch opens the walk's watch for the page about to be requested. Walks hold the
@@ -1245,7 +1360,7 @@ type rangeWatch struct {
 func (s *messagixSession) openWatch() *rangeWatch {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	w := &rangeWatch{epoch: s.connEpoch, ready: make(chan struct{}, 1)}
+	w := &rangeWatch{epoch: s.connEpoch, postConnect: !s.linkDown, ready: make(chan struct{}, 1)}
 	s.rangeWatch = w
 	return w
 }
@@ -1264,49 +1379,78 @@ func (s *messagixSession) closeWatch(w *rangeWatch, counts *inboxRowCounts) {
 	w.counts = lateCounts{}
 }
 
-// offerLocked counts a live table's range rows and keeps them for the page if the
-// connection epoch is still the watch's. The caller holds s.mu.
-func (s *messagixSession) offerLocked(w *rangeWatch, tbl *table.LSTable) {
-	r := rangeRowsOf(tbl)
-	if r.len() == 0 {
-		return
+// bumpEpochLocked starts a new connection epoch and wakes an open range watch, whose
+// page can no longer be answered. The caller holds s.mu.
+func (s *messagixSession) bumpEpochLocked() {
+	s.connEpoch++
+	if w := s.rangeWatch; w != nil {
+		w.wake()
 	}
-	w.counts.add(r)
-	if s.connEpoch != w.epoch {
-		w.counts.otherEpoch += r.len()
-		return
-	}
-	w.rows.add(r)
+}
+
+func (w *rangeWatch) wake() {
 	select {
 	case w.ready <- struct{}{}:
 	default:
 	}
 }
 
+// offerLocked counts a live table's range rows and keeps them for the page, with the
+// table's oldest thread, if the connection epoch is still the watch's. The caller holds
+// s.mu.
+func (s *messagixSession) offerLocked(w *rangeWatch, tbl *table.LSTable) {
+	r := rangeRowsOf(tbl)
+	if r.len() == 0 {
+		return
+	}
+	w.counts.add(r)
+	if threadRowCount(tbl) > 0 {
+		w.counts.framesThreads++
+	}
+	if s.connEpoch != w.epoch {
+		w.counts.otherEpoch += r.len()
+		w.counts.rejEpoch += candidateCount(r)
+		return
+	}
+	f := lateFrame{rows: r}
+	f.floor, f.floorOK = pageFloor(tbl)
+	w.frames = append(w.frames, f)
+	w.wake()
+}
+
 // awaitInboxRange waits, at most budget, for a later frame to carry a more row that
-// answers the page requested at ref whose reply's oldest thread is floor, and
-// continues the page from the candidates gathered so far each time rows arrive. A
-// late row never ends the walk (see lateCandidates). It returns how long it waited.
-// nil without an error means none arrived in time: the walk stops as before (stop 2).
+// answers the page at pos, and continues the page from the candidates gathered so far
+// each time rows arrive. A late row never ends the walk (see lateCandidates). It
+// returns how long it waited. nil without an error means the page has no late range:
+// the walk stops as before (stop 2). It stops waiting at once, before the budget is
+// spent, when nothing more can be accepted: no row can have a floor (pos.possible), the
+// connection epoch changed, or a candidate row arrived that could only be judged
+// against its own frame and that frame had no thread rows (the page's range came apart
+// from its threads; a later row would not be the answer to this page).
 // Only a cancel is an error.
-func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, ref socket.FetchThreadsTask, floor cursorPos, floorOK bool, budget time.Duration, counts *inboxRowCounts) (*walkRange, time.Duration, error) {
+func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, pos pagePosition, budget time.Duration, counts *inboxRowCounts) (*walkRange, time.Duration, error) {
 	start := time.Now()
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
-	pos := pagePosition{ref: cursorPos{ts: ref.ReferenceActivityTimestamp, key: ref.ReferenceThreadKey}, floor: floor, floorOK: floorOK}
 	var gathered rangeRows
 	for {
 		s.mu.Lock()
-		got := w.rows
-		w.rows = rangeRows{}
+		got := w.frames
+		w.frames = nil
+		moved := s.connEpoch != w.epoch
 		s.mu.Unlock()
-		if got.len() > 0 {
-			kept, rejected := lateCandidates(got, pos)
-			counts.late.rejected += rejected
-			gathered.add(kept)
+		if len(got) > 0 {
+			noFloor := counts.late.rejNoFloor
+			gathered.add(lateCandidates(got, pos, &counts.late))
 			if rng := lateRange(gathered); rng != nil {
 				return rng, time.Since(start), nil
 			}
+			if counts.late.rejNoFloor > noFloor {
+				return nil, time.Since(start), nil
+			}
+		}
+		if moved || !pos.possible() {
+			return nil, time.Since(start), nil
 		}
 		select {
 		case <-w.ready:
