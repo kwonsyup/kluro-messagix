@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -79,6 +80,9 @@ type messagixSession struct {
 	refreshPager  threadPager        // test seam: the refresh's client; nil means the messagix client
 	historyPager  threadPager        // test seam: History's client; nil means the messagix client
 	inboxResume   *inboxResumeRef    // where the next inbox walk resumes after one hit the page bound (memory only; guarded by mu)
+	rangeWatch    *rangeWatch        // the inbox page's open range watch: live tables add their range rows to it (guarded by mu)
+	oneoffExtra   atomic.Int64       // library warnings: a second data frame on a one-off stream (count only; see frameDropHook)
+	unknownStream atomic.Int64       // library warnings: a data frame for a stream it no longer has (count only)
 
 	threads        map[string]*threadInfo         // by wire id
 	participants   map[int64][]pendingParticipant // participant rows waiting for their thread
@@ -258,8 +262,9 @@ func (s *messagixSession) Start(ctx context.Context, emit emitFunc, acks *ackHub
 	}
 
 	// Library logs are discarded: they are not audited for sensitive content,
-	// and stderr may carry only the sidecar's own level+code lines.
-	cli := messagix.NewClient(ck, zerolog.Nop(), &messagix.Config{})
+	// and stderr may carry only the sidecar's own level+code lines. Two of its
+	// warnings are counted, by message only (see libraryLogger).
+	cli := messagix.NewClient(ck, s.libraryLogger(), &messagix.Config{})
 	if !s.logoutOnly {
 		cli.SetEventHandler(s.handleMetaEvent)
 	}
@@ -1099,4 +1104,37 @@ func emitterFatal(code int) {
 		time.Sleep(500 * time.Millisecond)
 		os.Exit(code)
 	}()
+}
+
+// The library's warnings for a data frame it drops: a second frame on a one-off
+// stream (only the first reaches ExecuteTasks; dgw OneOffStream.receiveFrame), and a
+// frame for a stream it has already closed (dgw Socket readLoop).
+const (
+	msgOneOffExtraFrame   = "Received multiple frames in one-off stream"
+	msgUnknownStreamFrame = "Received data frame for unknown stream"
+)
+
+// frameDropHook counts the library's dropped-frame warnings by their fixed message.
+// It reads nothing else of the event: no field, frame or payload.
+type frameDropHook struct{ s *messagixSession }
+
+func (h frameDropHook) Run(_ *zerolog.Event, _ zerolog.Level, msg string) {
+	switch msg {
+	case msgOneOffExtraFrame:
+		h.s.oneoffExtra.Add(1)
+	case msgUnknownStreamFrame:
+		h.s.unknownStream.Add(1)
+	}
+}
+
+// libraryLogger is the messagix client's logger: warnings and errors only, written
+// to io.Discard, with frameDropHook counting the two dropped-frame warnings. Nothing
+// the library logs leaves the process.
+func (s *messagixSession) libraryLogger() zerolog.Logger {
+	return zerolog.New(io.Discard).Level(zerolog.WarnLevel).Hook(frameDropHook{s: s})
+}
+
+// frameDrops is the session's dropped-frame warning counts so far.
+func (s *messagixSession) frameDrops() (oneoffExtra, unknownStream int64) {
+	return s.oneoffExtra.Load(), s.unknownStream.Load()
 }
