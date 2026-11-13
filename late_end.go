@@ -221,9 +221,9 @@ func (p pagePosition) endCheck(f lateFrame) (*table.LSUpsertSyncGroupThreadsRang
 // stop-6 condition, by each condition it failed (one frame can count under several).
 // For a frame whose end row the position check rejected, the rest says which
 // sub-condition of judge did it (their sum is always rejPosition), how the row's
-// minimum and the frame's threads sit against the page's reference, the same three
-// facts count records for an accepted end row, and whether the rejecting watch was
-// the walk's last requested page's.
+// minimum and the frame's threads sit against the page's reference, the V2 and
+// cursor facts count records for an accepted end row, and whether the rejecting
+// watch was the walk's last requested page's.
 type end6Counts struct {
 	pages, tiedReq, tiedTask, tight, v2Agree, v2Disagree, resync int
 	cursorSent, cursorOther, walkEpochMoved, knownGap, c1to8     int
@@ -231,7 +231,7 @@ type end6Counts struct {
 	rejMoreInFrame, rejPosition                                  int
 	rejPosCeiling, rejPosFloor, rejPosNoFloor                    int
 	rejMinEqRef, rejMinUntimed, rejThreadsBelowRef               int
-	rejV2Agree, rejCursorSent, rejKnownGap, rejLastPage          int
+	rejV2Agree, rejCursorSent, rejLastPage                       int
 	contradicted                                                 int // frames after a stop-6 end row whose more rows did not answer the page
 }
 
@@ -240,9 +240,12 @@ type end6Counts struct {
 // which judge sub-condition did it (judge returns the first failing one in its own
 // order, so the three split counts always sum to the position rejects), the row's
 // minimum against the page's reference and the frame's oldest thread against it, and
-// the same three facts count records for an accepted end row. The watch keeps its own
-// tally (w.endRejPos) so closeWatch can keep only the last requested page's rejects.
-func (c *end6Counts) reject(s *messagixSession, w *rangeWatch, pos pagePosition, f lateFrame) {
+// the V2 and cursor facts count records for an accepted end row. Everything it reads
+// is the frame's own rows, the page's position and the watch's cursor, so the walk
+// goroutine runs it without s.mu. rejLastPage is a per-page tally that openWatch
+// resets when the next page's watch opens, so only the last requested page's
+// position rejects are kept.
+func (c *end6Counts) reject(w *rangeWatch, pos pagePosition, f lateFrame) {
 	row, why := pos.endCheck(f)
 	if row == nil {
 		return
@@ -268,23 +271,19 @@ func (c *end6Counts) reject(s *messagixSession, w *rangeWatch, pos pagePosition,
 	c.rejMinEqRef += b2i(lo == pos.ref)
 	c.rejMinUntimed += b2i(lo.ts == 0)
 	c.rejThreadsBelowRef += b2i(f.floorOK && f.floor.olderThan(pos.ref))
-	s.mu.Lock()
-	_, agree, sent, gap := s.endFacts(w, pos, f, lo)
-	w.endRejPos++
-	s.mu.Unlock()
+	_, agree, sent := endFacts(w, lo, f)
 	c.rejV2Agree += b2i(agree)
 	c.rejCursorSent += b2i(sent)
-	c.rejKnownGap += gap
+	c.rejLastPage++
 }
 
-// endFacts is three of the beside counts of an end row's frame, computed the same way
-// for one that stopped the page 6 (count) and for one the position check rejected
-// (reject): v2 is whether the frame carries an inbox-parent V2 row and agree one with
-// the row's minimum; sent is a database-1 block naming the cursor the page was sent
-// with; gap is the known threads strictly between the frame's newest thread and the
-// reference that the frame does not carry (encrypted ones excluded). The caller holds
-// s.mu.
-func (s *messagixSession) endFacts(w *rangeWatch, pos pagePosition, f lateFrame, lo cursorPos) (v2, agree, sent bool, gap int) {
+// endFacts is the beside counts of an end row's frame that the frame's own rows and
+// the watch answer, computed the same way for one that stopped the page 6 (count)
+// and for one the position check rejected (reject): v2 is whether the frame carries
+// an inbox-parent V2 row and agree one with the row's minimum; sent is a database-1
+// block naming the cursor the page was sent with (w.cursor is written once, before
+// the page's request is sent, so it is read here without s.mu).
+func endFacts(w *rangeWatch, lo cursorPos, f lateFrame) (v2, agree, sent bool) {
 	for _, r := range f.rows.v2 {
 		if r.ParentThreadKey == inboxParentKey {
 			v2 = true
@@ -294,13 +293,21 @@ func (s *messagixSession) endFacts(w *rangeWatch, pos pagePosition, f lateFrame,
 		}
 	}
 	sent = w.cursor != "" && slices.Contains(f.cursors, w.cursor)
+	return v2, agree, sent
+}
+
+// knownGap is the known threads strictly between the frame's newest thread and the
+// reference that the frame does not carry (encrypted ones excluded): the one beside
+// count that reads the session's threads, so only count reads it, under the lock it
+// already holds. The caller holds s.mu.
+func (s *messagixSession) knownGap(pos pagePosition, f lateFrame) (gap int) {
 	for _, th := range s.threads {
 		at := cursorPos{ts: th.LastActivity, key: th.Key}
 		if !th.Enc && th.LastActivity > 0 && f.newest.olderThan(at) && at.olderThan(pos.ref) && !f.keys[th.Key] {
 			gap++
 		}
 	}
-	return v2, agree, sent, gap
+	return gap
 }
 
 // count records a stop-6 end row. The caller holds s.mu.
@@ -320,7 +327,7 @@ func (c *end6Counts) count(s *messagixSession, w *rangeWatch, pos pagePosition, 
 	if tight {
 		c.tight++
 	}
-	v2, agree, sent, gap := s.endFacts(w, pos, f, lo)
+	v2, agree, sent := endFacts(w, lo, f)
 	switch {
 	case agree:
 		c.v2Agree++
@@ -340,7 +347,7 @@ func (c *end6Counts) count(s *messagixSession, w *rangeWatch, pos pagePosition, 
 	if !sameWalkEpoch {
 		c.walkEpochMoved++
 	}
-	c.knownGap += gap
+	c.knownGap += s.knownGap(pos, f)
 	if tight && agree && !w.resync && sameWalkEpoch {
 		c.c1to8++
 	}
@@ -374,7 +381,6 @@ func (c *end6Counts) addStats(stats map[string]int) {
 	stats["inbox_end_rej_threads_below_ref"] = c.rejThreadsBelowRef
 	stats["inbox_end_rej_v2_agree"] = c.rejV2Agree
 	stats["inbox_end_rej_cursor_sent"] = c.rejCursorSent
-	stats["inbox_end_rej_known_gap"] = min(c.rejKnownGap, 999)
 	stats["inbox_end_rej_last_page"] = c.rejLastPage
 }
 

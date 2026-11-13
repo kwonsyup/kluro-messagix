@@ -1431,11 +1431,8 @@ type rangeWatch struct {
 	ids        messagix.RequestIDs
 	seen       []liveSeen
 	resync     bool
-	// endRejPos is the inbox-parent end rows the position check rejected while this
-	// watch was open: closeWatch keeps only the last requested page's tally.
-	endRejPos int
-	names     map[string]bool
-	closed    bool
+	names      map[string]bool
+	closed     bool
 }
 
 // lateFrame is one live table's range rows and the oldest of its thread rows. The
@@ -1457,13 +1454,16 @@ type lateFrame struct {
 }
 
 // openWatch opens the walk's watch for the page about to be requested, sent with
-// cursor. Walks hold the walk slot, so at most one watch is open at a time.
+// cursor. Walks hold the walk slot, so at most one watch is open at a time. A new
+// page's watch also restarts the last-page tally of position-rejected end rows (see
+// end6Counts.rejLastPage), so only the last requested page's rejects are kept.
 func (s *messagixSession) openWatch(cursor string, counts *inboxRowCounts) *rangeWatch {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !counts.opened {
 		counts.opened, counts.firstEpoch = true, s.connEpoch
 	}
+	counts.end6.rejLastPage = 0
 	w := &rangeWatch{epoch: s.connEpoch, postConnect: !s.linkDown, ready: make(chan struct{}, 1), cursor: cursor, firstEpoch: counts.firstEpoch}
 	s.rangeWatch = w
 	return w
@@ -1494,7 +1494,6 @@ func (s *messagixSession) closeWatch(w *rangeWatch, counts *inboxRowCounts) {
 	counts.late.merge(w.counts)
 	w.counts = lateCounts{}
 	counts.tie.count(w)
-	counts.end6.rejLastPage = w.endRejPos
 	for name := range w.names {
 		if counts.lateNames == nil {
 			counts.lateNames = map[string]bool{}
@@ -1620,7 +1619,7 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 				}
 				row := pos.endForPage(got[i])
 				if row == nil {
-					counts.end6.reject(s, w, pos, got[i])
+					counts.end6.reject(w, pos, got[i])
 				} else if end == nil {
 					end, endRow = &got[i], row
 				}
