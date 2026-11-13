@@ -550,6 +550,10 @@ func TestEndChangesOnlyTheStopCode(t *testing.T) {
 				}
 			}
 			ws, os := with.Stats["inbox_stop"], without.Stats["inbox_stop"]
+			// Premise of the position-reject fixtures: the end row was rejected on position and the stop stayed 2.
+			if strings.HasSuffix(name, "reject") && (with.Stats["inbox_end_rej_position"] != 1 || without.Stats["inbox_end_rej_position"] != 0 || ws != 2) {
+				t.Fatalf("premise: position rejects %d/%d, stop %d", with.Stats["inbox_end_rej_position"], without.Stats["inbox_end_rej_position"], ws)
+			}
 			if ws != os && !(ws == 6 && os == 2) {
 				t.Fatalf("stop %d with the end row, %d without: only 6 for 2 may differ", ws, os)
 			}

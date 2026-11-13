@@ -104,10 +104,9 @@ func TestKD222LastPageCountsOnlyTheLastWatch(t *testing.T) {
 		t.Fatalf("rejecting page: rng=%+v err=%v", rng, err)
 	}
 	s.closeWatch(w, &counts)
+	// The last page's watch is only opened and closed, like a page whose reply decided the
+	// range: the tally must restart when the watch opens, not when a wait starts.
 	w = s.openWatch("", &counts)
-	if rng, _, _, err := s.awaitInboxRange(context.Background(), w, pos, 0, &counts); err != nil || rng != nil {
-		t.Fatalf("last page: rng=%+v err=%v", rng, err)
-	}
 	s.closeWatch(w, &counts)
 	stats := map[string]int{}
 	counts.end6.addStats(stats)
