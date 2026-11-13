@@ -219,17 +219,30 @@ func (p pagePosition) endCheck(f lateFrame) (*table.LSUpsertSyncGroupThreadsRang
 // carry (folder threads count too); c1to8: tight, V2 agrees, no resync and the walk's
 // epoch, together. The rej counts are the frames whose inbox-parent end row failed a
 // stop-6 condition, by each condition it failed (one frame can count under several).
+// For a frame whose end row the position check rejected, the rest says which
+// sub-condition of judge did it (their sum is always rejPosition), how the row's
+// minimum and the frame's threads sit against the page's reference, the same three
+// facts count records for an accepted end row, and whether the rejecting watch was
+// the walk's last requested page's.
 type end6Counts struct {
 	pages, tiedReq, tiedTask, tight, v2Agree, v2Disagree, resync int
 	cursorSent, cursorOther, walkEpochMoved, knownGap, c1to8     int
 	rejPreConnect, rejNoThreads, rejUntimed, rejNewer            int
 	rejMoreInFrame, rejPosition                                  int
+	rejPosCeiling, rejPosFloor, rejPosNoFloor                    int
+	rejMinEqRef, rejMinUntimed, rejThreadsBelowRef               int
+	rejV2Agree, rejCursorSent, rejKnownGap, rejLastPage          int
 	contradicted                                                 int // frames after a stop-6 end row whose more rows did not answer the page
 }
 
 // reject counts the stop-6 conditions that frame f's inbox-parent end row fails, if it
-// has one and it fails any.
-func (c *end6Counts) reject(pos pagePosition, f lateFrame) {
+// has one and it fails any. For an end row the position check rejected it also counts
+// which judge sub-condition did it (judge returns the first failing one in its own
+// order, so the three split counts always sum to the position rejects), the row's
+// minimum against the page's reference and the frame's oldest thread against it, and
+// the same three facts count records for an accepted end row. The watch keeps its own
+// tally (w.endRejPos) so closeWatch can keep only the last requested page's rejects.
+func (c *end6Counts) reject(s *messagixSession, w *rangeWatch, pos pagePosition, f lateFrame) {
 	row, why := pos.endCheck(f)
 	if row == nil {
 		return
@@ -240,6 +253,54 @@ func (c *end6Counts) reject(pos pagePosition, f lateFrame) {
 	c.rejNewer += b2i(why.newer)
 	c.rejMoreInFrame += b2i(why.moreInFrame)
 	c.rejPosition += b2i(why.position)
+	if !why.position {
+		return
+	}
+	lo := cursorPos{ts: row.MinLastActivityTimestampMS, key: row.MinThreadKey}
+	switch pos.judge(lo, f) {
+	case rejCeiling:
+		c.rejPosCeiling++
+	case rejFloor:
+		c.rejPosFloor++
+	default: // rejNoFloor; judge cannot return accepted here, why.position says it failed
+		c.rejPosNoFloor++
+	}
+	c.rejMinEqRef += b2i(lo == pos.ref)
+	c.rejMinUntimed += b2i(lo.ts == 0)
+	c.rejThreadsBelowRef += b2i(f.floorOK && f.floor.olderThan(pos.ref))
+	s.mu.Lock()
+	_, agree, sent, gap := s.endFacts(w, pos, f, lo)
+	w.endRejPos++
+	s.mu.Unlock()
+	c.rejV2Agree += b2i(agree)
+	c.rejCursorSent += b2i(sent)
+	c.rejKnownGap += gap
+}
+
+// endFacts is three of the beside counts of an end row's frame, computed the same way
+// for one that stopped the page 6 (count) and for one the position check rejected
+// (reject): v2 is whether the frame carries an inbox-parent V2 row and agree one with
+// the row's minimum; sent is a database-1 block naming the cursor the page was sent
+// with; gap is the known threads strictly between the frame's newest thread and the
+// reference that the frame does not carry (encrypted ones excluded). The caller holds
+// s.mu.
+func (s *messagixSession) endFacts(w *rangeWatch, pos pagePosition, f lateFrame, lo cursorPos) (v2, agree, sent bool, gap int) {
+	for _, r := range f.rows.v2 {
+		if r.ParentThreadKey == inboxParentKey {
+			v2 = true
+			if r.MinLastActivityTimestampMs == lo.ts && r.MinThreadKey == lo.key {
+				agree = true
+			}
+		}
+	}
+	sent = w.cursor != "" && slices.Contains(f.cursors, w.cursor)
+	for _, th := range s.threads {
+		at := cursorPos{ts: th.LastActivity, key: th.Key}
+		if !th.Enc && th.LastActivity > 0 && f.newest.olderThan(at) && at.olderThan(pos.ref) && !f.keys[th.Key] {
+			gap++
+		}
+	}
+	return v2, agree, sent, gap
 }
 
 // count records a stop-6 end row. The caller holds s.mu.
@@ -259,15 +320,7 @@ func (c *end6Counts) count(s *messagixSession, w *rangeWatch, pos pagePosition, 
 	if tight {
 		c.tight++
 	}
-	var v2, agree bool
-	for _, r := range f.rows.v2 {
-		if r.ParentThreadKey == inboxParentKey {
-			v2 = true
-			if r.MinLastActivityTimestampMs == lo.ts && r.MinThreadKey == lo.key {
-				agree = true
-			}
-		}
-	}
+	v2, agree, sent, gap := s.endFacts(w, pos, f, lo)
 	switch {
 	case agree:
 		c.v2Agree++
@@ -278,7 +331,7 @@ func (c *end6Counts) count(s *messagixSession, w *rangeWatch, pos pagePosition, 
 		c.resync++
 	}
 	switch {
-	case w.cursor != "" && slices.Contains(f.cursors, w.cursor):
+	case sent:
 		c.cursorSent++
 	case len(f.cursors) > 0:
 		c.cursorOther++
@@ -286,13 +339,6 @@ func (c *end6Counts) count(s *messagixSession, w *rangeWatch, pos pagePosition, 
 	sameWalkEpoch := w.epoch == w.firstEpoch
 	if !sameWalkEpoch {
 		c.walkEpochMoved++
-	}
-	gap := 0
-	for _, th := range s.threads {
-		at := cursorPos{ts: th.LastActivity, key: th.Key}
-		if !th.Enc && th.LastActivity > 0 && f.newest.olderThan(at) && at.olderThan(pos.ref) && !f.keys[th.Key] {
-			gap++
-		}
 	}
 	c.knownGap += gap
 	if tight && agree && !w.resync && sameWalkEpoch {
@@ -320,6 +366,16 @@ func (c *end6Counts) addStats(stats map[string]int) {
 	stats["inbox_end_rej_newer"] = c.rejNewer
 	stats["inbox_end_rej_more_in_frame"] = c.rejMoreInFrame
 	stats["inbox_end_rej_position"] = c.rejPosition
+	stats["inbox_end_rej_pos_ceiling"] = c.rejPosCeiling
+	stats["inbox_end_rej_pos_floor"] = c.rejPosFloor
+	stats["inbox_end_rej_pos_nofloor"] = c.rejPosNoFloor
+	stats["inbox_end_rej_min_eq_ref"] = c.rejMinEqRef
+	stats["inbox_end_rej_min_untimed"] = c.rejMinUntimed
+	stats["inbox_end_rej_threads_below_ref"] = c.rejThreadsBelowRef
+	stats["inbox_end_rej_v2_agree"] = c.rejV2Agree
+	stats["inbox_end_rej_cursor_sent"] = c.rejCursorSent
+	stats["inbox_end_rej_known_gap"] = min(c.rejKnownGap, 999)
+	stats["inbox_end_rej_last_page"] = c.rejLastPage
 }
 
 // tieProbe counts, over a walk's pages, the live tables seen while a page's watch was

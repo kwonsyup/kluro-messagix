@@ -116,6 +116,8 @@ var newDiagKeys = []string{
 	"inbox_end6_pages", "inbox_end6_tied_req", "inbox_end6_tied_task", "inbox_end6_tight", "inbox_end6_v2_agree", "inbox_end6_v2_disagree", "inbox_end6_resync",
 	"inbox_end6_cursor_sent", "inbox_end6_cursor_other", "inbox_end6_walk_epoch_moved", "inbox_end6_known_gap", "inbox_end6_c1to8", "inbox_end6_contradicted",
 	"inbox_end_rej_preconnect", "inbox_end_rej_nothreads", "inbox_end_rej_untimed", "inbox_end_rej_newer", "inbox_end_rej_more_in_frame", "inbox_end_rej_position",
+	"inbox_end_rej_pos_ceiling", "inbox_end_rej_pos_floor", "inbox_end_rej_pos_nofloor", "inbox_end_rej_min_eq_ref", "inbox_end_rej_min_untimed",
+	"inbox_end_rej_threads_below_ref", "inbox_end_rej_v2_agree", "inbox_end_rej_cursor_sent", "inbox_end_rej_known_gap", "inbox_end_rej_last_page",
 	"start_tbl_src", "start_tbl_threads", "start_tbl_verify_threads", "start_tbl_g1_inbox_more", "start_tbl_g1_inbox_end", "start_tbl_g1_p0_more", "start_tbl_g1_p0_end",
 	"start_tbl_g1_other_more", "start_tbl_g1_other_end", "start_tbl_inbox_more", "start_tbl_inbox_end", "start_tbl_v2_inbox", "start_tbl_v2_other", "start_tbl_ranges_query",
 	"start_tbl_sync_blocks", "start_tbl_db1_blocks",

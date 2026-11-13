@@ -1431,8 +1431,11 @@ type rangeWatch struct {
 	ids        messagix.RequestIDs
 	seen       []liveSeen
 	resync     bool
-	names      map[string]bool
-	closed     bool
+	// endRejPos is the inbox-parent end rows the position check rejected while this
+	// watch was open: closeWatch keeps only the last requested page's tally.
+	endRejPos int
+	names     map[string]bool
+	closed    bool
 }
 
 // lateFrame is one live table's range rows and the oldest of its thread rows. The
@@ -1491,6 +1494,7 @@ func (s *messagixSession) closeWatch(w *rangeWatch, counts *inboxRowCounts) {
 	counts.late.merge(w.counts)
 	w.counts = lateCounts{}
 	counts.tie.count(w)
+	counts.end6.rejLastPage = w.endRejPos
 	for name := range w.names {
 		if counts.lateNames == nil {
 			counts.lateNames = map[string]bool{}
@@ -1616,7 +1620,7 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 				}
 				row := pos.endForPage(got[i])
 				if row == nil {
-					counts.end6.reject(pos, got[i])
+					counts.end6.reject(s, w, pos, got[i])
 				} else if end == nil {
 					end, endRow = &got[i], row
 				}
