@@ -210,7 +210,9 @@ func TestKD222StaleFloorEndOnlyEarnsAContinuation(t *testing.T) {
 func TestKD222FloorEndContinuationDoesNotRecurse(t *testing.T) {
 	withRangeWait(t, 300*time.Millisecond)
 	end1 := withV2(threadsFrame([][2]int64{{89, 4500}, {88, 4400}}, rangeOnly(endRow(-1, 85, 4300))), -1, 85, 4300)
-	end2 := withV2(threadsFrame([][2]int64{{86, 4300}}, rangeOnly(endRow(-1, 84, 4200))), -1, 84, 4200)
+	// The second frame continues the continuation's own frontier (it carries
+	// thread 87 the reply delivered), so only the no-recursion guard refuses it.
+	end2 := withV2(threadsFrame([][2]int64{{87, 4350}, {86, 4300}}, rangeOnly(endRow(-1, 84, 4200))), -1, 84, 4200)
 	p := &framedInbox{s: connected(t),
 		replies: []*table.LSTable{tpage(101, 5000, moreRow(-1, 90, 4600)), emptyReply, tpage(87, 4350)},
 		later:   [][]laterFrame{nil, {late(20 * time.Millisecond, end1)}, {late(20 * time.Millisecond, end2)}},
