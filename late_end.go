@@ -191,9 +191,9 @@ func (p pagePosition) endForPage(f lateFrame) *table.LSUpsertSyncGroupThreadsRan
 // path. The bindings checked when the wait runs out — one epoch for the whole
 // walk, no resync and no further cursor while the watch was open, and no known
 // thread between the frame's newest and the reference — are in awaitInboxRange.
-// Only then does the end row's own "no more before" (corroborated by V2) decide
-// the range ended, and the walk stops complete; every other failure keeps its
-// stop.
+// A bound candidate then earns the walk's one continuation request below the
+// page's oldest delivered thread; the unbound frame itself never decides the
+// range ended. Every other failure keeps its stop.
 func (p pagePosition) endAtFloor(w *rangeWatch, f lateFrame) (row *table.LSUpsertSyncGroupThreadsRange, cand bool) {
 	row, why := p.endCheck(f)
 	if row == nil || why != (endRejects{position: true}) {
@@ -277,7 +277,7 @@ type end6Counts struct {
 	rejMinEqRef, rejMinUntimed, rejThreadsBelowRef               int
 	rejV2Agree, rejCursorSent, rejLastPage                       int
 	contradicted                                                 int // frames after a stop-6 end row whose more rows did not answer the page
-	floorAccepted, floorRefused                                  int // floor-end candidates the walk completed on, or declined to (see endAtFloor)
+	floorRefused                                                 int // floor-end candidates declined outright or at the wait's end (see endAtFloor)
 }
 
 // reject counts the stop-6 conditions that frame f's inbox-parent end row fails, if it
@@ -427,7 +427,6 @@ func (c *end6Counts) addStats(stats map[string]int) {
 	stats["inbox_end_rej_v2_agree"] = c.rejV2Agree
 	stats["inbox_end_rej_cursor_sent"] = c.rejCursorSent
 	stats["inbox_end_rej_last_page"] = c.rejLastPage
-	stats["inbox_end_floor_accepted"] = c.floorAccepted
 	stats["inbox_end_floor_refused"] = c.floorRefused
 }
 

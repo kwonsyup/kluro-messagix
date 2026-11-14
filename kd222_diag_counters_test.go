@@ -102,7 +102,7 @@ func TestKD222LastPageCountsOnlyTheLastWatch(t *testing.T) {
 	var counts inboxRowCounts
 	w := s.openWatch("", &counts)
 	s.handleMetaEvent(context.Background(), threadsFrame([][2]int64{{90, 5000}}, rangeOnly(endRow(-1, 90, 5000))))
-	if rng, _, _, err := s.awaitInboxRange(context.Background(), w, pos, 0, &counts); err != nil || rng != nil {
+	if rng, _, _, err := s.awaitInboxRange(context.Background(), w, pos, 0, &counts, false); err != nil || rng != nil {
 		t.Fatalf("rejecting page: rng=%+v err=%v", rng, err)
 	}
 	s.closeWatch(w, &counts)
@@ -172,10 +172,16 @@ func TestKD222FloorEndContinuationReplyEndCompletesTheWalk(t *testing.T) {
 		},
 		later: [][]laterFrame{nil, {late(20 * time.Millisecond, end)}},
 	}
-	res, _ := runFramed(t, p)
+	frames, res, err, done := listGap(t, s, p, context.Background(), 10*time.Second)
+	p.wg.Wait()
+	if !done || err != nil {
+		t.Fatalf("done=%v err=%v", done, err)
+	}
 	checkWalk(t, p, res, walkWant{stop: 0, pages: 3, refs: [][2]int64{{90, 4600}, {88, 4400}}})
 	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 1})
-	listed := threadsByID(emitted)
+	// The late frame's threads come through the live emit; the continuation
+	// reply's through the walk's.
+	listed := threadsByID(append(frames, emitted...))
 	for _, th := range [][2]int64{{89, 4500}, {88, 4400}, {87, 4350}} {
 		if f := listed[strconv.FormatInt(th[0], 10)]; f == nil || f.LastActivity != th[1] {
 			t.Fatalf("thread %v is not listed: %v", th, listed)

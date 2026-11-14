@@ -592,8 +592,11 @@ var topRef = cursorPos{ts: inboxTop.ReferenceActivityTimestamp, key: inboxTop.Re
 // incomplete — 6 when that end row is one for the page (see pagePosition.endForPage;
 // it changes neither the wait nor whether the walk goes on, only the stop code), else
 // 2 as before — unless the row fails only the floor with an agreeing V2 row beside
-// it and the frame is bound to the page (see pagePosition.endAtFloor), which
-// completes the walk when the page's wait runs out. Every end row is counted. The late
+// it and the frame is bound to the page (see pagePosition.endAtFloor): that
+// candidate earns the walk's one continuation request below the page's oldest
+// delivered thread, an ordinary request whose own bound reply decides — an empty
+// reply or a reply end row completes the walk; anything else is the page's usual
+// outcome. Every end row is counted. The late
 // wait covers live frames only: a second data frame on the request's one-off stream is
 // dropped by the library and only counted (oneoff_extra_frames). The watch opens before
 // the request is sent and counts every range row that arrives while it is open,
@@ -603,7 +606,11 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 	budget := inboxRangeWait
 	var watch *rangeWatch
 	defer func() { s.closeWatch(watch, rows) }()
+	continued := false // a floor-end continuation was sent (one per walk)
+	contNext := false  // the next request is it
 	for batch := 0; batch < limit; batch++ {
+		isCont := contNext
+		contNext = false
 		if err := ctx.Err(); err != nil {
 			return "", 0, pages, ref, err
 		}
@@ -632,6 +639,11 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 		rows.replyThreads += replyThreads
 		rng := replyRange(tbl, rows)
 		endSeen := false
+		if rng == nil && isCont && replyThreads == 0 {
+			// The continuation's bound reply carried nothing below the reference:
+			// the floor-refused end row was the range's true bottom.
+			rng = &walkRange{more: false}
+		}
 		if rng == nil {
 			pos := pagePosition{ref: cursorPos{ts: ref.ReferenceActivityTimestamp, key: ref.ReferenceThreadKey}, postConnect: watch.postConnect}
 			pos.floor, pos.floorOK = pageFloor(tbl)
@@ -639,7 +651,7 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 			// watch opened after the socket's first sync (see rangeWatch.postConnect).
 			pos.frameFloor = replyThreads == 0 && watch.postConnect
 			var waited time.Duration
-			rng, endSeen, waited, err = s.awaitInboxRange(ctx, watch, pos, max(budget, 0), rows)
+			rng, endSeen, waited, err = s.awaitInboxRange(ctx, watch, pos, max(budget, 0), rows, isCont)
 			budget -= waited
 			rows.waitMS += int(waited.Milliseconds())
 			if err != nil {
@@ -658,11 +670,20 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 			return gapInboxIncomplete, 2, pages, ref, nil
 		}
 		if !rng.more {
+			if continued {
+				rows.floorContCompleted++
+			}
 			return "", 0, pages, ref, nil
 		}
 		next := socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, ReferenceThreadKey: rng.minKey, ReferenceActivityTimestamp: rng.minTS}
 		if next.ParentThreadKey == ref.ParentThreadKey && next.ReferenceThreadKey == ref.ReferenceThreadKey && next.ReferenceActivityTimestamp == ref.ReferenceActivityTimestamp {
 			return gapInboxIncomplete, 3, pages, ref, nil
+		}
+		if rng.cont {
+			// The one extra request: the walk's own, so the reply is bound to it.
+			continued, contNext = true, true
+			budget = inboxRangeWait // it waits for a late range like any page's
+			rows.floorContSent++
 		}
 		ref = next
 		select {
@@ -990,6 +1011,9 @@ type inboxRowCounts struct {
 	tie tieProbe
 	// The end rows that stopped a page with 6, and what was counted beside them (see end6Counts).
 	end6 end6Counts
+	// The one floor-end continuation request this walk sent, and whether the walk
+	// ended complete after it (see awaitInboxRange).
+	floorContSent, floorContCompleted int
 	// Table names present in the later frames that carried a range row.
 	lateNames map[string]bool
 	// The connection epoch of the walk's first watch, and whether one was opened.
@@ -1133,6 +1157,8 @@ func (c *inboxRowCounts) addStats(stats map[string]int) {
 	stats["inbox_late_db1_blocks"] = c.late.db1Blocks
 	stats["inbox_late_cursor_sent"] = c.late.cursorSent
 	stats["inbox_watch_resync"] = c.late.resync
+	stats["inbox_floor_continuation_sent"] = c.floorContSent
+	stats["inbox_floor_continuation_completed"] = c.floorContCompleted
 	c.replyClass.addStats(stats, "inbox_rows_g1_")
 	c.reply.addStats(stats)
 	c.tie.addStats(stats)
@@ -1141,9 +1167,12 @@ func (c *inboxRowCounts) addStats(stats map[string]int) {
 
 // walkRange is one page's range decision: more says whether the walk goes on, and
 // from where (the minimum thread key and activity time of what the page held).
+// cont marks the one floor-end continuation: the walk's own extra request below
+// the page's oldest delivered thread (see awaitInboxRange).
 type walkRange struct {
 	more          bool
 	minKey, minTS int64
+	cont          bool
 }
 
 // rangeRows is the range rows of one or more tables, from the three tables the server
@@ -1591,23 +1620,24 @@ func (s *messagixSession) offerLocked(w *rangeWatch, tbl *table.LSTable) {
 // and ends that were contradicted. The decisions read no diagnostic counter. Only a
 // cancel is an error.
 //
-// One late end row can complete the walk: an inbox-parent end row that fails only
-// the floor, with an inbox-parent V2 row of its frame agreeing with its minimum
-// (see pagePosition.endAtFloor). The floor keeps a more row's minimum — the next
-// request's reference — from skipping a thread the page held; an end row starts no
-// request, so the rejection only ever marks a genuine end whose range bottom sits
-// below the frame's last thread row, and the agreeing V2 row is the server's own
-// second account of that bottom. But a row shape is not a page's answer: the
-// candidate must also be bound to this page — not tagged to another request, on a
-// walked frontier, in one epoch across the whole walk, with no resync, no further
-// cursor and no known thread left between the frame's threads and the page's
-// reference. The end row's own "no more before", corroborated by V2, is then the
-// last-page signal: not the timer, which only bounds the wait. A bound row is
-// taken as the page's end: the range it returns has no more, exactly what a
-// reply's end row decides, so the walk stops complete. It never shortens the
-// wait either, a more row that answers the page still wins, and a fully
-// confirmed end row keeps stop 6.
-func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, pos pagePosition, budget time.Duration, counts *inboxRowCounts) (rng *walkRange, endSeen bool, waited time.Duration, err error) {
+// One late end row can continue the walk: an inbox-parent end row that fails
+// only the floor, with an inbox-parent V2 row of its frame agreeing with its
+// minimum (see pagePosition.endAtFloor). The floor keeps a more row's minimum —
+// the next request's reference — from skipping a thread the page held; an end
+// row starts no request, so the rejection only ever marks a genuine end whose
+// range bottom sits below the frame's last thread row, and the agreeing V2 row
+// is the server's own second account of that bottom. But a row shape is not a
+// page's answer, and even a bound frame cannot prove it is this page's end — an
+// untagged stale or replayed frame satisfies every positional binding. So the
+// bound candidate only earns one continuation: the walk's own next request,
+// below the page's oldest delivered thread, whose reply is bound to the walk by
+// the request itself. An empty continuation reply confirms the end (complete);
+// a reply end row confirms it the usual way; anything else is decided by the
+// page's ordinary rules, and a repeated floor-only shape stops 2 — the
+// continuation never recurs (isCont). It never shortens the wait either, a more
+// row that answers the page still wins, and a fully confirmed end row keeps
+// stop 6.
+func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, pos pagePosition, budget time.Duration, counts *inboxRowCounts, isCont bool) (rng *walkRange, endSeen bool, waited time.Duration, err error) {
 	start := time.Now()
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
@@ -1676,27 +1706,33 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 			}
 			s.mu.Lock()
 			moved = s.connEpoch != w.epoch
-			// The end row decides the range ended only while the walk is one unbroken
+			// The end row earns a continuation only while the walk is one unbroken
 			// reading of the server's state: one epoch across every page, no resync
 			// marker during the page's watch (a replayed range is not this page's
 			// answer), no further cursor after the end row's frame, and no known
 			// thread between the frame's newest and the page's reference that the
 			// frame does not carry (the frame must be this frontier's continuation,
 			// not some older range replayed beside it).
-			bound := end == nil && floorEnd != nil && !moved && w.epoch == w.firstEpoch &&
+			bound := !isCont && end == nil && floorEnd != nil && !moved && w.epoch == w.firstEpoch &&
 				!w.resync && !moreAfter && s.knownGap(pos, *floorEnd) == 0
 			switch {
 			case !moved && end != nil:
 				counts.end6.count(s, w, pos, *end, endRow)
 				counts.end6.contradicted += contradicted
-			case bound:
-				counts.end6.floorAccepted++
-			case !moved:
+			case !moved && !bound:
 				counts.end6.floorRefused++
 			}
 			s.mu.Unlock()
 			if bound {
-				return &walkRange{more: false}, false, time.Since(start), nil
+				// Continue from the page's oldest delivered thread: the reply's own
+				// when it carried threads, else the end frame's. The continuation's
+				// reference is below anything already delivered, so its reply's
+				// threads and range rows decide what the end row claimed.
+				next := floorEnd.floor
+				if pos.floorOK && pos.floor.olderThan(next) {
+					next = pos.floor
+				}
+				return &walkRange{more: true, minTS: next.ts, minKey: next.key, cont: true}, false, time.Since(start), nil
 			}
 			return nil, end != nil && !moved, time.Since(start), nil
 		case <-ctx.Done():
