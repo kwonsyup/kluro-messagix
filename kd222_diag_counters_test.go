@@ -143,7 +143,7 @@ func TestKD222LastPageFloorEndCompletesTheWalk(t *testing.T) {
 	}
 	res, _ := runFramed(t, p)
 	checkWalk(t, p, res, walkWant{stop: 0, pages: 4, refs: [][2]int64{{95, 4800}, {90, 4600}, {88, 4400}}})
-	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 1, "inbox_end_floor_refused": 0})
+	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 1, "inbox_floor_continuation_bound_empty": 1, "inbox_end_floor_refused": 0})
 	if task := p.tasks[3]; task.Cursor != "c-1" {
 		t.Fatalf("the continuation request's cursor = %q, want the walk's own %q", task.Cursor, "c-1")
 	}
@@ -178,7 +178,7 @@ func TestKD222FloorEndContinuationReplyEndCompletesTheWalk(t *testing.T) {
 		t.Fatalf("done=%v err=%v", done, err)
 	}
 	checkWalk(t, p, res, walkWant{stop: 0, pages: 3, refs: [][2]int64{{90, 4600}, {88, 4400}}})
-	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 1})
+	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 1, "inbox_floor_continuation_bound_end": 1})
 	// The late frame's threads come through the live emit; the continuation
 	// reply's through the walk's.
 	listed := threadsByID(append(frames, emitted...))
@@ -191,18 +191,20 @@ func TestKD222FloorEndContinuationReplyEndCompletesTheWalk(t *testing.T) {
 
 // An untagged stale or replayed floor-end frame can satisfy every positional
 // binding; it still cannot complete the walk — it only earns one bound
-// continuation request. When that request answers with a thread the stale end
-// row had skipped but no deciding range, the walk stops 2, truthfully.
+// continuation request. When the continuation's reply delivers a thread but no
+// deciding range and the same untagged replay is all its wait sees — the
+// rid-0-delta field shape — the walk stops 2 and says it was unbound-only.
 func TestKD222StaleFloorEndOnlyEarnsAContinuation(t *testing.T) {
 	withRangeWait(t, 300*time.Millisecond)
 	end := withV2(threadsFrame([][2]int64{{89, 4500}, {88, 4400}}, rangeOnly(endRow(-1, 85, 4300))), -1, 85, 4300)
 	p := &framedInbox{s: connected(t),
 		replies: []*table.LSTable{tpage(101, 5000, moreRow(-1, 90, 4600)), emptyReply, tpage(87, 4350)},
-		later:   [][]laterFrame{nil, {late(20 * time.Millisecond, end)}},
+		later:   [][]laterFrame{nil, {late(20 * time.Millisecond, end)}, {late(20 * time.Millisecond, end)}},
 	}
 	res, _ := runFramed(t, p)
 	checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 3, refs: [][2]int64{{90, 4600}, {88, 4400}}})
-	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 0})
+	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 0,
+		"inbox_floor_continuation_timeout": 1, "inbox_floor_continuation_unbound_only": 1})
 }
 
 // Only one continuation: the continuation page can itself carry a floor-end
@@ -219,7 +221,28 @@ func TestKD222FloorEndContinuationDoesNotRecurse(t *testing.T) {
 	}
 	res, _ := runFramed(t, p)
 	checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 3, refs: [][2]int64{{90, 4600}, {88, 4400}}})
-	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 0, "inbox_end_floor_refused": 1})
+	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 0, "inbox_end_floor_refused": 1,
+		"inbox_floor_continuation_timeout": 1, "inbox_floor_continuation_unbound_only": 1})
+}
+
+// The continuation can deliver more of the inbox: its bound reply carries the
+// threads the floor-refused end row had skipped and an ordinary more row, so
+// the walk goes on — bound rows, not an end.
+func TestKD222FloorEndContinuationDeliveringRows(t *testing.T) {
+	withRangeWait(t, 200*time.Millisecond)
+	end := withV2(threadsFrame([][2]int64{{89, 4500}, {88, 4400}}, rangeOnly(endRow(-1, 85, 4300))), -1, 85, 4300)
+	p := &framedInbox{s: connected(t),
+		replies: []*table.LSTable{
+			tpage(101, 5000, moreRow(-1, 90, 4600)),
+			emptyReply,
+			tpage(87, 4350, moreRow(-1, 80, 4100)),
+			tpage(79, 4000, endRow(-1, 75, 3900)),
+		},
+		later: [][]laterFrame{nil, {late(20 * time.Millisecond, end)}},
+	}
+	res, _ := runFramed(t, p)
+	checkWalk(t, p, res, walkWant{stop: 0, pages: 4, refs: [][2]int64{{90, 4600}, {88, 4400}, {80, 4100}}})
+	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 1, "inbox_floor_continuation_bound_rows": 1})
 }
 
 // A floor-end candidate on an earlier page changes nothing on its own — a more

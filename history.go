@@ -639,10 +639,19 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 		rows.replyThreads += replyThreads
 		rng := replyRange(tbl, rows)
 		endSeen := false
-		if rng == nil && isCont && replyThreads == 0 {
-			// The continuation's bound reply carried nothing below the reference:
-			// the floor-refused end row was the range's true bottom.
-			rng = &walkRange{more: false}
+		if isCont {
+			// How the continuation resolved, counted once for the field log.
+			switch {
+			case rng != nil && !rng.more:
+				rows.floorContBoundEnd++ // the reply's own end row
+			case rng != nil:
+				rows.floorContBoundRows++ // the reply's rows continue the walk
+			case replyThreads == 0:
+				// The bound reply carried nothing below the reference: the
+				// floor-refused end row was the range's true bottom.
+				rows.floorContBoundEmpty++
+				rng = &walkRange{more: false}
+			}
 		}
 		if rng == nil {
 			pos := pagePosition{ref: cursorPos{ts: ref.ReferenceActivityTimestamp, key: ref.ReferenceThreadKey}, postConnect: watch.postConnect}
@@ -659,6 +668,9 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 			}
 			if rng != nil {
 				rows.latePages++
+				if isCont && rng.more && !rng.cont {
+					rows.floorContBoundRows++ // a bound late more row continued it
+				}
 			}
 		}
 		s.closeWatch(watch, rows)
@@ -1012,8 +1024,13 @@ type inboxRowCounts struct {
 	// The end rows that stopped a page with 6, and what was counted beside them (see end6Counts).
 	end6 end6Counts
 	// The one floor-end continuation request this walk sent, and whether the walk
-	// ended complete after it (see awaitInboxRange).
-	floorContSent, floorContCompleted int
+	// ended complete after it (see awaitInboxRange). The remaining five split how
+	// the continuation resolved: its bound reply was empty or carried an end row
+	// or rows that continue the walk; or its wait expired with no bound answer,
+	// with only unbound frames seen (unboundOnly) or not.
+	floorContSent, floorContCompleted                          int
+	floorContBoundEmpty, floorContBoundEnd, floorContBoundRows int
+	floorContUnboundOnly, floorContTimeout                     int
 	// Table names present in the later frames that carried a range row.
 	lateNames map[string]bool
 	// The connection epoch of the walk's first watch, and whether one was opened.
@@ -1159,6 +1176,11 @@ func (c *inboxRowCounts) addStats(stats map[string]int) {
 	stats["inbox_watch_resync"] = c.late.resync
 	stats["inbox_floor_continuation_sent"] = c.floorContSent
 	stats["inbox_floor_continuation_completed"] = c.floorContCompleted
+	stats["inbox_floor_continuation_bound_empty"] = c.floorContBoundEmpty
+	stats["inbox_floor_continuation_bound_end"] = c.floorContBoundEnd
+	stats["inbox_floor_continuation_bound_rows"] = c.floorContBoundRows
+	stats["inbox_floor_continuation_unbound_only"] = c.floorContUnboundOnly
+	stats["inbox_floor_continuation_timeout"] = c.floorContTimeout
 	c.replyClass.addStats(stats, "inbox_rows_g1_")
 	c.reply.addStats(stats)
 	c.tie.addStats(stats)
@@ -1647,6 +1669,9 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 	var endRow *table.LSUpsertSyncGroupThreadsRange
 	var floorEnd *lateFrame // an end row the floor alone rejected, bound to this page: it can end the walk complete
 	moreAfter := false      // a more row that did not answer the page stood after floorEnd's frame
+	// For the continuation outcome counts: whether the wait saw any frame at all,
+	// and whether one was tagged to the page's own request.
+	sawFrame, sawBound := false, false
 	for {
 		s.mu.Lock()
 		got := w.frames
@@ -1654,6 +1679,12 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 		moved := s.connEpoch != w.epoch
 		s.mu.Unlock()
 		if len(got) > 0 {
+			sawFrame = true
+			for _, f := range got {
+				if f.tag.ok && w.ids.PacketID != 0 && f.tag.id == w.ids.PacketID {
+					sawBound = true
+				}
+			}
 			noFloor := false
 			for _, f := range got {
 				if _, ok := pos.floorFor(f); !ok && candidateCount(f.rows) > 0 {
@@ -1702,6 +1733,7 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 		case <-w.ready:
 		case <-timer.C:
 			if end == nil && floorEnd == nil {
+				countContWaitExpired(counts, isCont, true, sawFrame, sawBound)
 				return nil, false, time.Since(start), nil
 			}
 			s.mu.Lock()
@@ -1723,6 +1755,7 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 				counts.end6.floorRefused++
 			}
 			s.mu.Unlock()
+			countContWaitExpired(counts, isCont, end == nil || moved, sawFrame, sawBound)
 			if bound {
 				// Continue from the page's oldest delivered thread: the reply's own
 				// when it carried threads, else the end frame's. The continuation's
@@ -1738,6 +1771,21 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 		case <-ctx.Done():
 			return nil, false, time.Since(start), ctx.Err()
 		}
+	}
+}
+
+// countContWaitExpired records the continuation's wait ending without a bound
+// answer: timeout whenever the wait expired unanswered, and unboundOnly when it
+// saw frames but none tagged to the continuation's own request — the field's
+// rid-0-delta case, where the reply's content may have arrived untagged. Each
+// fires once per continuation, at the decision point.
+func countContWaitExpired(counts *inboxRowCounts, isCont, unanswered, sawFrame, sawBound bool) {
+	if !isCont || !unanswered {
+		return
+	}
+	counts.floorContTimeout++
+	if sawFrame && !sawBound {
+		counts.floorContUnboundOnly++
 	}
 }
 

@@ -119,6 +119,8 @@ var newDiagKeys = []string{
 	"inbox_end_rej_pos_ceiling", "inbox_end_rej_pos_floor", "inbox_end_rej_pos_nofloor", "inbox_end_rej_min_eq_ref", "inbox_end_rej_min_untimed",
 	"inbox_end_rej_threads_below_ref", "inbox_end_rej_v2_agree", "inbox_end_rej_cursor_sent", "inbox_end_rej_last_page",
 	"inbox_end_floor_refused", "inbox_floor_continuation_sent", "inbox_floor_continuation_completed",
+	"inbox_floor_continuation_bound_empty", "inbox_floor_continuation_bound_end", "inbox_floor_continuation_bound_rows",
+	"inbox_floor_continuation_unbound_only", "inbox_floor_continuation_timeout",
 	"start_tbl_src", "start_tbl_threads", "start_tbl_verify_threads", "start_tbl_g1_inbox_more", "start_tbl_g1_inbox_end", "start_tbl_g1_p0_more", "start_tbl_g1_p0_end",
 	"start_tbl_g1_other_more", "start_tbl_g1_other_end", "start_tbl_inbox_more", "start_tbl_inbox_end", "start_tbl_v2_inbox", "start_tbl_v2_other", "start_tbl_ranges_query",
 	"start_tbl_sync_blocks", "start_tbl_db1_blocks",
