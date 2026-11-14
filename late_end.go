@@ -172,6 +172,30 @@ func (p pagePosition) endForPage(f lateFrame) *table.LSUpsertSyncGroupThreadsRan
 	return row
 }
 
+// endAtFloor returns the frame's group-1 inbox-parent end row when the floor is the
+// one condition it fails and an inbox-parent V2 row of the frame agrees with its
+// minimum, or nil. The floor exists so a more row's minimum — the next request's
+// reference — cannot skip a thread this page held (see judge); an end row starts no
+// request, so on the walk's last page the check only rejects a genuine end: the
+// range's bottom can sit below the last thread row the frame carries, and the
+// agreeing V2 row is the server's own second account of that bottom. When the
+// page's wait runs out with such a row and nothing more, awaitInboxRange ends the
+// walk as complete; every other failure keeps its stop.
+func (p pagePosition) endAtFloor(w *rangeWatch, f lateFrame) *table.LSUpsertSyncGroupThreadsRange {
+	row, why := p.endCheck(f)
+	if row == nil || why != (endRejects{position: true}) {
+		return nil
+	}
+	lo := cursorPos{ts: row.MinLastActivityTimestampMS, key: row.MinThreadKey}
+	if p.judge(lo, f) != rejFloor {
+		return nil
+	}
+	if _, agree, _ := endFacts(w, lo, f); !agree {
+		return nil
+	}
+	return row
+}
+
 // endRejects is which stop-6 conditions an inbox-parent end row's frame fails.
 type endRejects struct {
 	preConnect, noThreads, untimed, newer, moreInFrame, position bool

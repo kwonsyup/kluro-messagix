@@ -137,7 +137,7 @@ func TestKD222LastPageFloorEndCompletesTheWalk(t *testing.T) {
 			tpage(94, 4700, moreRow(-1, 90, 4600)),
 			emptyReply,
 		},
-		later: [][]laterFrame{nil, nil, {late(20 * time.Millisecond, end)}},
+		later: [][]laterFrame{nil, nil, {late(20*time.Millisecond, end)}},
 	}
 	res, _ := runFramed(t, p)
 	checkWalk(t, p, res, walkWant{stop: 0, pages: 3, refs: [][2]int64{{95, 4800}, {90, 4600}}})
@@ -147,4 +147,70 @@ func TestKD222LastPageFloorEndCompletesTheWalk(t *testing.T) {
 			t.Fatalf("thread %v of the end row's frame is not listed: %v", th, listed)
 		}
 	}
+}
+
+// The acceptance fires only when the wait runs out on the walk's last page: an end
+// row the floor alone rejected on an earlier page changes nothing — a more row
+// that answers the page still continues the walk past it.
+func TestKD222FloorEndOnAnEarlierPageDoesNotComplete(t *testing.T) {
+	withRangeWait(t, 300*time.Millisecond)
+	end := withV2(threadsFrame([][2]int64{{120, 7000}, {119, 6900}}, rangeOnly(endRow(-1, 100, 5000))), -1, 100, 5000)
+	answer := threadsFrame([][2]int64{{120, 7000}, {90, 5000}}, rangeOnly(moreRow(-1, 90, 5000)))
+	p := &framedInbox{s: connected(t),
+		replies: []*table.LSTable{emptyReply, tpage(80, 4000, endRow(-1, 80, 4000))},
+		later:   [][]laterFrame{{late(20*time.Millisecond, end), late(150*time.Millisecond, answer)}},
+	}
+	res, _ := runFramed(t, p)
+	checkWalk(t, p, res, walkWant{stop: 0, pages: 2, refs: [][2]int64{{90, 5000}}})
+}
+
+// The floor alone rejects: without an inbox-parent V2 row agreeing with the end
+// row's minimum — none, or one at another minimum — the end still cannot be taken
+// and the walk stays incomplete.
+func TestKD222FloorEndWithoutV2AgreementStaysIncomplete(t *testing.T) {
+	withRangeWait(t, 200*time.Millisecond)
+	threads := [][2]int64{{89, 4500}, {88, 4400}}
+	for name, frame := range map[string]*table.LSTable{
+		"no V2 row":                   threadsFrame(threads, rangeOnly(endRow(-1, 85, 4300))),
+		"a V2 row at another minimum": withV2(threadsFrame(threads, rangeOnly(endRow(-1, 85, 4300))), -1, 84, 4300),
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := &framedInbox{s: connected(t),
+				replies: []*table.LSTable{tpage(101, 5000, moreRow(-1, 90, 4600)), emptyReply},
+				later:   [][]laterFrame{nil, {late(20*time.Millisecond, frame)}},
+			}
+			res, _ := runFramed(t, p)
+			checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 2, refs: [][2]int64{{90, 4600}}})
+			wantLate(t, res.Stats, map[string]int{"inbox_end_rej_pos_floor": 1, "inbox_end_rej_v2_agree": 0})
+		})
+	}
+}
+
+// A position failure other than the floor is not rescued by V2 agreement: an end
+// row at the page's reference (the ceiling) with an agreeing V2 row is still no
+// end for the page.
+func TestKD222CeilingEndWithV2AgreementStaysIncomplete(t *testing.T) {
+	withRangeWait(t, 200*time.Millisecond)
+	frame := withV2(threadsFrame([][2]int64{{90, 4600}}, rangeOnly(endRow(-1, 90, 4600))), -1, 90, 4600)
+	p := &framedInbox{s: connected(t),
+		replies: []*table.LSTable{tpage(101, 5000, moreRow(-1, 90, 4600)), emptyReply},
+		later:   [][]laterFrame{nil, {late(20*time.Millisecond, frame)}},
+	}
+	res, _ := runFramed(t, p)
+	checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 2, refs: [][2]int64{{90, 4600}}})
+	wantLate(t, res.Stats, map[string]int{"inbox_end_rej_pos_ceiling": 1, "inbox_end_rej_v2_agree": 1})
+}
+
+// An end row with no floor to be judged against — a frame without thread rows — is
+// never taken, V2 agreement or not.
+func TestKD222EndWithoutFloorStaysIncomplete(t *testing.T) {
+	withRangeWait(t, 200*time.Millisecond)
+	frame := withV2(rangeOnly(endRow(-1, 85, 4300)), -1, 85, 4300)
+	p := &framedInbox{s: connected(t),
+		replies: []*table.LSTable{emptyReply},
+		later:   [][]laterFrame{{late(20*time.Millisecond, frame)}},
+	}
+	res, _ := runFramed(t, p)
+	checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 1})
+	wantLate(t, res.Stats, map[string]int{"inbox_end_rej_pos_nofloor": 1, "inbox_end_rej_nothreads": 1})
 }

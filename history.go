@@ -583,10 +583,12 @@ var inboxTop = socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, Referenc
 // it never ends it. When the reply carries no thread rows at all, the page's oldest
 // thread is unknown; a late row may then be checked against the oldest thread of the
 // frame that carried it, and only on a watch opened after the socket's first sync (see
-// pagePosition.frameFloor). Only a reply can complete the walk: a page whose end comes only on
-// a later frame stops incomplete: 6 when that end row is one for the page (see
-// pagePosition.endForPage; it changes neither the wait nor whether the walk goes on, only
-// the stop code), else 2 as before. Every end row is counted. The late
+// pagePosition.frameFloor). A page whose end comes only on a later frame stops
+// incomplete — 6 when that end row is one for the page (see pagePosition.endForPage;
+// it changes neither the wait nor whether the walk goes on, only the stop code), else
+// 2 as before — unless the row fails only the floor with an agreeing V2 row beside
+// it, which completes the walk when the last page's wait runs out (see
+// pagePosition.endAtFloor). Every end row is counted. The late
 // wait covers live frames only: a second data frame on the request's one-off stream is
 // dropped by the library and only counted (oneoff_extra_frames). The watch opens before
 // the request is sent and counts every range row that arrives while it is open,
@@ -1583,6 +1585,18 @@ func (s *messagixSession) offerLocked(w *rangeWatch, tbl *table.LSTable) {
 // counted in inbox_end6_contradicted, so stop 6 can be split into ends that stood alone
 // and ends that were contradicted. The decisions read no diagnostic counter. Only a
 // cancel is an error.
+//
+// One late end row can complete the walk: an inbox-parent end row that fails only
+// the floor, with an inbox-parent V2 row of its frame agreeing with its minimum
+// (see pagePosition.endAtFloor). The floor keeps a more row's minimum — the next
+// request's reference — from skipping a thread the page held; an end row starts no
+// request, so when the wait runs out on the walk's last page the rejection only
+// ever marks a genuine end whose range bottom sits below the frame's last thread
+// row, and the agreeing V2 row is the server's own second account of that bottom.
+// Such a row is taken as the page's end: the range it returns has no more, exactly
+// what a reply's end row decides, so the walk stops complete. It never shortens
+// the wait either, a more row that answers the page still wins, and a fully
+// confirmed end row keeps stop 6.
 func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, pos pagePosition, budget time.Duration, counts *inboxRowCounts) (rng *walkRange, endSeen bool, waited time.Duration, err error) {
 	start := time.Now()
 	timer := time.NewTimer(budget)
@@ -1591,6 +1605,7 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 	var end *lateFrame // the first end row for the page; it only picks the stop code
 	contradicted := 0  // frames after it with more rows that did not answer the page (counted only)
 	var endRow *table.LSUpsertSyncGroupThreadsRange
+	var floorEnd *lateFrame // an end row the floor alone rejected, its V2 row agreeing: it can end the walk complete
 	for {
 		s.mu.Lock()
 		got := w.frames
@@ -1620,6 +1635,9 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 				row := pos.endForPage(got[i])
 				if row == nil {
 					counts.end6.reject(w, pos, got[i])
+					if floorEnd == nil && pos.endAtFloor(w, got[i]) != nil {
+						floorEnd = &got[i]
+					}
 				} else if end == nil {
 					end, endRow = &got[i], row
 				}
@@ -1631,17 +1649,20 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 		select {
 		case <-w.ready:
 		case <-timer.C:
-			if end == nil {
+			if end == nil && floorEnd == nil {
 				return nil, false, time.Since(start), nil
 			}
 			s.mu.Lock()
 			moved = s.connEpoch != w.epoch
-			if !moved {
+			if !moved && end != nil {
 				counts.end6.count(s, w, pos, *end, endRow)
 				counts.end6.contradicted += contradicted
 			}
 			s.mu.Unlock()
-			return nil, !moved, time.Since(start), nil
+			if moved || end != nil {
+				return nil, !moved, time.Since(start), nil
+			}
+			return &walkRange{more: false}, false, time.Since(start), nil
 		case <-ctx.Done():
 			return nil, false, time.Since(start), ctx.Err()
 		}
