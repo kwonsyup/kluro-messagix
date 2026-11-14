@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 )
 
@@ -209,20 +210,26 @@ func TestKD222StaleFloorEndOnlyEarnsAContinuation(t *testing.T) {
 
 // Only one continuation: the continuation page can itself carry a floor-end
 // candidate, but it is refused — the walk stops 2 and sends no fourth request.
+// The second candidate is tagged to the continuation's own request so it is a
+// frame the wait may decide on at all; the no-recursion guard is what refuses
+// it, nothing else.
 func TestKD222FloorEndContinuationDoesNotRecurse(t *testing.T) {
 	withRangeWait(t, 300*time.Millisecond)
 	end1 := withV2(threadsFrame([][2]int64{{89, 4500}, {88, 4400}}, rangeOnly(endRow(-1, 85, 4300))), -1, 85, 4300)
 	// The second frame continues the continuation's own frontier (it carries
 	// thread 87 the reply delivered), so only the no-recursion guard refuses it.
 	end2 := withV2(threadsFrame([][2]int64{{87, 4350}, {86, 4300}}, rangeOnly(endRow(-1, 84, 4200))), -1, 84, 4200)
-	p := &framedInbox{s: connected(t),
+	ids := []messagix.RequestIDs{{PacketID: 11}, {PacketID: 12}, {PacketID: 13}}
+	p := &framedInbox{s: connected(t), ids: ids,
 		replies: []*table.LSTable{tpage(101, 5000, moreRow(-1, 90, 4600)), emptyReply, tpage(87, 4350)},
-		later:   [][]laterFrame{nil, {late(20 * time.Millisecond, end1)}, {late(20 * time.Millisecond, end2)}},
+		later: [][]laterFrame{nil,
+			{late(20 * time.Millisecond, end1)},
+			{late(20 * time.Millisecond, tagged{id: ids[2].PacketID, ev: end2})}},
 	}
 	res, _ := runFramed(t, p)
 	checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 3, refs: [][2]int64{{90, 4600}, {88, 4400}}})
 	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 0, "inbox_end_floor_refused": 1,
-		"inbox_floor_continuation_timeout": 1, "inbox_floor_continuation_unbound_only": 1})
+		"inbox_floor_continuation_timeout": 1, "inbox_floor_continuation_unbound_only": 0})
 }
 
 // The continuation can deliver more of the inbox: its bound reply carries the
@@ -243,6 +250,54 @@ func TestKD222FloorEndContinuationDeliveringRows(t *testing.T) {
 	res, _ := runFramed(t, p)
 	checkWalk(t, p, res, walkWant{stop: 0, pages: 4, refs: [][2]int64{{90, 4600}, {88, 4400}, {80, 4100}}})
 	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 1, "inbox_floor_continuation_bound_rows": 1})
+}
+
+// The continuation's own reply carried rows but no range, and an untagged stale
+// frame offers a more row that answers the page positionally. A frame can only
+// decide the continuation's page when it is tagged to the continuation's own
+// request — the untagged frame is ingested but ignored, the wait times out on
+// unbound frames only, and the walk stops 2 instead of walking on from a stale
+// cursor.
+func TestKD222ContinuationNeedsABoundFrame(t *testing.T) {
+	withRangeWait(t, 300*time.Millisecond)
+	end := withV2(threadsFrame([][2]int64{{89, 4500}, {88, 4400}}, rangeOnly(endRow(-1, 85, 4300))), -1, 85, 4300)
+	stale := threadsFrame([][2]int64{{86, 4380}}, rangeOnly(moreRow(-1, 86, 4380)))
+	p := &framedInbox{s: connected(t),
+		replies: []*table.LSTable{
+			tpage(101, 5000, moreRow(-1, 90, 4600)),
+			emptyReply,
+			tpage(87, 4350), // the continuation reply: rows, no range
+			tpage(79, 4000, endRow(-1, 75, 3900)),
+		},
+		later: [][]laterFrame{nil, {late(20 * time.Millisecond, end)}, {late(20 * time.Millisecond, stale)}},
+	}
+	res, _ := runFramed(t, p)
+	checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 3, refs: [][2]int64{{90, 4600}, {88, 4400}}})
+	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 0,
+		"inbox_floor_continuation_bound_rows": 0, "inbox_floor_continuation_timeout": 1, "inbox_floor_continuation_unbound_only": 1})
+}
+
+// The continuation is one per walk, not one per page: after a bound candidate
+// has earned it and the walk has moved on, a second bound floor-end candidate
+// on a later page is refused outright — the walk stops 2 truthfully.
+func TestKD222FloorEndContinuationOnlyOnce(t *testing.T) {
+	withRangeWait(t, 300*time.Millisecond)
+	end1 := withV2(threadsFrame([][2]int64{{89, 4500}, {88, 4400}}, rangeOnly(endRow(-1, 85, 4300))), -1, 85, 4300)
+	end2 := withV2(threadsFrame([][2]int64{{79, 4050}, {78, 4020}}, rangeOnly(endRow(-1, 75, 3950))), -1, 75, 3950)
+	p := &framedInbox{s: connected(t),
+		replies: []*table.LSTable{
+			tpage(101, 5000, moreRow(-1, 90, 4600)),
+			emptyReply,
+			tpage(87, 4350, moreRow(-1, 80, 4100)), // the continuation delivers rows and a more row
+			emptyReply,                             // a later page with a second floor-end candidate
+			emptyReply,
+		},
+		later: [][]laterFrame{nil, {late(20 * time.Millisecond, end1)}, nil, {late(20 * time.Millisecond, end2)}},
+	}
+	res, _ := runFramed(t, p)
+	checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 4, refs: [][2]int64{{90, 4600}, {88, 4400}, {80, 4100}}})
+	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 0,
+		"inbox_floor_continuation_bound_rows": 1, "inbox_end_floor_refused": 1})
 }
 
 // A floor-end candidate on an earlier page changes nothing on its own — a more
