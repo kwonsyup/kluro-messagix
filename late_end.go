@@ -172,28 +172,48 @@ func (p pagePosition) endForPage(f lateFrame) *table.LSUpsertSyncGroupThreadsRan
 	return row
 }
 
-// endAtFloor returns the frame's group-1 inbox-parent end row when the floor is the
-// one condition it fails and an inbox-parent V2 row of the frame agrees with its
-// minimum, or nil. The floor exists so a more row's minimum — the next request's
-// reference — cannot skip a thread this page held (see judge); an end row starts no
-// request, so on the walk's last page the check only rejects a genuine end: the
-// range's bottom can sit below the last thread row the frame carries, and the
-// agreeing V2 row is the server's own second account of that bottom. When the
-// page's wait runs out with such a row and nothing more, awaitInboxRange ends the
-// walk as complete; every other failure keeps its stop.
-func (p pagePosition) endAtFloor(w *rangeWatch, f lateFrame) *table.LSUpsertSyncGroupThreadsRange {
+// endAtFloor reports whether the frame carries a floor-end candidate: a group-1
+// inbox-parent end row the floor alone rejects, with an inbox-parent V2 row of
+// the frame agreeing with its minimum (cand). It returns the row only when the
+// candidate is also bound to this page at arrival. The floor exists so a more
+// row's minimum — the next request's reference — cannot skip a thread this page
+// held (see judge); an end row starts no request, so on the walk's last page the
+// check only rejects a genuine end: the range's bottom can sit below the last
+// thread row the frame carries, and the agreeing V2 row is the server's own
+// second account of that bottom.
+//
+// Two arrival bindings tie the candidate to this page before it is remembered,
+// since the frame's request id is not always usable (the observed field shape
+// carries none): a stated request id that is another request's refuses outright
+// — a frame can only be bound to the page it answers — and the page's reference
+// must be a real walked frontier, not the top sentinel every fresh walk starts
+// with; a first-page end row could be any older range state replayed on the live
+// path. The bindings checked when the wait runs out — one epoch for the whole
+// walk, no resync and no further cursor while the watch was open, and no known
+// thread between the frame's newest and the reference — are in awaitInboxRange.
+// Only then does the end row's own "no more before" (corroborated by V2) decide
+// the range ended, and the walk stops complete; every other failure keeps its
+// stop.
+func (p pagePosition) endAtFloor(w *rangeWatch, f lateFrame) (row *table.LSUpsertSyncGroupThreadsRange, cand bool) {
 	row, why := p.endCheck(f)
 	if row == nil || why != (endRejects{position: true}) {
-		return nil
+		return nil, false
 	}
 	lo := cursorPos{ts: row.MinLastActivityTimestampMS, key: row.MinThreadKey}
 	if p.judge(lo, f) != rejFloor {
-		return nil
+		return nil, false
 	}
 	if _, agree, _ := endFacts(w, lo, f); !agree {
-		return nil
+		return nil, false
 	}
-	return row
+	cand = true
+	if f.tag.ok && w.ids.PacketID != 0 && f.tag.id != 0 && f.tag.id != w.ids.PacketID {
+		return nil, true // the frame names another request: it cannot answer this page
+	}
+	if p.ref == topRef {
+		return nil, true // the walk has not descended: there is no frontier to continue
+	}
+	return row, true
 }
 
 // endRejects is which stop-6 conditions an inbox-parent end row's frame fails.
@@ -257,6 +277,7 @@ type end6Counts struct {
 	rejMinEqRef, rejMinUntimed, rejThreadsBelowRef               int
 	rejV2Agree, rejCursorSent, rejLastPage                       int
 	contradicted                                                 int // frames after a stop-6 end row whose more rows did not answer the page
+	floorAccepted, floorRefused                                  int // floor-end candidates the walk completed on, or declined to (see endAtFloor)
 }
 
 // reject counts the stop-6 conditions that frame f's inbox-parent end row fails, if it
@@ -406,6 +427,8 @@ func (c *end6Counts) addStats(stats map[string]int) {
 	stats["inbox_end_rej_v2_agree"] = c.rejV2Agree
 	stats["inbox_end_rej_cursor_sent"] = c.rejCursorSent
 	stats["inbox_end_rej_last_page"] = c.rejLastPage
+	stats["inbox_end_floor_accepted"] = c.floorAccepted
+	stats["inbox_end_floor_refused"] = c.floorRefused
 }
 
 // tieProbe counts, over a walk's pages, the live tables seen while a page's watch was
