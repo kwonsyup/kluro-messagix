@@ -120,28 +120,33 @@ func TestKD222LastPageCountsOnlyTheLastWatch(t *testing.T) {
 // The live shape the split counters reported: on the walk's last page the reply is
 // empty and a late frame carries the page's threads, an inbox-parent end row whose
 // minimum is below the frame's oldest thread (the floor is the frame's own), and an
-// inbox-parent V2 row agreeing with the end row's minimum. The floor exists so a
-// more row's minimum — the next request's reference — cannot skip a thread the page
-// held; an end row starts no request, so when the last page's wait runs out it is
-// the inbox's own answer that there is nothing more, and the walk ends complete.
-// Every thread the end row's frame carried is listed, including the one below the
-// page's reference.
+// inbox-parent V2 row agreeing with the end row's minimum. The frame is a
+// candidate, not an answer: the walk asks the server once more, from the page's
+// oldest delivered thread — the frame's own — with its own request and cursor.
+// An empty bound reply (no threads below the reference) is the server's own
+// answer that the range ended, and the walk ends complete. Every thread the end
+// row's frame carried is listed, including the one below the page's reference.
 func TestKD222LastPageFloorEndCompletesTheWalk(t *testing.T) {
 	withRangeWait(t, 200*time.Millisecond)
 	s := connected(t)
 	var emitted []Frame
 	s.emit = func(f Frame) int64 { emitted = append(emitted, f); return 0 }
 	end := withV2(threadsFrame([][2]int64{{89, 4500}, {88, 4400}}, rangeOnly(endRow(-1, 85, 4300))), -1, 85, 4300)
-	p := &framedInbox{s: s,
+	p := &framedInbox{s: s, cursor: "c-1",
 		replies: []*table.LSTable{
 			tpage(101, 5000, moreRow(-1, 95, 4800)),
 			tpage(94, 4700, moreRow(-1, 90, 4600)),
 			emptyReply,
+			emptyReply, // the continuation: nothing below the frame's oldest thread
 		},
 		later: [][]laterFrame{nil, nil, {late(20*time.Millisecond, end)}},
 	}
 	res, _ := runFramed(t, p)
-	checkWalk(t, p, res, walkWant{stop: 0, pages: 3, refs: [][2]int64{{95, 4800}, {90, 4600}}})
+	checkWalk(t, p, res, walkWant{stop: 0, pages: 4, refs: [][2]int64{{95, 4800}, {90, 4600}, {88, 4400}}})
+	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 1, "inbox_end_floor_refused": 0})
+	if task := p.tasks[3]; task.Cursor != "c-1" {
+		t.Fatalf("the continuation request's cursor = %q, want the walk's own %q", task.Cursor, "c-1")
+	}
 	listed := threadsByID(emitted)
 	for _, th := range [][2]int64{{89, 4500}, {88, 4400}} {
 		if f := listed[strconv.FormatInt(th[0], 10)]; f == nil || f.LastActivity != th[1] {
@@ -150,9 +155,67 @@ func TestKD222LastPageFloorEndCompletesTheWalk(t *testing.T) {
 	}
 }
 
-// The acceptance fires only when the wait runs out on the walk's last page: an end
-// row the floor alone rejected on an earlier page changes nothing — a more row
-// that answers the page still continues the walk past it.
+// The same continuation ends complete when its bound reply delivers what the end
+// row's minimum had skipped — thread 87 below the frame's oldest thread — and a
+// genuine end row beside it.
+func TestKD222FloorEndContinuationReplyEndCompletesTheWalk(t *testing.T) {
+	withRangeWait(t, 200*time.Millisecond)
+	s := connected(t)
+	var emitted []Frame
+	s.emit = func(f Frame) int64 { emitted = append(emitted, f); return 0 }
+	end := withV2(threadsFrame([][2]int64{{89, 4500}, {88, 4400}}, rangeOnly(endRow(-1, 85, 4300))), -1, 85, 4300)
+	p := &framedInbox{s: s,
+		replies: []*table.LSTable{
+			tpage(101, 5000, moreRow(-1, 90, 4600)),
+			emptyReply,
+			tpage(87, 4350, endRow(-1, 85, 4300)),
+		},
+		later: [][]laterFrame{nil, {late(20 * time.Millisecond, end)}},
+	}
+	res, _ := runFramed(t, p)
+	checkWalk(t, p, res, walkWant{stop: 0, pages: 3, refs: [][2]int64{{90, 4600}, {88, 4400}}})
+	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 1})
+	listed := threadsByID(emitted)
+	for _, th := range [][2]int64{{89, 4500}, {88, 4400}, {87, 4350}} {
+		if f := listed[strconv.FormatInt(th[0], 10)]; f == nil || f.LastActivity != th[1] {
+			t.Fatalf("thread %v is not listed: %v", th, listed)
+		}
+	}
+}
+
+// An untagged stale or replayed floor-end frame can satisfy every positional
+// binding; it still cannot complete the walk — it only earns one bound
+// continuation request. When that request answers with a thread the stale end
+// row had skipped but no deciding range, the walk stops 2, truthfully.
+func TestKD222StaleFloorEndOnlyEarnsAContinuation(t *testing.T) {
+	withRangeWait(t, 300*time.Millisecond)
+	end := withV2(threadsFrame([][2]int64{{89, 4500}, {88, 4400}}, rangeOnly(endRow(-1, 85, 4300))), -1, 85, 4300)
+	p := &framedInbox{s: connected(t),
+		replies: []*table.LSTable{tpage(101, 5000, moreRow(-1, 90, 4600)), emptyReply, tpage(87, 4350)},
+		later:   [][]laterFrame{nil, {late(20 * time.Millisecond, end)}},
+	}
+	res, _ := runFramed(t, p)
+	checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 3, refs: [][2]int64{{90, 4600}, {88, 4400}}})
+	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 0})
+}
+
+// Only one continuation: the continuation page can itself carry a floor-end
+// candidate, but it is refused — the walk stops 2 and sends no fourth request.
+func TestKD222FloorEndContinuationDoesNotRecurse(t *testing.T) {
+	withRangeWait(t, 300*time.Millisecond)
+	end1 := withV2(threadsFrame([][2]int64{{89, 4500}, {88, 4400}}, rangeOnly(endRow(-1, 85, 4300))), -1, 85, 4300)
+	end2 := withV2(threadsFrame([][2]int64{{86, 4300}}, rangeOnly(endRow(-1, 84, 4200))), -1, 84, 4200)
+	p := &framedInbox{s: connected(t),
+		replies: []*table.LSTable{tpage(101, 5000, moreRow(-1, 90, 4600)), emptyReply, tpage(87, 4350)},
+		later:   [][]laterFrame{nil, {late(20 * time.Millisecond, end1)}, {late(20 * time.Millisecond, end2)}},
+	}
+	res, _ := runFramed(t, p)
+	checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 3, refs: [][2]int64{{90, 4600}, {88, 4400}}})
+	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 1, "inbox_floor_continuation_completed": 0, "inbox_end_floor_refused": 1})
+}
+
+// A floor-end candidate on an earlier page changes nothing on its own — a more
+// row that answers the page still continues the walk past it.
 func TestKD222FloorEndOnAnEarlierPageDoesNotComplete(t *testing.T) {
 	withRangeWait(t, 300*time.Millisecond)
 	end := withV2(threadsFrame([][2]int64{{120, 7000}, {119, 6900}}, rangeOnly(endRow(-1, 100, 5000))), -1, 100, 5000)
@@ -244,7 +307,7 @@ func TestKD222FloorEndOnAnUnboundPageStaysIncomplete(t *testing.T) {
 			p := &framedInbox{s: s, replies: tc.replies, later: tc.later}
 			res, _ := runFramed(t, p)
 			checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: tc.pages, refs: tc.refs})
-			wantLate(t, res.Stats, map[string]int{"inbox_end_floor_accepted": 0, "inbox_end_floor_refused": 1})
+			wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 0, "inbox_end_floor_refused": 1})
 		})
 	}
 }
@@ -260,7 +323,7 @@ func TestKD222FloorEndTaggedToAnotherRequestStaysIncomplete(t *testing.T) {
 	}
 	res, _ := runFramed(t, p)
 	checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 2, refs: [][2]int64{{90, 4600}}})
-	wantLate(t, res.Stats, map[string]int{"inbox_end_floor_accepted": 0, "inbox_end_floor_refused": 1, "inbox_tie_req_prev": 1})
+	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 0, "inbox_end_floor_refused": 1, "inbox_tie_req_prev": 1})
 }
 
 // The bindings that are checked at the wait's end: the whole walk must run in one
@@ -281,7 +344,7 @@ func TestKD222FloorEndNeedsAWholeWalkEpoch(t *testing.T) {
 		t.Fatalf("done=%v err=%v", done, err)
 	}
 	checkWalk(t, inner, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 2, refs: f0Refs[:1]})
-	wantLate(t, res.Stats, map[string]int{"inbox_end_floor_accepted": 0, "inbox_end_floor_refused": 1})
+	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 0, "inbox_end_floor_refused": 1})
 }
 
 func TestKD222FloorEndAfterResyncStaysIncomplete(t *testing.T) {
@@ -294,7 +357,7 @@ func TestKD222FloorEndAfterResyncStaysIncomplete(t *testing.T) {
 	}
 	res, _ := runFramed(t, p)
 	checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 2, refs: [][2]int64{{90, 4600}}})
-	wantLate(t, res.Stats, map[string]int{"inbox_end_floor_accepted": 0, "inbox_end_floor_refused": 1, "inbox_watch_resync": 1})
+	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 0, "inbox_end_floor_refused": 1, "inbox_watch_resync": 1})
 }
 
 func TestKD222FloorEndWithALaterCursorStaysIncomplete(t *testing.T) {
@@ -307,13 +370,14 @@ func TestKD222FloorEndWithALaterCursorStaysIncomplete(t *testing.T) {
 	}
 	res, _ := runFramed(t, p)
 	checkWalk(t, p, res, walkWant{gap: gapInboxIncomplete, stop: 2, pages: 2, refs: [][2]int64{{90, 4600}}})
-	wantLate(t, res.Stats, map[string]int{"inbox_end_floor_accepted": 0, "inbox_end_floor_refused": 1})
+	wantLate(t, res.Stats, map[string]int{"inbox_floor_continuation_sent": 0, "inbox_end_floor_refused": 1})
 }
 
-// The roster refresh shares walkInbox: a bound end row ends its walk as complete
-// — its stop code only feeds the refresh log line, and the folder fallback is
-// decided by its own target check, not the stop — while an end row the walk
-// cannot bind (the first page's) stays incomplete.
+// The roster refresh shares walkInbox: a bound end row earns it the same
+// continuation, whose empty bound reply ends the walk complete — its stop code
+// only feeds the refresh log line, and the folder fallback is decided by its own
+// target check, not the stop — while an end row the walk cannot bind (the first
+// page's) stays incomplete.
 func TestKD222FloorEndAndTheRosterRefresh(t *testing.T) {
 	target := func(s *messagixSession) {
 		s.threads["7"] = &threadInfo{Key: 7, Typed: true, Kind: "group", MemberCount: 2, LastActivity: 8000}
@@ -325,7 +389,7 @@ func TestKD222FloorEndAndTheRosterRefresh(t *testing.T) {
 		code    string
 	}{
 		// The page count includes the one request-scope page scanScopes always adds.
-		"a bound end completes the refresh walk": {[]*table.LSTable{tpage(101, 5000, moreRow(-1, 90, 4600)), emptyReply}, [][]laterFrame{nil, {late(20 * time.Millisecond, bound)}}, "roster_refresh.p3.s0.m1"},
+		"a bound end completes the refresh walk": {[]*table.LSTable{tpage(101, 5000, moreRow(-1, 90, 4600)), emptyReply, emptyReply}, [][]laterFrame{nil, {late(20 * time.Millisecond, bound)}}, "roster_refresh.p4.s0.m1"},
 		"the first page's end stays incomplete":  {[]*table.LSTable{emptyReply, tpage(80, 4000, endRow(-1, 80, 4000))}, [][]laterFrame{{late(20 * time.Millisecond, bound)}}, "roster_refresh.p2.s2.m1"},
 	} {
 		t.Run(name, func(t *testing.T) {
