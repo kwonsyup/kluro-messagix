@@ -435,13 +435,13 @@ func TestOneWaitBudgetPerWalk(t *testing.T) {
 		var counts inboxRowCounts
 		w := s.openWatch("", &counts)
 		s.handleMetaEvent(context.Background(), rangeOnly(rangeRow(true, -1, 90, 5000)))
-		rng, _, waited, err := s.awaitInboxRange(context.Background(), w, topPos, 0, &counts)
+		rng, _, waited, err := s.awaitInboxRange(context.Background(), w, topPos, 0, &counts, false, false)
 		s.closeWatch(w, &counts)
 		if err != nil || rng == nil || !rng.more || rng.minKey != 90 || rng.minTS != 5000 || waited > 50*time.Millisecond {
 			t.Fatalf("rng=%+v waited=%v err=%v", rng, waited, err)
 		}
 		w = s.openWatch("", &counts)
-		rng, _, _, err = s.awaitInboxRange(context.Background(), w, topPos, 0, &counts)
+		rng, _, _, err = s.awaitInboxRange(context.Background(), w, topPos, 0, &counts, false, false)
 		s.closeWatch(w, &counts)
 		if err != nil || rng != nil {
 			t.Fatalf("with nothing arrived and no budget: rng=%+v err=%v", rng, err)

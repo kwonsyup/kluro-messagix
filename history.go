@@ -565,6 +565,11 @@ func (s *messagixSession) pageThreads(ctx context.Context, cli threadPager, emit
 // inboxTop is the first page request of a walk: the newest threads of the main inbox.
 var inboxTop = socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, ReferenceThreadKey: 0, ReferenceActivityTimestamp: 9999999999999}
 
+// topRef is the reference the first request of a fresh walk is sent with. A page
+// requested with it has no walked frontier — no position the walk itself has
+// confirmed that a late frame could continue (see pagePosition.endAtFloor).
+var topRef = cursorPos{ts: inboxTop.ReferenceActivityTimestamp, key: inboxTop.ReferenceThreadKey}
+
 // walkInbox pages group 1 from ref for at most limit requests and returns the next
 // request position (what a page-bound stop, code 4, would resume at). It owns no
 // shared walk state: pageThreads keeps inboxResume, and the roster refresh passes its
@@ -583,10 +588,15 @@ var inboxTop = socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, Referenc
 // it never ends it. When the reply carries no thread rows at all, the page's oldest
 // thread is unknown; a late row may then be checked against the oldest thread of the
 // frame that carried it, and only on a watch opened after the socket's first sync (see
-// pagePosition.frameFloor). Only a reply can complete the walk: a page whose end comes only on
-// a later frame stops incomplete: 6 when that end row is one for the page (see
-// pagePosition.endForPage; it changes neither the wait nor whether the walk goes on, only
-// the stop code), else 2 as before. Every end row is counted. The late
+// pagePosition.frameFloor). A page whose end comes only on a later frame stops
+// incomplete — 6 when that end row is one for the page (see pagePosition.endForPage;
+// it changes neither the wait nor whether the walk goes on, only the stop code), else
+// 2 as before — unless the row fails only the floor with an agreeing V2 row beside
+// it and the frame is bound to the page (see pagePosition.endAtFloor): that
+// candidate earns the walk's one continuation request below the page's oldest
+// delivered thread, an ordinary request whose own bound reply decides — an empty
+// reply or a reply end row completes the walk; anything else is the page's usual
+// outcome. Every end row is counted. The late
 // wait covers live frames only: a second data frame on the request's one-off stream is
 // dropped by the library and only counted (oneoff_extra_frames). The watch opens before
 // the request is sent and counts every range row that arrives while it is open,
@@ -596,7 +606,11 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 	budget := inboxRangeWait
 	var watch *rangeWatch
 	defer func() { s.closeWatch(watch, rows) }()
+	continued := false // a floor-end continuation was sent (one per walk)
+	contNext := false  // the next request is it
 	for batch := 0; batch < limit; batch++ {
+		isCont := contNext
+		contNext = false
 		if err := ctx.Err(); err != nil {
 			return "", 0, pages, ref, err
 		}
@@ -625,6 +639,20 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 		rows.replyThreads += replyThreads
 		rng := replyRange(tbl, rows)
 		endSeen := false
+		if isCont {
+			// How the continuation resolved, counted once for the field log.
+			switch {
+			case rng != nil && !rng.more:
+				rows.floorContBoundEnd++ // the reply's own end row
+			case rng != nil:
+				rows.floorContBoundRows++ // the reply's rows continue the walk
+			case replyThreads == 0:
+				// The bound reply carried nothing below the reference: the
+				// floor-refused end row was the range's true bottom.
+				rows.floorContBoundEmpty++
+				rng = &walkRange{more: false}
+			}
+		}
 		if rng == nil {
 			pos := pagePosition{ref: cursorPos{ts: ref.ReferenceActivityTimestamp, key: ref.ReferenceThreadKey}, postConnect: watch.postConnect}
 			pos.floor, pos.floorOK = pageFloor(tbl)
@@ -632,7 +660,7 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 			// watch opened after the socket's first sync (see rangeWatch.postConnect).
 			pos.frameFloor = replyThreads == 0 && watch.postConnect
 			var waited time.Duration
-			rng, endSeen, waited, err = s.awaitInboxRange(ctx, watch, pos, max(budget, 0), rows)
+			rng, endSeen, waited, err = s.awaitInboxRange(ctx, watch, pos, max(budget, 0), rows, isCont, continued)
 			budget -= waited
 			rows.waitMS += int(waited.Milliseconds())
 			if err != nil {
@@ -640,6 +668,9 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 			}
 			if rng != nil {
 				rows.latePages++
+				if isCont && rng.more && !rng.cont {
+					rows.floorContBoundRows++ // a bound late more row continued it
+				}
 			}
 		}
 		s.closeWatch(watch, rows)
@@ -651,11 +682,20 @@ func (s *messagixSession) walkInbox(ctx context.Context, cli threadPager, emit e
 			return gapInboxIncomplete, 2, pages, ref, nil
 		}
 		if !rng.more {
+			if continued {
+				rows.floorContCompleted++
+			}
 			return "", 0, pages, ref, nil
 		}
 		next := socket.FetchThreadsTask{ParentThreadKey: inboxParentKey, ReferenceThreadKey: rng.minKey, ReferenceActivityTimestamp: rng.minTS}
 		if next.ParentThreadKey == ref.ParentThreadKey && next.ReferenceThreadKey == ref.ReferenceThreadKey && next.ReferenceActivityTimestamp == ref.ReferenceActivityTimestamp {
 			return gapInboxIncomplete, 3, pages, ref, nil
+		}
+		if rng.cont {
+			// The one extra request: the walk's own, so the reply is bound to it.
+			continued, contNext = true, true
+			budget = inboxRangeWait // it waits for a late range like any page's
+			rows.floorContSent++
 		}
 		ref = next
 		select {
@@ -983,6 +1023,14 @@ type inboxRowCounts struct {
 	tie tieProbe
 	// The end rows that stopped a page with 6, and what was counted beside them (see end6Counts).
 	end6 end6Counts
+	// The one floor-end continuation request this walk sent, and whether the walk
+	// ended complete after it (see awaitInboxRange). The remaining five split how
+	// the continuation resolved: its bound reply was empty or carried an end row
+	// or rows that continue the walk; or its wait expired with no bound answer,
+	// with only unbound frames seen (unboundOnly) or not.
+	floorContSent, floorContCompleted                          int
+	floorContBoundEmpty, floorContBoundEnd, floorContBoundRows int
+	floorContUnboundOnly, floorContTimeout                     int
 	// Table names present in the later frames that carried a range row.
 	lateNames map[string]bool
 	// The connection epoch of the walk's first watch, and whether one was opened.
@@ -1126,6 +1174,13 @@ func (c *inboxRowCounts) addStats(stats map[string]int) {
 	stats["inbox_late_db1_blocks"] = c.late.db1Blocks
 	stats["inbox_late_cursor_sent"] = c.late.cursorSent
 	stats["inbox_watch_resync"] = c.late.resync
+	stats["inbox_floor_continuation_sent"] = c.floorContSent
+	stats["inbox_floor_continuation_completed"] = c.floorContCompleted
+	stats["inbox_floor_continuation_bound_empty"] = c.floorContBoundEmpty
+	stats["inbox_floor_continuation_bound_end"] = c.floorContBoundEnd
+	stats["inbox_floor_continuation_bound_rows"] = c.floorContBoundRows
+	stats["inbox_floor_continuation_unbound_only"] = c.floorContUnboundOnly
+	stats["inbox_floor_continuation_timeout"] = c.floorContTimeout
 	c.replyClass.addStats(stats, "inbox_rows_g1_")
 	c.reply.addStats(stats)
 	c.tie.addStats(stats)
@@ -1134,9 +1189,12 @@ func (c *inboxRowCounts) addStats(stats map[string]int) {
 
 // walkRange is one page's range decision: more says whether the walk goes on, and
 // from where (the minimum thread key and activity time of what the page held).
+// cont marks the one floor-end continuation: the walk's own extra request below
+// the page's oldest delivered thread (see awaitInboxRange).
 type walkRange struct {
 	more          bool
 	minKey, minTS int64
+	cont          bool
 }
 
 // rangeRows is the range rows of one or more tables, from the three tables the server
@@ -1583,7 +1641,33 @@ func (s *messagixSession) offerLocked(w *rangeWatch, tbl *table.LSTable) {
 // counted in inbox_end6_contradicted, so stop 6 can be split into ends that stood alone
 // and ends that were contradicted. The decisions read no diagnostic counter. Only a
 // cancel is an error.
-func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, pos pagePosition, budget time.Duration, counts *inboxRowCounts) (rng *walkRange, endSeen bool, waited time.Duration, err error) {
+//
+// One late end row can continue the walk: an inbox-parent end row that fails
+// only the floor, with an inbox-parent V2 row of its frame agreeing with its
+// minimum (see pagePosition.endAtFloor). The floor keeps a more row's minimum —
+// the next request's reference — from skipping a thread the page held; an end
+// row starts no request, so the rejection only ever marks a genuine end whose
+// range bottom sits below the frame's last thread row, and the agreeing V2 row
+// is the server's own second account of that bottom. But a row shape is not a
+// page's answer, and even a bound frame cannot prove it is this page's end — an
+// untagged stale or replayed frame satisfies every positional binding. So the
+// bound candidate only earns one continuation: the walk's own next request,
+// below the page's oldest delivered thread, whose reply is bound to the walk by
+// the request itself. An empty continuation reply confirms the end (complete);
+// a reply end row confirms it the usual way; anything else is decided by the
+// page's ordinary rules, and a repeated floor-only shape stops 2 — the
+// continuation never recurs (isCont). It never shortens the wait either, a more
+// row that answers the page still wins, and a fully confirmed end row keeps
+// stop 6.
+//
+// The continuation's own page (isCont) is stricter still: only a frame tagged
+// to the continuation's own request may decide it, since anything unbound is
+// the same unproven evidence that earned the continuation. Untagged and
+// foreign frames are still ingested — their threads reach the listing — but
+// their range rows are ignored for the page, and they are what the
+// unbound-only count reports. And one continuation is one per walk (contUsed):
+// a second bound candidate on a later page is refused, not continued.
+func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, pos pagePosition, budget time.Duration, counts *inboxRowCounts, isCont, contUsed bool) (rng *walkRange, endSeen bool, waited time.Duration, err error) {
 	start := time.Now()
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
@@ -1591,6 +1675,11 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 	var end *lateFrame // the first end row for the page; it only picks the stop code
 	contradicted := 0  // frames after it with more rows that did not answer the page (counted only)
 	var endRow *table.LSUpsertSyncGroupThreadsRange
+	var floorEnd *lateFrame // an end row the floor alone rejected, bound to this page: it can end the walk complete
+	moreAfter := false      // a more row that did not answer the page stood after floorEnd's frame
+	// For the continuation outcome counts: whether the wait saw any frame at all,
+	// and whether one was tagged to the page's own request.
+	sawFrame, sawBound := false, false
 	for {
 		s.mu.Lock()
 		got := w.frames
@@ -1598,30 +1687,63 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 		moved := s.connEpoch != w.epoch
 		s.mu.Unlock()
 		if len(got) > 0 {
-			noFloor := false
+			sawFrame = true
 			for _, f := range got {
+				if f.tag.ok && w.ids.PacketID != 0 && f.tag.id == w.ids.PacketID {
+					sawBound = true
+				}
+			}
+			// On the continuation's page a frame decides only when it is tagged
+			// to the continuation's own request; untagged and foreign frames are
+			// ingested but ignored, the same unproven evidence the page was
+			// opened to confirm.
+			deciding := got
+			if isCont {
+				deciding = nil
+				for i := range got {
+					if got[i].tag.ok && w.ids.PacketID != 0 && got[i].tag.id == w.ids.PacketID {
+						deciding = append(deciding, got[i])
+					}
+				}
+			}
+			noFloor := false
+			for _, f := range deciding {
 				if _, ok := pos.floorFor(f); !ok && candidateCount(f.rows) > 0 {
 					noFloor = true // a candidate that can never be judged: see the doc comment
 				}
 			}
-			gathered.add(lateCandidates(got, pos, &counts.late))
+			gathered.add(lateCandidates(deciding, pos, &counts.late))
 			if rng := lateRange(gathered); rng != nil {
 				return rng, false, time.Since(start), nil
 			}
 			if noFloor {
 				return nil, false, time.Since(start), nil
 			}
-			for i := range got {
-				if end != nil && candidateCount(got[i].rows) > 0 {
-					// After the end row, a frame whose more rows did not answer the page
-					// (one that did would have continued the walk above): counted only.
-					contradicted++
+			for i := range deciding {
+				if candidateCount(deciding[i].rows) > 0 {
+					if end != nil {
+						// After the end row, a frame whose more rows did not answer the page
+						// (one that did would have continued the walk above): counted only.
+						contradicted++
+					}
+					if floorEnd != nil {
+						// A further cursor stood after the end row's frame: it was not
+						// the range's last word.
+						moreAfter = true
+					}
 				}
-				row := pos.endForPage(got[i])
+				row := pos.endForPage(deciding[i])
 				if row == nil {
-					counts.end6.reject(w, pos, got[i])
+					counts.end6.reject(w, pos, deciding[i])
+					if floorEnd == nil {
+						if r, cand := pos.endAtFloor(w, deciding[i]); r != nil {
+							floorEnd = &deciding[i]
+						} else if cand {
+							counts.end6.floorRefused++
+						}
+					}
 				} else if end == nil {
-					end, endRow = &got[i], row
+					end, endRow = &deciding[i], row
 				}
 			}
 		}
@@ -1631,20 +1753,60 @@ func (s *messagixSession) awaitInboxRange(ctx context.Context, w *rangeWatch, po
 		select {
 		case <-w.ready:
 		case <-timer.C:
-			if end == nil {
+			if end == nil && floorEnd == nil {
+				countContWaitExpired(counts, isCont, true, sawFrame, sawBound)
 				return nil, false, time.Since(start), nil
 			}
 			s.mu.Lock()
 			moved = s.connEpoch != w.epoch
-			if !moved {
+			// The end row earns a continuation only while the walk is one unbroken
+			// reading of the server's state: one epoch across every page, no resync
+			// marker during the page's watch (a replayed range is not this page's
+			// answer), no further cursor after the end row's frame, and no known
+			// thread between the frame's newest and the page's reference that the
+			// frame does not carry (the frame must be this frontier's continuation,
+			// not some older range replayed beside it).
+			bound := !isCont && !contUsed && end == nil && floorEnd != nil && !moved && w.epoch == w.firstEpoch &&
+				!w.resync && !moreAfter && s.knownGap(pos, *floorEnd) == 0
+			switch {
+			case !moved && end != nil:
 				counts.end6.count(s, w, pos, *end, endRow)
 				counts.end6.contradicted += contradicted
+			case !moved && !bound:
+				counts.end6.floorRefused++
 			}
 			s.mu.Unlock()
-			return nil, !moved, time.Since(start), nil
+			countContWaitExpired(counts, isCont, end == nil || moved, sawFrame, sawBound)
+			if bound {
+				// Continue from the page's oldest delivered thread: the reply's own
+				// when it carried threads, else the end frame's. The continuation's
+				// reference is below anything already delivered, so its reply's
+				// threads and range rows decide what the end row claimed.
+				next := floorEnd.floor
+				if pos.floorOK && pos.floor.olderThan(next) {
+					next = pos.floor
+				}
+				return &walkRange{more: true, minTS: next.ts, minKey: next.key, cont: true}, false, time.Since(start), nil
+			}
+			return nil, end != nil && !moved, time.Since(start), nil
 		case <-ctx.Done():
 			return nil, false, time.Since(start), ctx.Err()
 		}
+	}
+}
+
+// countContWaitExpired records the continuation's wait ending without a bound
+// answer: timeout whenever the wait expired unanswered, and unboundOnly when it
+// saw frames but none tagged to the continuation's own request — the field's
+// rid-0-delta case, where the reply's content may have arrived untagged. Each
+// fires once per continuation, at the decision point.
+func countContWaitExpired(counts *inboxRowCounts, isCont, unanswered, sawFrame, sawBound bool) {
+	if !isCont || !unanswered {
+		return
+	}
+	counts.floorContTimeout++
+	if sawFrame && !sawBound {
+		counts.floorContUnboundOnly++
 	}
 }
 
