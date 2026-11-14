@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -113,4 +114,37 @@ func TestKD222LastPageCountsOnlyTheLastWatch(t *testing.T) {
 	wantLate(t, stats, map[string]int{
 		"inbox_end_rej_position": 1, "inbox_end_rej_pos_ceiling": 1, "inbox_end_rej_last_page": 0,
 	})
+}
+
+// The live shape the split counters reported: on the walk's last page the reply is
+// empty and a late frame carries the page's threads, an inbox-parent end row whose
+// minimum is below the frame's oldest thread (the floor is the frame's own), and an
+// inbox-parent V2 row agreeing with the end row's minimum. The floor exists so a
+// more row's minimum — the next request's reference — cannot skip a thread the page
+// held; an end row starts no request, so when the last page's wait runs out it is
+// the inbox's own answer that there is nothing more, and the walk ends complete.
+// Every thread the end row's frame carried is listed, including the one below the
+// page's reference.
+func TestKD222LastPageFloorEndCompletesTheWalk(t *testing.T) {
+	withRangeWait(t, 200*time.Millisecond)
+	s := connected(t)
+	var emitted []Frame
+	s.emit = func(f Frame) int64 { emitted = append(emitted, f); return 0 }
+	end := withV2(threadsFrame([][2]int64{{89, 4500}, {88, 4400}}, rangeOnly(endRow(-1, 85, 4300))), -1, 85, 4300)
+	p := &framedInbox{s: s,
+		replies: []*table.LSTable{
+			tpage(101, 5000, moreRow(-1, 95, 4800)),
+			tpage(94, 4700, moreRow(-1, 90, 4600)),
+			emptyReply,
+		},
+		later: [][]laterFrame{nil, nil, {late(20 * time.Millisecond, end)}},
+	}
+	res, _ := runFramed(t, p)
+	checkWalk(t, p, res, walkWant{stop: 0, pages: 3, refs: [][2]int64{{95, 4800}, {90, 4600}}})
+	listed := threadsByID(emitted)
+	for _, th := range [][2]int64{{89, 4500}, {88, 4400}} {
+		if f := listed[strconv.FormatInt(th[0], 10)]; f == nil || f.LastActivity != th[1] {
+			t.Fatalf("thread %v of the end row's frame is not listed: %v", th, listed)
+		}
+	}
 }
