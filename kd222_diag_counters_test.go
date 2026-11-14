@@ -103,7 +103,7 @@ func TestKD222LastPageCountsOnlyTheLastWatch(t *testing.T) {
 	var counts inboxRowCounts
 	w := s.openWatch("", &counts)
 	s.handleMetaEvent(context.Background(), threadsFrame([][2]int64{{90, 5000}}, rangeOnly(endRow(-1, 90, 5000))))
-	if rng, _, _, err := s.awaitInboxRange(context.Background(), w, pos, 0, &counts, false); err != nil || rng != nil {
+	if rng, _, _, err := s.awaitInboxRange(context.Background(), w, pos, 0, &counts, false, false); err != nil || rng != nil {
 		t.Fatalf("rejecting page: rng=%+v err=%v", rng, err)
 	}
 	s.closeWatch(w, &counts)
